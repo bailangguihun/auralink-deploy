@@ -1,0 +1,6 @@
+services:
+  vmm-service:
+    gpus: all
+
+  vision-service:
+    gpus: all

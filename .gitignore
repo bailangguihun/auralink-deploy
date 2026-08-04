@@ -1,0 +1,24 @@
+# Real environment files
+.env
+.env.*
+!.env.example
+
+# TLS certificates and private keys
+certs/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime files
+data/
+logs/
+*.log
+*.pid
+*.sock
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
