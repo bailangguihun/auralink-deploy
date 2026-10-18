@@ -205,7 +205,9 @@ def validate_policy(policy):
     must(type(config) is dict and set(config) == ({'before_sha256', 'after_sha256', 'knowledge','assistant'} if assistant else {'before_sha256', 'after_sha256', 'knowledge'}), 'business_configuration')
     digest(config['before_sha256']); digest(config['after_sha256'])
     must((assistant or config['before_sha256'] == legacy['application_configuration_sha256']) and
-         config['before_sha256'] != config['after_sha256'], 'business_configuration_baseline')
+         (config['before_sha256'] != config['after_sha256'] or
+          (assistant and 'successor' in up and config['before_sha256'] == config['after_sha256'])),
+         'business_configuration_baseline')
     must(type(config['knowledge']) is dict and set(config['knowledge']) == set(keys), 'business_configuration_keys')
     must(config['knowledge']['map-enabled'] is map_enabled, 'business_configuration_profile')
     if isolation_mode(policy) == 'sealed-memfd-capdrop':
@@ -276,6 +278,8 @@ def validate_policy(policy):
              acl['credential_uid'] == pg['credential_uid'], 'business_traversal_acl_credential')
         must(Path('/root') in absolute(config['knowledge']['snapshot-root']).parents,
              'business_traversal_acl_ancestor')
+    if 'successor' in up:
+        validate_successor(policy)
     if assistant:
         module=assistant_module(policy)
         module.validate_contract(up.get('assistant'))
@@ -305,6 +309,11 @@ def config_for_release(policy, record):
     up = validate_policy(policy)['upgrade']
     if record.get('artifact_sha256') == up['candidate']['artifact_sha256']:
         candidate_matches(policy, record)
+        if 'successor' in up:
+            import core_release_guard as guard
+            phase = guard.successor_configuration_phase(policy)
+            must(phase != 'transition', 'successor_configuration_not_startable')
+            return up['successor']['core_final_sha256'] if phase == 'final' else up['configuration']['after_sha256']
         return up['configuration']['after_sha256']
     must(all(record.get(key) == up['baseline_release'][key] for key in ('commit_sha', 'artifact_sha256')),
          'business_rollback_not_approved')
@@ -318,6 +327,11 @@ def render_configuration(before, policy):
         text = before.decode('utf-8')
     except UnicodeError as error:
         raise Refused('business_configuration_encoding') from error
+    if 'successor' in policy['upgrade']:
+        validate_successor(policy)
+        validate_existing_assistant_configuration(before, policy)
+        must(sha(before) == config['after_sha256'], 'successor_bridge_configuration_unchanged')
+        return before
     if policy['upgrade']['capability']=='assistant-v1':
         values=config['assistant']
         allowed={'enabled','history-only','attachment-root','execution.enabled','execution.ai-base-url','execution.internal-token-file','execution.expected-config-sha256','execution.allow-loopback-http','storage.quota-bytes','storage.draft-lifetime','storage.minimum-free-bytes','storage.cleanup-enabled'}
@@ -351,6 +365,89 @@ def render_configuration(before, policy):
         after += ('auralink.knowledge.' + key + ': ' + json.dumps(config['knowledge'][key], ensure_ascii=True) + '\n').encode()
     must(sha(after) == config['after_sha256'], 'business_configuration_after')
     return after
+
+
+
+def validate_successor(policy):
+    """Finite C1/G0 -> C1/G1 contract; not an arbitrary configuration editor."""
+    up = policy['upgrade']; value = up['successor']
+    must(up.get('capability') == 'assistant-v1' and type(value) is dict and set(value) == {
+        'schema', 'ai_before', 'ai_candidate', 'ai_configuration', 'core_final_sha256'},
+        'successor_contract_fields')
+    must(value['schema'] == 'R25_ASSISTANT_SUCCESSOR_CONFIGURATION_V1', 'successor_contract_schema')
+    before = value['ai_before']
+    must(type(before) is dict and set(before) == {'commit_sha','source_tree_sha256','record_sha256'}, 'successor_ai_before')
+    for key, item in before.items(): digest(item, 40 if key == 'commit_sha' else 64)
+    candidate = value['ai_candidate']
+    must(type(candidate) is dict and set(candidate) == {'repository','commit_sha','github_run_id',
+        'github_run_attempt','source_tree_sha256','archive_sha256'} and
+        candidate['repository'] == 'bailangguihun/auralink-ai-service', 'successor_ai_candidate')
+    for key in ('commit_sha','source_tree_sha256','archive_sha256'):
+        digest(candidate[key], 40 if key == 'commit_sha' else 64)
+    for key in ('github_run_id','github_run_attempt'):
+        must(type(candidate[key]) is str and re.fullmatch('[1-9][0-9]{0,19}',candidate[key]), 'successor_ai_run')
+    must(candidate['source_tree_sha256'] != before['source_tree_sha256'], 'successor_ai_changed_source_required')
+    config = value['ai_configuration']
+    must(type(config) is dict and set(config) == {'before_sha256','after_sha256'}, 'successor_ai_config_fields')
+    for item in config.values(): digest(item)
+    digest(value['core_final_sha256'])
+    bridge = up['configuration']
+    must(bridge['before_sha256'] == bridge['after_sha256'] and
+        bridge['assistant']['execution.expected-config-sha256'] == config['before_sha256'] and
+        config['before_sha256'] != config['after_sha256'] and
+        value['core_final_sha256'] != bridge['after_sha256'], 'successor_configuration_bindings')
+    return value
+
+
+def validate_existing_assistant_configuration(raw, policy):
+    """Require the exact already installed dotted-property representation."""
+    text = raw.decode('utf-8'); values = policy['upgrade']['configuration']['assistant']
+    must(not any(x in text for x in ('\x00','\t')) and not any(
+        x.startswith(('---','...','%')) for x in text.splitlines()), 'successor_configuration_syntax')
+    actual = {}
+    for line in text.splitlines():
+        if re.search(r'(?i)(?:assistant|auralink\.assistant)', line) and not line.lstrip().startswith('#'):
+            match = re.fullmatch(r'auralink\.assistant\.([a-zA-Z0-9_.-]+): (.+)', line)
+            must(match is not None and match[1] not in actual, 'successor_configuration_alias')
+            actual[match[1]] = strict_json(match[2])
+    must(actual == values, 'successor_configuration_values')
+    for key, value in policy['upgrade']['configuration']['knowledge'].items():
+        must(text.splitlines().count('auralink.knowledge.' + key + ': ' + json.dumps(value,ensure_ascii=True)) == 1,
+             'successor_knowledge_configuration')
+
+
+def render_successor_configuration(before, policy):
+    transition = validate_successor(policy)
+    must(sha(before) == policy['upgrade']['configuration']['after_sha256'], 'successor_core_config_before')
+    validate_existing_assistant_configuration(before, policy)
+    config = transition['ai_configuration']
+    prefix = b'auralink.assistant.execution.expected-config-sha256: '
+    old = prefix + json.dumps(config['before_sha256']).encode() + b'\n'
+    new = prefix + json.dumps(config['after_sha256']).encode() + b'\n'
+    must(before.count(old) == 1, 'successor_core_config_anchor')
+    after = before.replace(old, new)
+    must(sha(after) == transition['core_final_sha256'], 'successor_core_config_after')
+    return after
+
+
+def validate_successor_ai_configuration(before, after, policy):
+    """Only tested DashScope Beijing Flash thinking override may differ."""
+    binding = validate_successor(policy)['ai_configuration']
+    must(sha(before) == binding['before_sha256'] and sha(after) == binding['after_sha256'],
+         'successor_ai_config_digest')
+    old, new = strict_json(before), strict_json(after)
+    import copy
+    expected = copy.deepcopy(old)
+    must(old.get('ragflow',{}).get('enabled') is False and type(old.get('models')) is list,
+         'successor_ai_config_profile')
+    selected = [x for x in expected['models'] if x.get('model') == 'qwen3.8-flash']
+    must(len(selected) == 1 and selected[0].get('provider') == 'dashscope' and
+         selected[0].get('baseUrl') == 'https://dashscope.aliyuncs.com/compatible-mode/v1' and
+         selected[0].get('thinkingMode', 'provider-default') == 'provider-default',
+         'successor_flash_route')
+    selected[0]['thinkingMode'] = 'disabled'
+    must(new == expected, 'successor_ai_config_unrelated_change')
+    return new
 
 
 def _service(policy):

@@ -62,6 +62,7 @@ class Successor(unittest.TestCase):
     def __init__(self): self.v={};self.kind=None
     def active(self,*args): return {'pid':123,'ticks':456}
     def watchdog_stop_locked(self): pass
+    def load_execution_policy(self): self.execution_policy='configured-provider'
     def watchdog_start_locked(self): pass
     def watchdog_identity(self): return {'pid':111,'ticks':222}
     def frontend(self,*args): pass

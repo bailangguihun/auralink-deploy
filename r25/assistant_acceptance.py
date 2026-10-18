@@ -105,7 +105,13 @@ def verify_assistant_http(policy, *, get_authenticated, get=request):
     upgrade = policy.get('upgrade', {})
     must(upgrade.get('capability') == 'assistant-v1', 'assistant_http_candidate_required')
     contract = upgrade.get('assistant', {})
-    configured = upgrade.get('configuration', {}).get('assistant', {})
+    configured = dict(upgrade.get('configuration', {}).get('assistant', {}))
+    if 'successor' in upgrade:
+        import core_release_guard as guard
+        phase = guard.successor_configuration_phase(policy)
+        must(phase != 'transition', 'successor_acceptance_configuration_incomplete')
+        if phase == 'final':
+            configured['execution.expected-config-sha256'] = upgrade['successor']['ai_configuration']['after_sha256']
     mode = contract.get('mode')
     retrieval_profile = contract.get('retrieval_profile')
     must(retrieval_profile in (None, 'artwork-only-v1'), 'assistant_http_retrieval_profile')
