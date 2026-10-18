@@ -114,3 +114,7 @@ retention默认只读列出保留/删除日期，apply仅删除本job具有完�
 ```
 
 现有已绑定attachment-root中唯一控制文件 `.generation-suspended-v1`，精确内容 `ArtLIVE Assistant generation suspended v1\n`、0600、根目录所属身份。操作持共享锁、校验namespace/非终止事务、以原子写/CAS删除并保留私有INTENT/COMMITTED及前记录；不修改.env、不重启Java/Critic、不清空排队记录。错误文件/权限/软链拒绝；Core对坏控制状态fail-closed。状态、历史、图片、导出、删除仍可用。标记属于受控备份inventory，恢复不暗中删除它或恢复付费分发。
+
+## 已安装 Assistant V2 的后续业务升级
+
+后续 C0/A0/G0 → C1/A0/G0 → C1/A1/G1 不重跑上述首次安装，见 [后续发布合同](assistant-successor-release.md)。该显式合同保留既有 27 文件/16 版本链、共享锁、权限与私有批准；只允许受正式 artifact 与原事务绑定的 Flash 配置相位变换。

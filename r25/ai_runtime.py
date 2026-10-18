@@ -1,7 +1,8 @@
 """Fixed-host AI source publication with shared Core/Web lease and real adapter.
 
-Only the 19 reviewed source files may change. No pip, database write, provider
-request, JAR switch, frontend restart or tunnel restart is performed here.
+Only the installed policy's exact 19/27 source files may change. An explicit
+Assistant successor also journals two fixed configuration files. No pip,
+database write, provider request, JAR switch, frontend or tunnel restart occurs.
 """
 from __future__ import annotations
 
@@ -165,6 +166,7 @@ class AIRuntime:
         current = guard.reference(before_current.get('release'))
         before = self.verify_candidate(current)
         after = self.verify_candidate(candidate)
+        configuration = self.successor_configuration(current, candidate, after)
         guard.verify_live(current)
         paired_core = self.core.current()
         self.core.verify_current(paired_core)
@@ -180,6 +182,8 @@ class AIRuntime:
         if added:
             must(added == set(guard.ASSISTANT_PATHS)-set(guard.SOURCE_PATHS) and not new_directory.exists() and not new_directory.is_symlink(), 'ai_new_directory_must_be_absent')
         changed = sorted({role(name) for name, value in files.items() if value['before'] != value['after']})
+        if configuration is not None:
+            must(changed == ['critic'], 'successor_guide_source_preserved')
         must(shutil.disk_usage(STORE).free > 64 * 1024 * 1024 + sum(x['before']['bytes'] for x in files.values() if x['before'] is not None) * 3,
              'ai_snapshot_disk_space')
         tx = secrets.token_hex(16)
@@ -197,6 +201,8 @@ class AIRuntime:
                     'core': asdict(paired_core), 'before_current': before_current,
                     'minimum_total': self.core.last_http['gallery_total'], 'files': files, 'changed_roles': changed,
                     'before_health': health, 'created_directories': ['critic-service/app/assistant'] if added else [], 'source_owner':list(guard.source_owner())}
+        if configuration is not None:
+            document['configuration_transition'] = self.snapshot_configuration(folder, configuration)
         self.identity(STORE / 'CURRENT.json', expected_sha256=before_current_sha)
         self.storage.atomic_write_json(folder / 'snapshot.json', document)
         self.storage.atomic_write_json(folder / 'journal.json', {'schema': 'R25_AI_TRANSACTION_V1',
@@ -204,6 +210,89 @@ class AIRuntime:
             'snapshot_sha256': self.identity(folder / 'snapshot.json')['sha256']})
         self.write(STORE / 'ACTIVE.json', {'schema': 'R25_AI_ACTIVE_V1', 'transaction_id': tx})
         return tx
+
+
+    def configuration_targets(self):
+        return {'ai': ROOT / 'runtime/config/assistant-private/assistant-runtime.json',
+                'core': ROOT / 'runtime/config/application.yml'}
+
+    def successor_configuration(self, current, candidate, record):
+        policy = guard.core.policy()
+        transition = policy.get('upgrade', {}).get('successor')
+        if transition is None: return None
+        module = guard.core.business_module(policy)
+        module.validate_successor(policy)
+        must(current == transition['ai_before'] and
+             all(record.get(k) == v for k,v in transition['ai_candidate'].items()),
+             'successor_ai_selected_candidate')
+        paired = asdict(self.core.current()); core_candidate = policy['upgrade']['candidate']
+        must(paired['commit_sha'] == core_candidate['commit_sha'] and
+             paired['artifact_sha256'] == core_candidate['artifact_sha256'], 'successor_core_bridge_required')
+        owner = tuple(policy['installation']['private_owner'])
+        paths = self.configuration_targets()
+        before = {name: guard.read_file(path, owner=owner, mode=0o600) for name,path in paths.items()}
+        # Exact reviewed JSON file, no caller-selected path or credentials.
+        staged = STORE / 'successor-configurations' / (transition['ai_configuration']['after_sha256']+'.json')
+        after_ai = guard.read_file(staged, owner=owner, mode=0o600,
+                                  expected=transition['ai_configuration']['after_sha256'])
+        module.validate_successor_ai_configuration(before['ai'], after_ai, policy)
+        after_core = module.render_successor_configuration(before['core'], policy)
+        return {'before': before, 'after': {'ai': after_ai,'core': after_core},
+                'owner': list(owner), 'policy_sha256': self.core.identity(guard.core.STORE/'POLICY.json')['sha256']}
+
+    def snapshot_configuration(self, folder, value):
+        self.storage.mkdir_private(folder / 'after-configuration')
+        self.storage.mkdir_private(folder / 'before-configuration')
+        records = {}
+        for name, path in self.configuration_targets().items():
+            before, after = value['before'][name], value['after'][name]
+            self.identity(path, expected_sha256=hashlib.sha256(before).hexdigest(),
+                          expected_owner=tuple(value['owner']), expected_mode=0o600)
+            self.storage.atomic_write_bytes(folder/'before-configuration'/name, before)
+            self.storage.atomic_write_bytes(folder/'after-configuration'/name, after)
+            records[name] = {'before_sha256':hashlib.sha256(before).hexdigest(),
+                             'after_sha256':hashlib.sha256(after).hexdigest()}
+        return {'policy_sha256': value['policy_sha256'], 'owner': value['owner'], 'files': records}
+
+    def validate_configuration_snapshot(self, tx, snapshot):
+        value = snapshot['configuration_transition']; policy = guard.core.policy()
+        transition = policy.get('upgrade',{}).get('successor')
+        must(transition is not None and type(value) is dict and
+             set(value) == {'policy_sha256','owner','files'} and
+             value['policy_sha256'] == self.core.identity(guard.core.STORE/'POLICY.json')['sha256'] and
+             value['owner'] == policy['installation']['private_owner'] and set(value['files']) == {'ai','core'},
+             'successor_configuration_snapshot')
+        must(snapshot['current'] == transition['ai_before'], 'successor_snapshot_before')
+        record = self.verify_candidate(snapshot['candidate'])
+        must(all(record.get(k) == v for k,v in transition['ai_candidate'].items()), 'successor_snapshot_provenance')
+        expected = {'ai':transition['ai_configuration'], 'core': {
+            'before_sha256':policy['upgrade']['configuration']['after_sha256'],
+            'after_sha256':transition['core_final_sha256']}}
+        must(value['files'] == expected, 'successor_snapshot_hashes')
+        owner = tuple(value['owner']); folder = self.transaction(tx)
+        raw = {}
+        for name,path in self.configuration_targets().items():
+            identity = self.identity(path, expected_owner=owner, expected_mode=0o600)
+            must(identity['sha256'] in set(expected[name].values()), 'successor_foreign_configuration')
+            for side in ('before','after'):
+                raw[(name,side)] = guard.read_file(folder/(side+'-configuration')/name, owner=owner,
+                    mode=0o600, expected=expected[name][side+'_sha256'])
+        module = guard.core.business_module(policy)
+        module.validate_successor_ai_configuration(raw['ai','before'], raw['ai','after'], policy)
+        must(module.render_successor_configuration(raw['core','before'],policy) == raw['core','after'],
+             'successor_core_configuration_transform')
+        return value
+
+    def copy_configuration(self, tx, snapshot, *, restore):
+        value = self.validate_configuration_snapshot(tx,snapshot)
+        for name,path in self.configuration_targets().items():
+            item = value['files'][name]; owner = tuple(value['owner'])
+            actual = self.identity(path,expected_owner=owner,expected_mode=0o600)['sha256']
+            wanted = item['before_sha256' if restore else 'after_sha256']
+            if actual == wanted: continue
+            self.storage.atomic_copy_file(self.transaction(tx)/('before-configuration' if restore else 'after-configuration')/name,
+                path,wanted,replace=True,expected_existing_sha256=actual,source_owner=owner,source_mode=0o600,
+                target_owner=owner,mode=0o600,existing_owner=owner,existing_mode=0o600)
 
     def make_parents(self, folder, base):
         must(folder.is_relative_to(base), 'ai_private_parent')
@@ -237,6 +326,8 @@ class AIRuntime:
             actual=self.identity(target, expected_owner=guard.source_owner())
             allowed={value['after']['sha256']} | ({value['before']['sha256']} if value['before'] is not None else set())
             must(actual['sha256'] in allowed,'ai_foreign_source_drift')
+        if 'configuration_transition' in snapshot:
+            self.validate_configuration_snapshot(tx, snapshot)
         return journal, snapshot
 
     def partial_engine(self):
@@ -285,6 +376,8 @@ class AIRuntime:
             source = self.transaction(tx) / 'before' / name if restore else guard.release_folder(snapshot['candidate']) / 'source' / name
             self.storage.atomic_copy_file(source, target, item['sha256'], expected_bytes=item['bytes'],
                 target_owner=owner, replace=actual is not None, expected_existing_sha256=actual, existing_owner=owner)
+        if 'configuration_transition' in snapshot:
+            self.copy_configuration(tx, snapshot, restore=restore)
         if restore:
             for name in reversed(snapshot.get('created_directories',[])):
                 target=ROOT/'release'/name
@@ -314,6 +407,8 @@ class AIRuntime:
         engine.start_java_locked(self.core.fd)
         http = verify_http(self.core.query, minimum_total=snapshot['minimum_total'])
         must(engine.active('java', 19080), 'restored_core_java_identity')
+        if 'configuration_transition' in snapshot:
+            http = self.core.acceptance(Release(**snapshot['core']), minimum_total=snapshot['minimum_total'])
         engine.frontend('status', self.core.fd)
         engine.tunnel.status()
         engine.watchdog_start_locked()

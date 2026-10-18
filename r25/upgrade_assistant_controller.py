@@ -33,6 +33,7 @@ from upgrade_core_controller import ControlUpgradeRuntime, upgrade_lease
 from publisher_transaction import Refused
 
 SCHEMA='R25_ASSISTANT_CONTROLLER_UPGRADE_V1'
+SUCCESSOR_SCHEMA='R25_ASSISTANT_CONTROLLER_SUCCESSOR_V1'
 FILES=('assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py','assistant_acceptance.py','assistant_backup.py','upgrade_assistant_controller.py',
        'core_business.py','core_runtime.py','core_release_guard.py','core_publish.py','publisher_transaction.py','r25_storage.py',
        'ai_release_candidate.py','ai_release_guard.py','ai_runtime.py','ai_publish.py')
@@ -69,12 +70,14 @@ def sha(raw): return hashlib.sha256(raw).hexdigest()
 
 
 def validate(plan):
-    must(type(plan)is dict and set(plan)=={'schema','from_policy_schema','deploy','current_release','next_owner','controller_owner','private_owner','files','operational','review_evidence_sha256'},'assistant_upgrade_plan_fields')
-    must(plan['schema']==SCHEMA and plan['from_policy_schema']=='R25_CORE_BUSINESS_POLICY_V2','assistant_upgrade_requires_installed_v2')
+    successor = type(plan) is dict and plan.get('schema') == SUCCESSOR_SCHEMA
+    fields={'schema','from_policy_schema','deploy','current_release','next_owner','controller_owner','private_owner','files','operational','review_evidence_sha256'}
+    must(type(plan)is dict and set(plan)==fields | ({'current_ai_release','preserved','services'} if successor else set()),'assistant_upgrade_plan_fields')
+    must(plan['schema'] in (SCHEMA,SUCCESSOR_SCHEMA) and plan['from_policy_schema']=='R25_CORE_BUSINESS_POLICY_V2','assistant_upgrade_requires_installed_v2')
     must(set(plan['files'])==set(FILES) and set(plan['operational'])==set(OPERATIONAL),'assistant_upgrade_exact_inventory')
     must(plan['next_owner']=='c5ea','assistant_next_owner')
     identity=plan['deploy']
-    must(set(identity)=={'repository','ref','commit','run_id','run_attempt'} and identity['repository']=='bailangguihun/auralink-deploy' and identity['ref']=='refs/heads/release','assistant_upgrade_formal_repository')
+    must(set(identity)==({'repository','ref','commit','run_id','run_attempt'} | ({'archive_sha256','manifest_sha256','tool_sha256'} if successor else set())) and identity['repository']=='bailangguihun/auralink-deploy' and identity['ref']=='refs/heads/release','assistant_upgrade_formal_repository')
     must(re.fullmatch('[a-f0-9]{40}',identity['commit']) and all(re.fullmatch('[1-9][0-9]{0,19}',identity[x]) for x in ('run_id','run_attempt')),'assistant_upgrade_formal_identity')
     must(re.fullmatch('[a-f0-9]{64}',plan['review_evidence_sha256']),'assistant_upgrade_review_evidence')
     for name,entry in {**plan['files'],**plan['operational']}.items():
@@ -85,6 +88,19 @@ def validate(plan):
         if name in OPERATIONAL:must(entry['before_sha256']is not None,'assistant_upgrade_installed_controls_required')
     for field in ('controller_owner','private_owner'):
         must(type(plan[field])is list and len(plan[field])==2 and all(type(x)is int and x>=0 for x in plan[field]),'assistant_upgrade_owner')
+    if successor:
+        for key in ('archive_sha256','manifest_sha256','tool_sha256'):guard.digest_value(identity[key])
+        import ai_release_guard as ai_guard
+        ai_guard.reference(plan['current_ai_release'])
+        must(set(plan['preserved']) == {'release-jar','preview-jar','manifest','application'}, 'successor_preserved_inventory')
+        for value in plan['preserved'].values():guard.digest_value(value)
+        must(plan['preserved']['release-jar'] == plan['preserved']['preview-jar'] == plan['current_release']['artifact_sha256'], 'successor_preserved_jar')
+        must(set(plan['services']) == {'java','guide','critic'}, 'successor_service_inventory')
+        for identity in plan['services'].values():
+            must(type(identity) is dict and set(identity)=={'pid','ticks'} and type(identity['pid']) is int and identity['pid']>1 and str(identity['ticks']).isdigit(), 'successor_service_identity')
+        must(all(x['before_sha256'] is not None for x in entries(plan).values()), 'successor_requires_installed_files')
+        for name in ('critic-wrapper','lifecycle','ai-policy'):
+            must(plan['operational'][name]['before_sha256']==plan['operational'][name]['after_sha256'], 'successor_existing_overlay_preserved')
     return plan
 
 
@@ -111,6 +127,11 @@ def source(bundle,name):
 def verify(rt,plan,bundle,*,mixed=False,after=False):
     validate(plan);rt.require_lease();rt.require_terminal_application_transactions()
     must(asdict(rt.current())==plan['current_release'],'assistant_upgrade_current_drift')
+    if plan['schema'] == SUCCESSOR_SCHEMA:
+        current_ai = rt.read(guard.ROOT/'runtime/ai-publications/CURRENT.json')
+        must(current_ai.get('release') == plan['current_ai_release'], 'successor_ai_current_drift')
+        for name,digest in plan['preserved'].items():rt.identity(LIVE_FILES[name],expected_sha256=digest)
+        verify_launcher_repair_bundle(rt,plan,bundle)
     must(bundle==guard.ROOT/'operations/r25-controller-candidates'/plan['deploy']['commit'],'assistant_upgrade_fixed_bundle')
     for name,entry in entries(plan).items():
         rt.identity(source(bundle,name),expected_sha256=entry['after_sha256'])
@@ -135,23 +156,29 @@ def rendered_bindings(rt,plan,bundle):
     must(new['controllers']['core_release_guard.py']==plan['files']['core_release_guard.py']['after_sha256'] and
          new['controllers']['lifecycle_adapter.py']==plan['operational']['lifecycle']['after_sha256'] and
          new['controllers']['r25-production-java-launch.py']==old['controllers']['r25-production-java-launch.py'],'assistant_upgrade_controller_bindings')
+    successor = plan['schema'] == SUCCESSOR_SCHEMA
+    if successor:
+        validate_successor_bindings(rt,plan,old,new,bundle)
     wrapper=guard.read_file(targets(plan)['critic-wrapper'][0],owner=tuple(plan['controller_owner']),mode=0o700,
                              expected=plan['operational']['critic-wrapper']['before_sha256'])
-    after_wrapper=overlay.render(wrapper)
+    after_wrapper=wrapper if successor else overlay.render(wrapper)
     must(sha(after_wrapper)==plan['operational']['critic-wrapper']['after_sha256'],'assistant_upgrade_wrapper_render')
     lifecycle=guard.read_file(targets(plan)['lifecycle'][0],owner=tuple(plan['controller_owner']),mode=0o700,
                              expected=plan['operational']['lifecycle']['before_sha256'])
-    must(lifecycle.count(overlay.BASE_SHA256.encode())==1,'assistant_upgrade_lifecycle_wrapper_anchor')
-    after_lifecycle=lifecycle.replace(overlay.BASE_SHA256.encode(),sha(after_wrapper).encode())
+    if not successor:must(lifecycle.count(overlay.BASE_SHA256.encode())==1,'assistant_upgrade_lifecycle_wrapper_anchor')
+    after_lifecycle=lifecycle if successor else lifecycle.replace(overlay.BASE_SHA256.encode(),sha(after_wrapper).encode())
     must(sha(after_lifecycle)==plan['operational']['lifecycle']['after_sha256'],'assistant_upgrade_lifecycle_render')
     import ai_release_guard as ai_guard
     old_ai=rt.read(guard.ROOT/'runtime/ai-publications/POLICY.json',plan['operational']['ai-policy']['before_sha256'])
     new_ai=rt.read(bundle/'AI_POLICY.next.json',plan['operational']['ai-policy']['after_sha256'])
-    must(old_ai.get('schema')=='R25_AI_SOURCE_POLICY_V1' and old_ai.get('source_paths')==list(ai_guard.SOURCE_PATHS),'assistant_ai_installed_v1_required')
+    if successor:
+        must(old_ai == new_ai and old_ai.get('schema')=='R25_AI_SOURCE_POLICY_V2' and old_ai.get('source_paths')==list(ai_guard.ASSISTANT_PATHS), 'successor_installed_ai_v2')
+    else:
+        must(old_ai.get('schema')=='R25_AI_SOURCE_POLICY_V1' and old_ai.get('source_paths')==list(ai_guard.SOURCE_PATHS),'assistant_ai_installed_v1_required')
     must(new_ai.get('schema')=='R25_AI_SOURCE_POLICY_V2' and new_ai.get('repository')=='bailangguihun/auralink-ai-service' and new_ai.get('source_paths')==list(ai_guard.ASSISTANT_PATHS),'assistant_ai_successor_inventory')
-    must(new_ai.get('legacy_policy_sha256')==plan['operational']['ai-policy']['before_sha256'] and new_ai.get('dependency_sha256')==old_ai.get('dependency_sha256') and new_ai.get('review_evidence_sha256')==plan['review_evidence_sha256'],'assistant_ai_policy_binding')
+    must((successor or new_ai.get('legacy_policy_sha256')==plan['operational']['ai-policy']['before_sha256']) and new_ai.get('dependency_sha256')==old_ai.get('dependency_sha256') and (successor or new_ai.get('review_evidence_sha256')==plan['review_evidence_sha256']),'assistant_ai_policy_binding')
     owner=new_ai.get('source_owner');must(type(owner)is list and len(owner)==2 and all(type(x)is int and x>=0 for x in owner),'assistant_ai_source_owner')
-    for name in ai_guard.SOURCE_PATHS:
+    for name in (ai_guard.ASSISTANT_PATHS if successor else ai_guard.SOURCE_PATHS):
         rt.identity(guard.ROOT/'release'/name,expected_owner=tuple(owner),expected_mode=0o600)
     before=guard.read_file(LIVE_FILES['handoff'],owner=tuple(plan['private_owner']),expected=plan['operational']['handoff']['before_sha256'])
     after=replace_env(before,{'R25_CORE_RELEASE_POLICY_SHA256':plan['operational']['policy']['after_sha256'],
@@ -170,6 +197,44 @@ def rendered_bindings(rt,plan,bundle):
     return new
 
 
+
+def validate_successor_bindings(rt,plan,old,new,bundle):
+    """Keep installed identities and behavior except exact reviewed release bindings."""
+    must(old.get('upgrade',{}).get('capability') == 'assistant-v1' and 'successor' not in old['upgrade'],
+         'successor_installed_assistant_v2_required')
+    must(set(new) == set(old) and all(new[k]==old[k] for k in old if k not in {'controllers','runtime_modules','upgrade'}),
+         'successor_policy_unrelated_change')
+    before,after = old['upgrade'],new['upgrade']
+    mutable = {'candidate','baseline_release','web_commit','configuration','assistant','compatibility','evidence','successor'}
+    must(set(after)==set(before)|{'successor'} and all(after[k]==before[k] for k in before if k not in mutable),
+         'successor_upgrade_unrelated_change')
+    must(after['configuration'] == {**before['configuration'],
+        'before_sha256':before['configuration']['after_sha256'], 'after_sha256':before['configuration']['after_sha256']},
+         'successor_bridge_config_preserved')
+    must(after['configuration']['after_sha256'] == plan['preserved']['application'], 'successor_actual_bridge_config')
+    a,b = before['assistant'],after['assistant']
+    changes={'artifacts','configuration_sha256','baseline_policy_sha256','baseline_payload_fingerprint',
+             'compatible_recovery_jar_sha256','compatibility_evidence_sha256','review_evidence_sha256'}
+    must(set(a)==set(b) and all(a[k]==b[k] for k in a if k not in changes), 'successor_assistant_policy_preserved')
+    must(b['baseline_policy_sha256']==plan['operational']['policy']['before_sha256'] and
+         b['baseline_payload_fingerprint']==before['candidate']['payload_fingerprint'] and
+         b['compatible_recovery_jar_sha256']==plan['current_release']['artifact_sha256'] and
+         b['review_evidence_sha256']==plan['review_evidence_sha256'], 'successor_accepted_baseline_binding')
+    must(b['artifacts']['web']==a['artifacts']['web'], 'successor_preserve_accepted_web_artifact')
+    transition = core_business.validate_successor(new)
+    must(transition['ai_before']==plan['current_ai_release'], 'successor_ai_baseline_binding')
+    must(b['artifacts']['ai']['commit']==transition['ai_candidate']['commit_sha'] and
+         b['artifacts']['ai']['sha256']==transition['ai_candidate']['archive_sha256'] and
+         b['artifacts']['deploy']=={'repository':plan['deploy']['repository'],'commit':plan['deploy']['commit'],
+                                   'sha256':plan['deploy']['archive_sha256']}, 'successor_artifact_bindings')
+    raw=guard.read_file(LIVE_FILES['application'],owner=tuple(plan['private_owner']),expected=plan['preserved']['application'])
+    core_business.render_successor_configuration(raw,new)
+    ai_before=guard.read_file(guard.ROOT/'runtime/config/assistant-private/assistant-runtime.json',
+                             owner=tuple(plan['private_owner']),expected=transition['ai_configuration']['before_sha256'])
+    ai_after=guard.read_file(bundle/'ASSISTANT_CONFIG.next.json',owner=tuple(plan['private_owner']),expected=transition['ai_configuration']['after_sha256'])
+    core_business.validate_successor_ai_configuration(ai_before,ai_after,new)
+
+
 def service_identities(engine):
     result={}
     for name,port in (('java',19080),('guide',19084),('critic',19085)):
@@ -183,6 +248,9 @@ def approval(rt,plan,expected):
     path=guard.STORE/'controller-upgrades'/expected
     record=path/'approval.json' if (path/'approval.json').exists() else guard.STORE/'CONTROL_UPGRADE_APPROVAL.json'
     must(rt.read(record,expected)==plan,'assistant_upgrade_private_approval_binding')
+    if plan['schema'] == SUCCESSOR_SCHEMA:
+        review = path/'review.json' if (path/'review.json').exists() else guard.STORE/'CONTROL_UPGRADE_REVIEW.json'
+        must(type(rt.read(review,plan['review_evidence_sha256'])) is dict, 'successor_private_review_binding')
     return path
 
 
@@ -202,9 +270,12 @@ def install(rt,plan,bundle,*,approval_sha256):
         verify(rt,plan,bundle);rendered_bindings(rt,plan,bundle)
         rt.verify_current(rt.current());rt.require_no_active_work()
         engine=rt.engine();engine.frontend('status',rt.fd);before=service_identities(engine)
+        if plan['schema'] == SUCCESSOR_SCHEMA:must(before == plan['services'], 'successor_process_context_drift')
         rt.storage.mkdir_private(guard.STORE/'controller-upgrades');rt.storage.mkdir_private(folder);rt.storage.mkdir_private(folder/'before')
         if not (folder/'approval.json').exists():
             rt.storage.atomic_copy_file(guard.STORE/'CONTROL_UPGRADE_APPROVAL.json',folder/'approval.json',approval_sha256)
+        if plan['schema'] == SUCCESSOR_SCHEMA and not (folder/'review.json').exists():
+            rt.storage.atomic_copy_file(guard.STORE/'CONTROL_UPGRADE_REVIEW.json',folder/'review.json',plan['review_evidence_sha256'])
         for name,entry in entries(plan).items():
             if entry['before_sha256']is not None:
                 path,owner,mode=targets(plan)[name]
@@ -220,6 +291,9 @@ def install(rt,plan,bundle,*,approval_sha256):
                 rt.storage.atomic_copy_file(source(bundle,name),path,entry['after_sha256'],replace=entry['before_sha256']is not None,
                     expected_existing_sha256=entry['before_sha256'],target_owner=owner,mode=mode,existing_owner=owner,existing_mode=mode)
             verify(rt,plan,bundle,after=True)
+            if plan['schema'] == SUCCESSOR_SCHEMA:
+                # Do not fork watchdog with pre-upgrade guard modules cached.
+                engine=rt.engine();rt.verify_current(rt.current())
             must(service_identities(engine)==before,'assistant_upgrade_unexpected_service_restart')
             engine.frontend('status',rt.fd)
             engine.watchdog_start_locked();must(engine.watchdog_identity(),'assistant_upgrade_watchdog')
@@ -246,6 +320,10 @@ def recover(rt,plan,bundle,*,approval_sha256):
         engine=module.production(rt.fd)
         engine.v=env_values(guard.read_file(folder/'before/handoff',owner=tuple(plan['private_owner']),expected=plan['operational']['handoff']['before_sha256']))
         engine.kind=engine.v.get('R25_LIFECYCLE_RELEASE_KIND')
+        if plan['schema'] == SUCCESSOR_SCHEMA:
+            # Full load is unsafe while controller files are mixed. Critic
+            # ownership still needs this existing read-only policy loader.
+            engine.load_execution_policy()
         engine.watchdog_stop_locked()
         record['phase']='RESTORE_INTENT';rt.write(folder/'journal.json',record)
         for name,entry in entries(plan).items():
@@ -575,7 +653,7 @@ def main():
     import argparse
     import json
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('upgrade','recover','repair-launcher-import','recover-launcher-import'))
+    parser.add_argument('command',choices=('upgrade','recover','preflight-successor','upgrade-successor','recover-successor','repair-launcher-import','recover-launcher-import'))
     parser.add_argument('--approval-sha256',required=True)
     args=parser.parse_args()
     try:
@@ -592,12 +670,22 @@ def main():
             result=repair_launcher_import(rt,plan,bundle,approval_sha256=args.approval_sha256,recovery=args.command=='recover-launcher-import')
             print(json.dumps({'outcome':result,'application_restart':False,'database_writes':False,'ai_transaction_replayed':False}));return 0
         recorded=guard.STORE/'controller-upgrades'/args.approval_sha256/'approval.json'
-        approval_file=recorded if args.command=='recover' and recorded.exists() else guard.STORE/'CONTROL_UPGRADE_APPROVAL.json'
+        approval_file=recorded if args.command in ('recover','recover-successor') and recorded.exists() else guard.STORE/'CONTROL_UPGRADE_APPROVAL.json'
         plan=validate(rt.read(approval_file,args.approval_sha256))
         bundle=guard.ROOT/'operations/r25-controller-candidates'/plan['deploy']['commit']
         must(Path(__file__).absolute()==bundle/'upgrade_assistant_controller.py','assistant_upgrade_trusted_bundle_location')
         rt.identity(Path(__file__),expected_sha256=plan['files']['upgrade_assistant_controller.py']['after_sha256'])
-        result=(install if args.command=='upgrade' else recover)(rt,plan,bundle,approval_sha256=args.approval_sha256)
+        if args.command.endswith('successor'):
+            must(plan['schema'] == SUCCESSOR_SCHEMA, 'successor_cli_contract')
+        else:must(plan['schema'] == SCHEMA, 'legacy_upgrade_cli_contract')
+        if args.command == 'preflight-successor':
+            with upgrade_lease(rt):
+                approval(rt,plan,args.approval_sha256);verify(rt,plan,bundle);rendered_bindings(rt,plan,bundle)
+                rt.verify_current(rt.current());rt.require_no_active_work()
+                must(service_identities(rt.engine())==plan['services'], 'successor_process_context_drift')
+            result='SUCCESSOR_PREFLIGHT_VERIFIED'
+        else:
+            result=(install if args.command in ('upgrade','upgrade-successor') else recover)(rt,plan,bundle,approval_sha256=args.approval_sha256)
         print(json.dumps({'outcome':result,'application_restart':False,'database_writes':False}));return 0
     except Exception as error:
         print(json.dumps({'outcome':'ASSISTANT_CONTROLLER_REFUSED_OR_RECOVERY_REQUIRED','failure_class':type(error).__name__,

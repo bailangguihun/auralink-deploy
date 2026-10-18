@@ -263,6 +263,10 @@ class CoreRuntime:
         record = guard.release_record(release.artifact_sha256, release.accepted_record_sha256, release.commit_sha)
         if value.get('schema') != guard.BUSINESS_POLICY_SCHEMA or record.get('schema') != guard.BUSINESS_RECORD_SCHEMA:
             return self.verify_current(release)
+        if 'successor' in value.get('upgrade',{}):
+            must(guard.successor_configuration_phase(value) == 'bridge', 'successor_restore_ai_before_core')
+            ai_current = self.read(ROOT/'runtime/ai-publications/CURRENT.json')
+            must(ai_current.get('release') == value['upgrade']['successor']['ai_before'], 'successor_restore_ai_before_core')
         must(self.tx is not None, 'business_rollback_transaction_required')
         plan = self.load_recovery(self.tx)
         must(plan.phase == 'COMMITTED' and plan.candidate == release and self.current() == release,
