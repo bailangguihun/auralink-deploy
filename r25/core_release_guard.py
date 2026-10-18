@@ -223,8 +223,78 @@ def validate_configuration_context(value):
                 must(phase in {'INSTALL_INTENT', 'RECOVERY_REQUIRED', 'RESTORE_STOP_INTENT',
                                'RESTORE_STOPPED', 'RESTORE_INTENT'}, 'business_configuration_phase')
                 allowed = {'before_sha256', 'after_sha256'}
+    hashes = {upgrade['configuration'][name] for name in allowed}
+    if 'successor' in upgrade:
+        phase = successor_configuration_phase(value)
+        if side(reference) == 'before_sha256':
+            must(phase == 'bridge', 'successor_restore_ai_before_core')
+        if phase == 'final': hashes = {upgrade['successor']['core_final_sha256']}
+        elif phase == 'transition': hashes.add(upgrade['successor']['core_final_sha256'])
     observed = hashlib.sha256(read_file(ROOT / 'runtime/config/application.yml')).hexdigest()
-    must(observed in {upgrade['configuration'][name] for name in allowed}, 'business_configuration_state')
+    must(observed in hashes, 'business_configuration_state')
+
+
+
+def successor_configuration_phase(value):
+    """Authorize final configuration only through the exact AI journal.
+
+    A digest on disk alone does not authorize G1. Stable phases must agree with
+    AI CURRENT, pinned snapshot, C1 identity, policy and source provenance.
+    Mixed phases permit recovery inspection but never application startup.
+    """
+    binding = value['upgrade'].get('successor')
+    if binding is None: return 'bridge'
+    def checked(phase):
+        expected = binding['ai_configuration']
+        raw = read_file(ROOT/'runtime/config/assistant-private/assistant-runtime.json',
+                        owner=tuple(value['installation']['private_owner']),mode=0o600)
+        permitted = set(expected.values()) if phase == 'transition' else {expected['after_sha256' if phase == 'final' else 'before_sha256']}
+        must(hashlib.sha256(raw).hexdigest() in permitted, 'successor_ai_configuration_state')
+        return phase
+    store = ROOT / 'runtime/ai-publications'
+    current = private_record(store / 'CURRENT.json')
+    must(current.get('schema') == 'R25_AI_CURRENT_V1', 'successor_ai_current')
+    try: active = private_record(store / 'ACTIVE.json')
+    except FileNotFoundError:
+        must(current.get('release') == binding['ai_before'], 'successor_ai_before_current')
+        return checked('bridge')
+    tx = active.get('transaction_id')
+    must(active.get('schema') == 'R25_AI_ACTIVE_V1' and type(tx) is str and
+        re.fullmatch('[0-9a-f]{32}',tx), 'successor_ai_active')
+    journal = private_record(store / 'transactions' / tx / 'journal.json')
+    must(journal.get('transaction_id') == tx and journal.get('schema') == 'R25_AI_TRANSACTION_V1',
+         'successor_ai_journal')
+    if journal.get('phase') in {'COMMITTED','RESTORED'} and current.get('release') == binding['ai_before']:
+        expected = journal.get('candidate' if journal['phase'] == 'COMMITTED' else 'current')
+        must(expected == binding['ai_before'], 'successor_ai_prior_journal')
+        return checked('bridge')
+    snapshot = private_record(store / 'transactions' / tx / 'snapshot.json',journal['snapshot_sha256'])
+    transition = snapshot.get('configuration_transition')
+    must(type(transition) is dict and transition.get('policy_sha256') ==
+        hashlib.sha256(read_file(STORE / 'POLICY.json')).hexdigest() and
+        snapshot.get('schema') == 'R25_AI_SNAPSHOT_V1' and snapshot.get('transaction_id') == tx and
+        snapshot.get('current') == journal.get('current') == binding['ai_before'] and
+        snapshot.get('candidate') == journal.get('candidate'), 'successor_ai_snapshot')
+    ref = journal['candidate']; candidate = binding['ai_candidate']
+    must(ref.get('commit_sha') == candidate['commit_sha'] and
+        ref.get('source_tree_sha256') == candidate['source_tree_sha256'], 'successor_ai_candidate_binding')
+    release = private_record(store / 'releases' / (ref['source_tree_sha256']+'-'+ref['commit_sha']) / 'record.json',
+                             digest_value(ref.get('record_sha256')))
+    must(all(release.get(k) == v for k,v in candidate.items()), 'successor_ai_candidate_provenance')
+    core = private_record(STORE / 'CURRENT.json').get('release')
+    must(core == snapshot.get('core') and core.get('artifact_sha256') == value['upgrade']['candidate']['artifact_sha256'] and
+        core.get('commit_sha') == value['upgrade']['candidate']['commit_sha'], 'successor_core_bridge_required')
+    phase = journal['phase']; ref_now = current.get('release')
+    must(ref_now in (binding['ai_before'], ref), 'successor_ai_current_drift')
+    if phase in {'PREPARED','QUIESCE_INTENT','QUIESCED','STOP_INTENT','STOPPED','RESTORE_START_INTENT','RESTORED'}:
+        if phase == 'RESTORED': must(ref_now == binding['ai_before'], 'successor_ai_restored_pointer')
+        return checked('bridge')
+    if phase in {'START_INTENT','ACCEPTED','CURRENT_COMMIT_INTENT','COMMITTED'}:
+        if phase == 'COMMITTED': must(ref_now == ref, 'successor_ai_committed_pointer')
+        return checked('final')
+    must(phase in {'INSTALL_INTENT','INSTALLED','RECOVERY_REQUIRED','RESTORE_STOP_INTENT','RESTORE_STOPPED','RESTORE_INTENT'},
+         'successor_ai_phase')
+    return checked('transition')
 
 
 def require_release_configuration(value, record):

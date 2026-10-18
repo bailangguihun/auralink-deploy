@@ -191,7 +191,8 @@ class AdapterTests(unittest.TestCase):
             (installer, 'HANDOFF', self.root / 'runtime/handoff-control.env'),
             (installer, 'HOOK', self.root / 'operations/ai_release_guard.py')):
             self.patches.append(patch.object(module, key, value))
-        self.patches += [patch.object(guard, 'read_file', self.read_file),
+        self.patches += [patch.object(guard.core, 'policy', return_value={}),
+                         patch.object(guard, 'read_file', self.read_file),
                          patch.object(guard, 'private_record', self.private_record),
                          patch.object(runtime, 'get_json', self.http),
                          patch.object(runtime, 'verify_http', lambda *a, **k: {'gallery_total': 40}),
