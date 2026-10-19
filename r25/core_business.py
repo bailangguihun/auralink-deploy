@@ -206,7 +206,7 @@ def validate_policy(policy):
     digest(config['before_sha256']); digest(config['after_sha256'])
     must((assistant or config['before_sha256'] == legacy['application_configuration_sha256']) and
          (config['before_sha256'] != config['after_sha256'] or
-          (assistant and 'successor' in up and config['before_sha256'] == config['after_sha256'])),
+          (assistant and ('successor' in up or 'core_followup' in up) and config['before_sha256'] == config['after_sha256'])),
          'business_configuration_baseline')
     must(type(config['knowledge']) is dict and set(config['knowledge']) == set(keys), 'business_configuration_keys')
     must(config['knowledge']['map-enabled'] is map_enabled, 'business_configuration_profile')
@@ -280,6 +280,8 @@ def validate_policy(policy):
              'business_traversal_acl_ancestor')
     if 'successor' in up:
         validate_successor(policy)
+    if 'core_followup' in up:
+        validate_core_followup(policy)
     if assistant:
         module=assistant_module(policy)
         module.validate_contract(up.get('assistant'))
@@ -327,8 +329,8 @@ def render_configuration(before, policy):
         text = before.decode('utf-8')
     except UnicodeError as error:
         raise Refused('business_configuration_encoding') from error
-    if 'successor' in policy['upgrade']:
-        validate_successor(policy)
+    if 'successor' in policy['upgrade'] or 'core_followup' in policy['upgrade']:
+        (validate_successor if 'successor' in policy['upgrade'] else validate_core_followup)(policy)
         validate_existing_assistant_configuration(before, policy)
         must(sha(before) == config['after_sha256'], 'successor_bridge_configuration_unchanged')
         return before
@@ -366,6 +368,33 @@ def render_configuration(before, policy):
     must(sha(after) == config['after_sha256'], 'business_configuration_after')
     return after
 
+
+
+def validate_core_followup(policy):
+    """Core-only replacement after the completed finite Assistant successor.
+
+    The old transition is retained as immutable evidence, never re-authorized
+    against a different Core/POLICY. Runtime additionally checks its exact AI
+    CURRENT, COMMITTED journal, snapshot, accepted source and G1 bytes.
+    """
+    up = policy['upgrade']; value = up['core_followup']
+    must(up.get('capability') == 'assistant-v1' and 'successor' not in up and type(value) is dict and set(value) == {
+        'schema','acceptance','predecessor_policy_sha256','ai_release','ai_policy_sha256','ai_transaction_id',
+        'ai_active_sha256','ai_current_sha256','ai_journal_sha256','ai_snapshot_sha256','ai_configuration_sha256'},
+        'core_followup_contract_fields')
+    must(value['schema'] == 'R25_ASSISTANT_CORE_FOLLOWUP_V1', 'core_followup_contract_schema')
+    must(value['acceptance']=='gallery-daily-v1','core_followup_acceptance_contract')
+    for key in ('predecessor_policy_sha256','ai_policy_sha256','ai_active_sha256','ai_current_sha256',
+                'ai_journal_sha256','ai_snapshot_sha256','ai_configuration_sha256'):digest(value[key])
+    must(type(value['ai_transaction_id']) is str and re.fullmatch('[a-f0-9]{32}',value['ai_transaction_id']), 'core_followup_ai_transaction')
+    ref=value['ai_release']
+    must(type(ref) is dict and set(ref)=={'commit_sha','source_tree_sha256','record_sha256'}, 'core_followup_ai_reference')
+    for key,item in ref.items():digest(item,40 if key=='commit_sha' else 64)
+    config=up['configuration']
+    must(config['before_sha256']==config['after_sha256'] and
+         config['assistant']['execution.expected-config-sha256']==value['ai_configuration_sha256'] and
+         up['assistant']['baseline_policy_sha256']==value['predecessor_policy_sha256'], 'core_followup_configuration_binding')
+    return value
 
 
 def validate_successor(policy):

@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+import time
+from datetime import datetime, timedelta
 import urllib.error
 import urllib.request
+from urllib.parse import urlencode
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from core_release_guard import Refused, must
 
@@ -130,6 +136,85 @@ def authenticated_request(token):
     def get(path, accept='application/json'):
         return request(path, accept, bearer=token)
     return get
+
+
+def verify_gallery_followup_http(*, get_authenticated, monotonic=time.monotonic,
+                                today=lambda: datetime.now(ZoneInfo('Asia/Shanghai')).date()):
+    """Finite Gallery-daily capability acceptance for the new candidate only.
+
+    Eight GETs using the existing fixed-origin, no-redirect, 8-second HTTP
+    adapter. Each response is bounded there; this sequence also refuses after
+    60 seconds and never retries. A catalog/date change is an inconclusive
+    acceptance, not permission to mutate records or silently pick another day.
+    Returned evidence contains only counts, date and a keyword digest.
+    """
+    started = monotonic(); day = today(); calls = 0
+
+    def fetch(sort, page=0, *, order_date=None, keyword=None):
+        nonlocal calls
+        must(monotonic() - started < 60, 'gallery_followup_deadline')
+        must(today() == day, 'gallery_followup_date_changed')
+        parameters = {'sort': sort, 'direction': 'asc', 'page': page, 'size': 2}
+        if order_date is not None: parameters['orderDate'] = order_date
+        if keyword is not None: parameters['keyword'] = keyword
+        calls += 1
+        must(calls <= 8, 'gallery_followup_request_limit')
+        value = json_response('/api/v1/paintings?' + urlencode(parameters), get=get_authenticated)
+        must(monotonic() - started < 60, 'gallery_followup_deadline')
+        must(today() == day, 'gallery_followup_date_changed')
+        actual_page = 0 if sort == 'daily' and order_date != day.isoformat() else page
+        total, items = value.get('totalElements'), value.get('items')
+        must(type(total) is int and total >= 0 and type(items) is list and
+             type(value.get('page')) is int and value['page'] == actual_page and
+             type(value.get('size')) is int and value['size'] == 2 and
+             type(value.get('totalPages')) is int and value['totalPages'] == (total + 1) // 2 and
+             len(items) == min(2, max(0, total - actual_page * 2)), 'gallery_followup_pagination')
+        for field, expected in (('first', actual_page == 0), ('last', (actual_page + 1) * 2 >= total),
+                                ('hasNext', (actual_page + 1) * 2 < total)):
+            must(type(value.get(field)) is bool and value[field] is expected, 'gallery_followup_pagination_flags')
+        must(value.get('orderDate') == (day.isoformat() if sort == 'daily' else None),
+             'gallery_followup_order_date')
+        ids = []
+        for item in items:
+            must(type(item) is dict and type(item.get('paintingId')) is str, 'gallery_followup_identity')
+            identity = item['paintingId']
+            try:
+                canonical = str(UUID(identity))
+            except (ValueError, AttributeError):
+                raise Refused('gallery_followup_identity') from None
+            must(identity == canonical, 'gallery_followup_identity')
+            ids.append(identity)
+        must(len(ids) == len(set(ids)), 'gallery_followup_duplicate_item')
+        return value, ids
+
+    source, _ = fetch('source')
+    must(source['totalElements'] > 0, 'gallery_followup_empty_catalog')
+    daily, ids = fetch('daily')
+    repeat, repeated_ids = fetch('daily', order_date=day.isoformat())
+    second, next_ids = fetch('daily', page=1, order_date=day.isoformat())
+    reset, reset_ids = fetch('daily', page=1, order_date=(day - timedelta(days=1)).isoformat())
+    must(ids == repeated_ids == reset_ids and not set(ids).intersection(next_ids),
+         'gallery_followup_daily_order')
+    # Use only an already public value, bounded well below Core's 200-char
+    # keyword limit. URL encoding is transport quoting, not wildcard escaping;
+    # literal %, _, Chinese and backslash correctness belongs to real PG tests.
+    keyword = next((item[field].strip()[:24] for item in source['items']
+                    for field in ('title', 'authorName', 'subject')
+                    if type(item.get(field)) is str and item[field].strip()), None)
+    must(keyword is not None, 'gallery_followup_public_keyword_unavailable')
+    filtered_source, _ = fetch('source', keyword=keyword)
+    filtered_daily, _ = fetch('daily', keyword=keyword, order_date=day.isoformat())
+    final, _ = fetch('source')
+    must(all(value['totalElements'] == source['totalElements'] for value in
+             (daily, repeat, second, reset, final)), 'gallery_followup_catalog_changed')
+    must(0 < filtered_source['totalElements'] == filtered_daily['totalElements'] <= source['totalElements'],
+         'gallery_followup_keyword_count')
+    return {'schema': 'R25_GALLERY_DAILY_READONLY_HTTP_ACCEPTANCE_V1', 'order_date': day.isoformat(),
+            'gallery_total': source['totalElements'], 'keyword_total': filtered_source['totalElements'],
+            'keyword_sha256': hashlib.sha256(keyword.encode('utf-8')).hexdigest(),
+            'daily_stable': True, 'pagination_disjoint': True, 'stale_date_resets_page': True,
+            'read_requests': calls, 'write_requests': 0, 'provider_requests': 0,
+            'elapsed_ms': round((monotonic() - started) * 1000)}
 
 
 def verify_knowledge_http(query, policy, *, get=request, get_authenticated):
