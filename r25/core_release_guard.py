@@ -224,6 +224,8 @@ def validate_configuration_context(value):
                                'RESTORE_STOPPED', 'RESTORE_INTENT'}, 'business_configuration_phase')
                 allowed = {'before_sha256', 'after_sha256'}
     hashes = {upgrade['configuration'][name] for name in allowed}
+    if 'core_followup' in upgrade:
+        verify_core_followup_context(value)
     if 'successor' in upgrade:
         phase = successor_configuration_phase(value)
         if side(reference) == 'before_sha256':
@@ -232,6 +234,71 @@ def validate_configuration_context(value):
         elif phase == 'transition': hashes.add(upgrade['successor']['core_final_sha256'])
     observed = hashlib.sha256(read_file(ROOT / 'runtime/config/application.yml')).hexdigest()
     must(observed in hashes, 'business_configuration_state')
+
+
+def verify_core_followup_context(value, predecessor=None, validator=None):
+    """Freeze a genuinely committed AI/G1 while Core changes or recovers.
+
+    The pre-install caller may supply predecessor bytes already SHA-bound by
+    its approved plan. Installed operation always reads the immutable copy at
+    a fixed content-addressed path. No old journal, CURRENT or record is edited.
+    """
+    core_business=validator if validator is not None else business_module(value)
+    binding=core_business.validate_core_followup(value)
+    prior_sha=binding['predecessor_policy_sha256']
+    if predecessor is None:
+        predecessor=private_record(STORE/'core-followup-baselines'/(prior_sha+'.json'),prior_sha)
+    prior=core_business.validate_successor(predecessor)
+    up=value['upgrade']; old=predecessor['upgrade']
+    must(predecessor.get('schema')==BUSINESS_POLICY_SCHEMA and
+         all(old['candidate'].get(k)==up['baseline_release'].get(k) for k in ('commit_sha','artifact_sha256')) and
+         prior['core_final_sha256']==up['configuration']['before_sha256'] and
+         prior['ai_configuration']['after_sha256']==binding['ai_configuration_sha256'], 'core_followup_predecessor_binding')
+    store=ROOT/'runtime/ai-publications'; tx=binding['ai_transaction_id']
+    ai_policy=private_record(store/'POLICY.json',binding['ai_policy_sha256'])
+    current=private_record(store/'CURRENT.json',binding['ai_current_sha256'])
+    active=private_record(store/'ACTIVE.json',binding['ai_active_sha256'])
+    journal=private_record(store/'transactions'/tx/'journal.json',binding['ai_journal_sha256'])
+    snapshot=private_record(store/'transactions'/tx/'snapshot.json',binding['ai_snapshot_sha256'])
+    ref=binding['ai_release']
+    must(current.get('schema')=='R25_AI_CURRENT_V1' and current.get('release')==ref and
+         active=={'schema':'R25_AI_ACTIVE_V1','transaction_id':tx}, 'core_followup_ai_current')
+    must(journal.get('schema')=='R25_AI_TRANSACTION_V1' and journal.get('transaction_id')==tx and
+         journal.get('phase')=='COMMITTED' and journal.get('current')==prior['ai_before'] and
+         journal.get('candidate')==ref and journal.get('snapshot_sha256')==binding['ai_snapshot_sha256'], 'core_followup_ai_not_committed')
+    transition=snapshot.get('configuration_transition')
+    must(snapshot.get('schema')=='R25_AI_SNAPSHOT_V1' and snapshot.get('transaction_id')==tx and
+         snapshot.get('current')==prior['ai_before'] and snapshot.get('candidate')==ref and
+         snapshot.get('core')==up['baseline_release'] and type(transition) is dict and
+         transition.get('policy_sha256')==prior_sha, 'core_followup_ai_snapshot')
+    record=private_record(store/'releases'/(ref['source_tree_sha256']+'-'+ref['commit_sha'])/'record.json',ref['record_sha256'])
+    must(record.get('schema')=='R25_AI_ACCEPTED_SOURCE_V2' and record.get('policy_sha256')==binding['ai_policy_sha256'] and
+         all(record.get(k)==v for k,v in prior['ai_candidate'].items()) and
+         record.get('commit_sha')==ref['commit_sha'] and record.get('source_tree_sha256')==ref['source_tree_sha256'],
+         'core_followup_ai_provenance')
+    # This guard is also loaded standalone by the Java launcher. Do not import
+    # sibling publisher modules from ambient sys.path/module caches.
+    paths=tuple(sorted(('guide_service/__init__.py','guide_service/__main__.py','guide_service/app.py',
+        'guide_service/config.py','guide_service/diagnostics.py','guide_service/env_loader.py','guide_service/qwen_client.py',
+        'guide_service/schema.py','guide_service/requirements.txt','critic-service/app/__init__.py','critic-service/app/config.py',
+        'critic-service/app/dimensions.py','critic-service/app/image_utils.py','critic-service/app/llm.py','critic-service/app/main.py',
+        'critic-service/app/orchestrator.py','critic-service/app/prompts.py','critic-service/app/schemas.py','critic-service/requirements.txt')+
+        tuple('critic-service/app/assistant/'+name for name in ('__init__.py','config.py','schemas.py','router.py',
+            'execution.py','providers.py','retrieval.py','prompts.py'))))
+    must(ai_policy.get('schema')=='R25_AI_SOURCE_POLICY_V2' and ai_policy.get('source_paths')==list(paths),
+         'core_followup_ai_policy')
+    files=record.get('files')
+    must(type(files) is list and all(type(item) is dict for item in files) and [item.get('path') for item in files]==list(paths) and
+         hashlib.sha256(encoded(files).rstrip(b'\n')).hexdigest()==ref['source_tree_sha256'], 'core_followup_ai_inventory')
+    for item in files:
+        must(set(item)=={'path','bytes','sha256'} and type(item['bytes']) is int and 0<=item['bytes']<=1024*1024,
+             'core_followup_ai_file')
+        raw=read_file(ROOT/'release'/item['path'],owner=core_business.owner(ai_policy.get('source_owner')),mode=0o600,
+                      expected=digest_value(item['sha256']))
+        must(len(raw)==item['bytes'], 'core_followup_ai_bytes')
+    read_file(ROOT/'runtime/config/assistant-private/assistant-runtime.json',
+              owner=tuple(value['installation']['private_owner']),mode=0o600,expected=binding['ai_configuration_sha256'])
+    return ref
 
 
 

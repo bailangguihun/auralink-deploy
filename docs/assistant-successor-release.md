@@ -2,6 +2,8 @@
 
 本次改变是显式作品选择/权威 Core 查询/有据回答和既有 Flash 参数修复，**不是 V1 等价重打包**。沿用 R25/c5ea 锁、可信正式包、私有批准、原事务和恢复入口，不增加启动器或守护器。
 
+该 successor 的 Core、AI/G1 已 COMMITTED 后，若仅更换兼容 Core，请使用受限的 [Core-only followup](core-followup-release.md)；不要重放本页安装/AI转换。下文原 successor 的身份及恢复规则保持不变。
+
 ## 受审状态与有限变换
 
 状态链固定为 `C0/A0/G0 → C1/A0/G0 → C1/A1/G1 → Web`。C0 是实际已验收 Assistant Core，不是历史 Knowledge JAR。数据库保留 V001–V016；没有新 SQL、down migration 或数据库恢复。Core 原发布事务仍做一致性备份并只读核验完整 schema。
