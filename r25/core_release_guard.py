@@ -167,6 +167,14 @@ def policy():
     if result.get('schema') == BUSINESS_POLICY_SCHEMA:
         business_module(result).validate_policy(result)
         validate_configuration_context(result)
+        if 'R25_VMM_CONTROLLER' in values:
+            # Optional reviewed controller-only overlay. Original POLICY bytes
+            # and accepted-record hashes remain authoritative and unchanged.
+            path = ROOT / 'operations/r25-publisher/vmm_controller.py'
+            must(values.get('R25_VMM_CONTROLLER') == str(path), 'vmm_controller_path')
+            raw = read_file(path, expected=digest_value(values.get('R25_VMM_CONTROLLER_SHA256')))
+            module = source_module(path, 'r25_bound_vmm_controller', raw)
+            result = module.apply_policy_overlay(result, values, ROOT)
         return result
     must(result.get('schema') == POLICY_SCHEMA and result.get('baseline_sha256') == BASELINE and
          result.get('baseline_commit') == BASELINE_COMMIT and
