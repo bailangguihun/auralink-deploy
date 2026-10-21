@@ -25,6 +25,50 @@ SELECT (SELECT count(*) FROM creations WHERE status IN ('QUEUED','RUNNING'))
 +(SELECT count(*) FROM catalog_painting_guide_generation_attempts
  WHERE status IN ('DISPATCHING','POST_RESPONSE_UNCERTAIN')); ROLLBACK;"""
 
+MANAGED_VMM_INFLIGHT_SQL = """BEGIN READ ONLY;
+SET LOCAL statement_timeout='8000ms';
+WITH music_creations AS (
+  SELECT c.id, c.status, c.error_code
+  FROM creations c
+  WHERE EXISTS (
+    SELECT 1 FROM creation_steps s
+    WHERE s.creation_id=c.id AND s.operation_code='PAINTING_TO_MUSIC'
+  )
+), music_steps AS (
+  SELECT s.id, s.creation_id, s.status, s.provider_dispatch_state, s.error_code
+  FROM creation_steps s JOIN music_creations c ON c.id=s.creation_id
+  WHERE s.operation_code='PAINTING_TO_MUSIC'
+), music_dispatches AS (
+  SELECT d.dispatch_state, d.finished_at, d.resolution_code
+  FROM creation_step_dispatch_attempts d JOIN music_steps s ON s.id=d.creation_step_id
+)
+SELECT jsonb_build_object(
+  'music_creations_by_status', COALESCE((SELECT jsonb_object_agg(status,n) FROM
+    (SELECT status,count(*) AS n FROM music_creations GROUP BY status) q),'{}'::jsonb),
+  'music_steps_by_status', COALESCE((SELECT jsonb_object_agg(status,n) FROM
+    (SELECT status,count(*) AS n FROM music_steps GROUP BY status) q),'{}'::jsonb),
+  'music_steps_by_dispatch_state', COALESCE((SELECT jsonb_object_agg(provider_dispatch_state,n) FROM
+    (SELECT provider_dispatch_state,count(*) AS n FROM music_steps GROUP BY provider_dispatch_state) q),'{}'::jsonb),
+  'music_queued', (SELECT count(*) FROM music_creations WHERE status='QUEUED'),
+  'music_running', (SELECT count(*) FROM music_creations WHERE status='RUNNING'),
+  'music_current_send_started', (SELECT count(*) FROM music_steps WHERE provider_dispatch_state='SEND_STARTED'),
+  'music_dispatch_history_send_started', (SELECT count(*) FROM music_dispatches WHERE dispatch_state='SEND_STARTED'),
+  'music_dispatch_unfinished', (SELECT count(*) FROM music_dispatches WHERE finished_at IS NULL),
+  'music_execution_attempts_unfinished', (SELECT count(*) FROM creation_execution_attempts e
+    JOIN music_creations c ON c.id=e.creation_id WHERE e.finished_at IS NULL),
+  'music_creation_explicit_uncertain', (SELECT count(*) FROM music_creations
+    WHERE error_code IN ('PROVIDER_OUTCOME_UNCERTAIN','PROVIDER_DISPATCH_AMBIGUOUS')),
+  'music_step_explicit_uncertain', (SELECT count(*) FROM music_steps
+    WHERE error_code IN ('PROVIDER_OUTCOME_UNCERTAIN','PROVIDER_DISPATCH_AMBIGUOUS')),
+  'music_dispatch_resolution_uncertain', (SELECT count(*) FROM music_dispatches
+    WHERE resolution_code IN ('PROVIDER_OUTCOME_UNCERTAIN','PROVIDER_DISPATCH_AMBIGUOUS')),
+  'music_execution_resolution_uncertain', (SELECT count(*) FROM creation_execution_attempts e
+    JOIN music_creations c ON c.id=e.creation_id
+    WHERE e.resolution_code IN ('PROVIDER_OUTCOME_UNCERTAIN','PROVIDER_DISPATCH_AMBIGUOUS'))
+)::text;
+ROLLBACK;
+"""
+
 PRIVATE_SAMPLE_SQL = """BEGIN READ ONLY; SET LOCAL statement_timeout='8000ms';
 SELECT coalesce(jsonb_agg(item),'[]'::jsonb)::text FROM (
  SELECT sr.painting_id::text AS painting_id,
@@ -303,3 +347,29 @@ def verify_knowledge_http(query, policy, *, get=request, get_authenticated):
     else:
         receipt['map_authenticated_status'] = 503
     return receipt
+
+
+def verify_managed_vmm_closed_http(*,get_authenticated):
+    """One authenticated non-generating capability GET; no VMM dispatch probe."""
+    value=json_response('/api/v1/workflow/node-types',get=get_authenticated)
+    must(value.get('featureEnabled') is True and type(value.get('operations'))is list,'managed_vmm_capability_contract')
+    music=[x for x in value['operations'] if type(x)is dict and x.get('code')=='PAINTING_TO_MUSIC']
+    must(len(music)==1 and music[0].get('inputModality')=='PAINTING' and music[0].get('outputModality')=='AUDIO' and
+         music[0].get('executionAvailable')is False and music[0].get('availabilityReason') in
+         {'CREATION_PROVIDER_NOT_READY','CREATION_PROVIDER_CONFIGURATION_MISSING','CREATION_PROVIDER_CONFIGURATION_INVALID'},'managed_vmm_dispatch_not_closed')
+    providers=music[0].get('providers')
+    must(type(providers)is list and len(providers)>0 and all(type(x)is dict and x.get('executionAvailable')is False for x in providers),'managed_vmm_provider_not_closed')
+    return {'contract':'managed-vmm-closed-v1','requests':1,'generation_requests':0,'dispatch_permitted':False}
+
+
+def verify_managed_vmm_inventory(value,*,require_clear=True):
+    groups={'music_creations_by_status','music_steps_by_status','music_steps_by_dispatch_state'}
+    counters={'music_queued','music_running','music_current_send_started','music_dispatch_history_send_started',
+        'music_dispatch_unfinished','music_execution_attempts_unfinished','music_creation_explicit_uncertain',
+        'music_step_explicit_uncertain','music_dispatch_resolution_uncertain','music_execution_resolution_uncertain'}
+    must(type(value)is dict and set(value)==groups|counters,'managed_vmm_inventory_contract')
+    for key in groups:
+        must(type(value[key])is dict and all(type(k)is str and re.fullmatch('[A-Z_]{1,40}',k) and type(n)is int and n>=0 for k,n in value[key].items()),'managed_vmm_inventory_counts')
+    must(all(type(value[k])is int and value[k]>=0 for k in counters),'managed_vmm_inventory_counts')
+    if require_clear:must(all(value[k]==0 for k in counters),'managed_vmm_work_requires_readonly_reconciliation')
+    return value

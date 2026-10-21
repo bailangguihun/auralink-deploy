@@ -204,9 +204,13 @@ class Runtime:
         journal=json_read(self.root/'runtime/core-publications/controller-upgrades'/ident/'journal.json',self.private)
         prior=json_read(self.root/'runtime/core-publications/controller-upgrades'/ident/'approval.json',self.private,ident)
         must(journal.get('phase')=='INSTALLED' and journal.get('approval_sha256')==ident and
-             prior.get('schema')=='R25_ASSISTANT_CORE_FOLLOWUP_BINDING_V1' and
+             prior.get('schema') in {'R25_ASSISTANT_CORE_FOLLOWUP_BINDING_V1','R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1'} and
              prior.get('operational',{}).get('policy',{}).get('after_sha256')==observed['policy'],
              'prior_controller_incomplete_or_mismatched')
+        if prior['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1':
+            must(policy['upgrade']['core_followup'].get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1' and
+                 prior.get('files',{}).get('core_release_guard.py',{}).get('after_sha256')==policy.get('controllers',{}).get('core_release_guard.py'),
+                 'managed_core_controller_binding')
         if runtime:return observed
         for kind in ('core','ai'):
             store=self.root/f'runtime/{kind}-publications'
@@ -272,6 +276,21 @@ def render_handoff(before,rt,after):
     return ('\n'.join(lines+[key+'='+value for key,value in additions.items()])+'\n').encode()
 
 
+
+def verify_baseline_controls(rt,old,sources):
+    must(sha(old['lifecycle'])==BASE_LIFECYCLE and old['publisher-guard']==old['operation-guard'],'installed_control_baseline')
+    policy=json_read(rt.preserved()['policy'],rt.private)
+    if policy['upgrade']['core_followup'].get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1':
+        # The bounded managed Core binding must already be installed and its
+        # guard must be the identical source from this formal extension bundle.
+        # An arbitrary policy hash is never an extension installation baseline.
+        active=json_read(rt.preserved()['original-controller-active'],rt.private)
+        prior=json_read(rt.root/'runtime/core-publications/controller-upgrades'/digest(active.get('approval_sha256'))/'approval.json',rt.private,active['approval_sha256'])
+        must(prior.get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1' and
+             sha(old['operation-guard'])==sha(sources['core_release_guard.py'])==prior['files']['core_release_guard.py']['after_sha256'],
+             'managed_core_formal_guard_baseline')
+    else:must(sha(old['operation-guard'])==BASE_GUARD,'installed_control_baseline')
+
 def prepare(rt, request_sha):
     request=json_read(rt.store/'REQUEST.json',rt.private,request_sha)
     must(set(request)=={'schema','deploy','review_evidence_sha256'} and request['schema']=='R25_VMM_CONTROLLER_REQUEST_V1','request_fields')
@@ -283,7 +302,7 @@ def prepare(rt, request_sha):
         for name,(path,owner,mode) in targets.items():
             before[name]=read(path,owner,mode) if path.exists() else None
             must(before[name]is not None if name in {'lifecycle','publisher-guard','operation-guard','handoff'} else before[name]is None,'installed_target_precondition')
-        must(sha(before['lifecycle'])==BASE_LIFECYCLE and sha(before['operation-guard'])==BASE_GUARD and before['publisher-guard']==before['operation-guard'],'installed_control_baseline')
+        verify_baseline_controls(rt,before,sources)
         after={name:sources[name] for name in ('vmm_controller.py','vmm_lifecycle.py','vmm_service.py')}
         after.update({'publisher-guard':sources['core_release_guard.py'],'operation-guard':sources['core_release_guard.py'],
             'lifecycle':renderer(folder,sources,before['lifecycle']), 'role':encoded({'schema':'R25_VMM_ROLE_V1','enabled':False})})
@@ -347,7 +366,7 @@ def before_after(rt,plan,folder,sources,bundle):
         previous=folder/'before'/name
         old[name]=(read(previous,rt.private,expected=plan['files'][name]['before_sha256']) if previous.exists()
                    else read(path,owner,mode,plan['files'][name]['before_sha256']) if plan['files'][name]['before_sha256'] else None)
-    must(sha(old['lifecycle'])==BASE_LIFECYCLE and sha(old['operation-guard'])==BASE_GUARD and old['publisher-guard']==old['operation-guard'],'approved_baseline')
+    verify_baseline_controls(rt,old,sources)
     after={n:sources[n] for n in ('vmm_controller.py','vmm_lifecycle.py','vmm_service.py')}
     after.update({'publisher-guard':sources['core_release_guard.py'],'operation-guard':sources['core_release_guard.py'],
         'lifecycle':renderer(bundle,sources,old['lifecycle']),'role':encoded({'schema':'R25_VMM_ROLE_V1','enabled':False})})
