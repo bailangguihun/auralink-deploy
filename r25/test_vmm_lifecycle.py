@@ -152,6 +152,28 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual(0, self.role.state()['attempts'])
             self.assertTrue(life.port_busy(self.port))
 
+    def test_time_wait_is_not_an_active_foreign_listener(self):
+        # Real kernel TIME_WAIT: a bind probe fails although no LISTEN socket
+        # remains. This regression fails with the original bind-based probe.
+        with socket.socket() as server, socket.socket() as client:
+            server.bind(('127.0.0.1', 0)); port = server.getsockname()[1]
+            server.listen(); client.connect(('127.0.0.1', port))
+            accepted, _ = server.accept()
+            accepted.shutdown(socket.SHUT_WR)
+            self.assertEqual(b'', client.recv(1))
+            client.close(); accepted.close(); server.close()
+            until = time.monotonic() + 1
+            while time.monotonic() < until:
+                states = [line.split()[3] for line in Path('/proc/net/tcp').read_text().splitlines()[1:]
+                          if int(line.split()[1].split(':')[1], 16) == port]
+                if '06' in states: break
+                time.sleep(.01)
+            self.assertIn('06', states)
+            with socket.socket() as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with self.assertRaises(OSError):probe.bind(('127.0.0.1', port))
+            self.assertFalse(life.port_busy(port))
+
     def test_reused_pid_rejected_without_signal(self):
         self.start()
         value = self.role.state()

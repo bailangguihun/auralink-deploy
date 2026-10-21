@@ -103,22 +103,23 @@ def process(pid):
 
 
 def port_busy(port):
-    with socket.socket() as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(('127.0.0.1', port))
-            return False
-        except OSError:
-            return True
+    # bind() failure can be TIME_WAIT, not a live listener. The child still
+    # binds before any model load; a genuinely unavailable bind fails closed.
+    return bool(listening_inodes(port))
 
 
-def owned_listener(pid, port):
+def listening_inodes(port):
     inodes = set()
     for table in ('tcp', 'tcp6'):
         for line in (Path('/proc/net') / table).read_text().splitlines()[1:]:
             fields = line.split()
             if fields[3] == '0A' and int(fields[1].split(':')[1], 16) == port:
                 inodes.add(fields[9])
+    return inodes
+
+
+def owned_listener(pid, port):
+    inodes = listening_inodes(port)
     if not inodes:
         return False
     owned = set()
