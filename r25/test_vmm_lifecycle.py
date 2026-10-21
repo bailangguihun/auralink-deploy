@@ -1,8 +1,9 @@
 """Real CPU child processes, loopback status and original lock semantics."""
 import contextlib
+import ctypes
+import errno
 import fcntl
 import hashlib
-import json
 import os
 from pathlib import Path
 import signal
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import vmm_lifecycle as life
 import vmm_service
@@ -82,27 +83,6 @@ class LifecycleTest(unittest.TestCase):
                              {'PATH': '/usr/bin:/bin', 'R25_VMM_HEALTH_TOKEN': 'fixture'}, self.root,
                              self.port, self.store, startup_seconds=.3, stop_seconds=1, restart_limit=0)
         self.processes = []
-        # Capture the real /proc boundary on runners where a stop is refused.
-        # Only synthetic PID/socket metadata is logged, never service inputs.
-        original_process = life.process
-        def observed_process(pid):
-            value = original_process(pid)
-            if value is None and life.port_busy(self.port):
-                root = Path('/proc') / str(pid)
-                diagnostic = {'pid': pid, 'port': self.port,
-                              'listening_inodes': sorted(life.listening_inodes(self.port))}
-                for name in ('stat', 'status'):
-                    try:
-                        raw = (root / name).read_text()
-                        diagnostic[name] = raw if name == 'stat' else [line for line in raw.splitlines()
-                            if line.startswith(('State:', 'Pid:', 'PPid:', 'Uid:', 'Threads:'))]
-                    except OSError as error:
-                        diagnostic[name] = {'errno': error.errno}
-                print('VMM_CPU_STOP_BOUNDARY=' + json.dumps(diagnostic), flush=True)
-            return value
-        self.process_probe = patch.object(life, 'process', observed_process)
-        self.process_probe.start()
-        self.addCleanup(self.process_probe.stop)
 
     def tearDown(self):
         # Tests clean only their captured child handles; no port/name signaling.
@@ -204,6 +184,82 @@ class LifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(life.Refused, 'reused'):
             self.role.stop()
         self.assertIsNone(self.role.children[0].poll())
+
+    def test_stop_uses_stat_when_full_identity_probe_disappears(self):
+        self.script.write_text(CHILD.replace('started=time.monotonic()',
+            'import signal\nsignal.signal(signal.SIGTERM, lambda *_: (time.sleep(.15), sys.exit(0)))\nstarted=time.monotonic()'))
+        self.start()
+        real_process, real_signal = life.process, signal.pidfd_send_signal
+        sent = []
+        def send(*args):
+            result = real_signal(*args); sent.append(True); return result
+        def observed(pid):
+            # Reproduce an exe/cwd lookup disappearing after SIGTERM while
+            # the actual HTTP child still performs its bounded exit cleanup.
+            return None if sent else real_process(pid)
+        with patch.object(signal, 'pidfd_send_signal', send), patch.object(life, 'process', observed):
+            self.assertEqual('STOPPED', self.role.stop()['result'])
+        self.assertTrue(sent)
+        self.assertFalse(life.port_busy(self.port))
+
+    def test_stop_pins_actual_child_without_python_pidfd_open_wrapper(self):
+        self.start()
+        with patch.object(os, 'pidfd_open', None, create=True):
+            self.assertEqual('STOPPED', self.role.stop()['result'])
+        self.assertFalse(self.role.status()['alive'])
+
+    def test_pidfd_unavailable_never_falls_back_to_numeric_signal(self):
+        self.start()
+        libc = Mock()
+        def unavailable(*args):
+            ctypes.set_errno(errno.ENOSYS)
+            return -1
+        libc.syscall.side_effect = unavailable
+        with patch.object(os, 'pidfd_open', None, create=True), patch.object(ctypes, 'CDLL', return_value=libc):
+            with self.assertRaisesRegex(OSError, 'not implemented'):
+                self.role.stop()
+        self.assertIsNone(self.role.children[0].poll())
+        self.assertEqual('CLOSED', self.store.snapshot()['mode'])
+        self.assertEqual('STOPPED', self.role.state()['desired'])
+
+    def test_stop_waits_only_for_previously_owned_socket_observation(self):
+        self.start()
+        real_inodes = life.listening_inodes
+        old = real_inodes(self.port)
+        self.assertTrue(old)
+        lag = []
+        def observed(port):
+            current = real_inodes(port)
+            if port == self.port and not current and len(lag) < 3:
+                lag.append(True)
+                return old  # kernel observation lag, not a new listener
+            return current
+        with patch.object(life, 'listening_inodes', observed):
+            self.assertEqual('STOPPED', self.role.stop()['result'])
+        self.assertEqual(3, len(lag))
+
+    def test_new_listener_during_stop_is_refused_without_signal(self):
+        self.start()
+        real_inodes = life.listening_inodes
+        replacement = socket.socket()
+        replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bound = []
+        def observed(port):
+            current = real_inodes(port)
+            if port == self.port and not current and not bound:
+                replacement.bind(('127.0.0.1', port)); replacement.listen()
+                bound.append(True)
+                return real_inodes(port)
+            return current
+        try:
+            with patch.object(life, 'listening_inodes', observed):
+                with self.assertRaisesRegex(life.Refused, 'foreign_listener_after_stop'):
+                    self.role.stop()
+            self.assertTrue(bound)
+            with socket.create_connection(('127.0.0.1', self.port), timeout=1):
+                accepted, _ = replacement.accept(); accepted.close()
+        finally:
+            replacement.close()
 
     def test_stale_record_recovery_budget_is_durable(self):
         self.role.restart_limit = 1

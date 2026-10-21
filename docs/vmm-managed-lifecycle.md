@@ -8,6 +8,8 @@ Use the clean legacy installation `b115f0724e16f16128563dc996c5a10082783074`, `V
 
 Runtime policy separates **process alive**, **model ready**, and **dispatch permitted**. A loopback listener must belong to the recorded PID, boot ID, start ticks, executable, argv, uid, cwd and process group. A foreign listener or reused PID is a refusal, never an adoption or kill. A separate inherited process-lifetime lease prevents a second child after a crash between spawn and PID-record persistence. This is an ownership guard, not a supervisor. The original shared deployment lock covers short control/state operations only; it is not inherited by VMM and is not held through initialization or music generation.
 
+Stop pins the target with a Linux pidfd before its final identity check and signal, with no numeric-PID signal fallback. The installed R25 Python 3.10 exports `signal.pidfd_send_signal` but omits `os.pidfd_open`; glibc 2.35 also omits the named wrapper. A small stdlib ctypes adapter uses only the verified Linux x86_64 `pidfd_open` syscall ABI (434). Other unsupported platforms or syscall errors fail closed; no runtime upgrade is implied. CPU tests exercise both Python and direct-syscall paths, including ENOSYS. Production kernel/syscall permission remains a later preflight gate. Stop proves exit from boot/start ticks/stat, because exe/cwd may vanish earlier, and waits for only the previously owned socket inodes within the same stop budget. A new listener inode is an immediate refusal.
+
 ## Modes and controls
 
 After an independently reviewed role configuration binding, the existing bound `operations/lifecycle_adapter.py` gains:

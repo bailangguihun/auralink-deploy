@@ -8,10 +8,12 @@ deployment lock. Desired state and an execution budget survive process death.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import fcntl
 import importlib.util
 import json
 import os
+import platform
 from pathlib import Path
 import signal
 import socket
@@ -106,6 +108,41 @@ def port_busy(port):
     # bind() failure can be TIME_WAIT, not a live listener. The child still
     # binds before any model load; a genuinely unavailable bind fails closed.
     return bool(listening_inodes(port))
+
+
+def stopping_process_alive(saved):
+    # exe/cwd can disappear before a task exits. Do not reuse the multi-file
+    # readiness identity probe as proof of completed SIGTERM cleanup.
+    must(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == saved['boot_id'],
+         'vmm_stop_boot_changed')
+    try:
+        raw = (Path('/proc') / str(saved['pid']) / 'stat').read_text()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise Refused('vmm_stop_identity_unreadable') from error
+    fields = raw[raw.rfind(')') + 2:].split()
+    must(len(fields) > 19 and fields[19] == saved['ticks'], 'vmm_stop_pid_reused')
+    return fields[0] != 'Z'
+
+
+def open_pidfd(pid):
+    native = getattr(os, 'pidfd_open', None)
+    if native is not None:
+        return native(pid)
+    # Installed R25 conda Python omits os.pidfd_open and glibc 2.35 has no
+    # named wrapper. Use the fixed Linux x86_64 ABI, not a numeric-PID kill.
+    must(platform.system() == 'Linux' and platform.machine() == 'x86_64',
+         'vmm_pidfd_unsupported_platform')
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.argtypes = [ctypes.c_long, ctypes.c_int, ctypes.c_uint]
+    syscall.restype = ctypes.c_long
+    descriptor = syscall(434, pid, 0)  # __NR_pidfd_open, Linux x86_64
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
 
 
 def listening_inodes(port):
@@ -311,16 +348,33 @@ class Role:
             self.gate.on_start()
         must(not self.gate.snapshot()['in_flight'], 'vmm_in_flight_drain_required')
         if active:
+            closing_inodes = listening_inodes(self.port)
             owned_listener(active['pid'], self.port)
-            self.owned(value)
-            os.kill(active['pid'], signal.SIGTERM)
+            # A pidfd pins this exact process across the final identity check
+            # and signal. Never fall back to signalling a possibly reused PID.
+            must(hasattr(signal, 'pidfd_send_signal'), 'vmm_pidfd_required')
+            try:
+                pidfd = open_pidfd(active['pid'])
+            except ProcessLookupError:
+                pidfd = None
+            if pidfd is not None:
+                try:
+                    must(self.owned(value) == active, 'vmm_stop_identity_changed')
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass  # pinned process already exited; no numeric-PID fallback
+                finally:
+                    os.close(pidfd)
             until = time.monotonic() + self.stop_seconds
-            current = process(active['pid'])
-            while time.monotonic() < until and current is not None:
-                must(current['ticks'] == active['ticks'] and current['boot_id'] == active['boot_id'], 'vmm_stop_pid_reused')
+            while True:
+                alive = stopping_process_alive(active)
+                remaining = listening_inodes(self.port)
+                must(remaining <= closing_inodes, 'vmm_foreign_listener_after_stop')
+                if not alive and not remaining:
+                    break
+                must(time.monotonic() < until, 'vmm_stop_timeout')
                 time.sleep(.025)
-                current = process(active['pid'])
-            must(current is None, 'vmm_stop_timeout')
         must(not port_busy(self.port), 'vmm_foreign_listener_after_stop')
         descriptor = self.instance_lease()
         os.close(descriptor)
