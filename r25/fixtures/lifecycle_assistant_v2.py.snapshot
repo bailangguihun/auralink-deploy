@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""R25 application lifecycle adapter; fixed production CLI, explicit fixture API.
+
+Keep the established Java launcher and Critic private wrappers unchanged. Next
+belongs to unchanged c5ea through the hash-bound external selector. A shared
+deployment lease covers every lifecycle action. The healthy externally owned
+Tunnel is verified, never stopped or adopted into an obsolete R25 PID record.
+"""
+from __future__ import annotations
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = Path('/root/autodl-tmp/artlive-r25-native-pg16/handoff-production-20260923T062101Z')
+BASE = '3260eba56991c8327542e3e90facf9831effa2a6217a61c1f1fe3bc849ab53b4'
+CANDIDATE = '2e273a737b68aeac4095cc490c5933a81b4b02fca96409252368b0a7c51a611b'
+HUANIAO_CANDIDATE = '3a37ad49be1b9c45461302c1dcc51f55399e5fc2536e7959e35e5decda2a0417'
+COORDINATED_CURRENT = 'f00a9773a18039e0d86c1938099a17d3d274023e8de5ad8e9ee4f760aff6a324'
+COORDINATED_CANDIDATE = '60c5b95529e027ec2cd3634cc6fe190fe43b42c48eb402e2d9ba0f1ce7caaecb'
+JAVA_LAUNCH = 'a03e698d4c751b0840f8f6a8f7fd794424743df4a8b7b7277aab386e21ec7de1'
+WRAPPERS = {'current-3260': '92adabbcdeebee69ccdb1bcda487a4c6bb3250a20a56b383029630296fae76d3',
+            'candidate-isolated': 'bdc568450753de15a867a9ada6c2f58cdaa7c28c7b0591d8f1b7b9bfa2b4a8c8'}
+PYTHON = {'current-3260': {'main.py': '67e50e24ae1c557240cd806f924d277c32fa896ea0683107f8862a8e6d2e8109',
+                         'config.py': 'afdefae73c1fcc47a0f304f5fa5b880c3bc3b1920dbfa36b28c1922a10c6835d'},
+          'candidate-isolated': {'main.py': '7c7cb53b5cdcbdf7e7193fc8c3af853c8d3214ee2b6a581fd30af6cbb798839d',
+                                 'config.py': '5f9fb53a2ba57a8221d2940268d11da8eb54afa8be2fa287ca0f4b0e27486e43'}}
+LLM = '956cf0029f3f03c5aa1e3b0276fef6be2261a90b06c7704a692dd98d05c70614'
+SELECTOR = 'e7ef56459448e957c153be710c4a8afaf69c1e9f9d791dd5926ae3bce21fb45f'
+POLICY = b'AURALINK_CRITIC_EXECUTION_POLICY=isolated-stub-only\n'
+EXECUTION_POLICIES = frozenset({'isolated-stub-only', 'configured-provider'})
+
+def parse_execution_policy(data):
+    """Only an explicit, canonical, persistent finite policy is accepted."""
+    for value in EXECUTION_POLICIES:
+        if data == ('AURALINK_CRITIC_EXECUTION_POLICY='+value+'\n').encode('ascii'):
+            return value
+    raise Refused('execution_policy_invalid')
+
+class Refused(RuntimeError): pass
+class Busy(Refused): pass
+def must(ok, reason):
+    if not ok: raise Refused(reason)
+def sha(path):
+    value=hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1048576),b''):value.update(chunk)
+    return value.hexdigest()
+def no_links(path):
+    for item in [path,*path.parents]:must(not item.is_symlink(),'symlink_path')
+def guard(path, owner=(0,0), mode=0o600, digest=None, directory=False):
+    no_links(path);value=path.lstat()
+    must((stat.S_ISDIR if directory else stat.S_ISREG)(value.st_mode),'object_type')
+    must((value.st_uid,value.st_gid,stat.S_IMODE(value.st_mode))==(*owner,mode),'object_identity')
+    must(digest is None or sha(path)==digest,'artifact_identity')
+def envfile(path):
+    must(path.stat().st_size<=1024*1024,'configuration_size_limit')
+    values={}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith('#'):continue
+        must('=' in line,'configuration_syntax');key,value=line.split('=',1)
+        must(key not in values and re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',key),'configuration_syntax')
+        values[key]=value
+    return values
+def proc(pid):
+    root=Path('/proc')/str(pid)
+    try:
+        raw=(root/'stat').read_text();tail=raw[raw.rfind(')')+2:].split()
+        if tail[0]=='Z':return None
+        values=(root/'status').read_text().splitlines()
+        uid=next(x for x in values if x.startswith('Uid:')).split()[1:]
+        return dict(pid=int(pid),ticks=tail[19],pgid=int(tail[2]),sid=int(tail[3]),
+                    uid=[int(x) for x in uid],exe=str((root/'exe').resolve()),
+                    cwd=str((root/'cwd').resolve()),
+                    argv=[x.decode() for x in (root/'cmdline').read_bytes().split(b'\0') if x])
+    except (OSError,StopIteration,ValueError):return None
+def atomic(path, data):
+    no_links(path.parent);tmp=path.with_name(path.name+'.lifecycle-new')
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as target:
+        target.write(data);target.flush();os.fchmod(target.fileno(),0o600);os.fsync(target.fileno())
+    os.replace(tmp,path)
+    fd=os.open(path.parent,os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+class Engine:
+    def __init__(self, root, preview, *, script_owner=(1000,1000), private_owner=(0,0),
+                 phase_owner=(999,999), cwd=Path('/root'), lease_fd=None,
+                 selector_module=None, tunnel=None, guide_command=None,
+                 expected_java=Path('/usr/lib/jvm/java-17-openjdk-amd64/bin/java'),
+                 deployment_root=Path('/root/autodl-tmp/auralink-web-deploy'),
+                 diagnostics_module=None, recovery_guard_module=None, recovery_guard=None,
+                 reconciliation_contract=None):
+        self.root,self.preview=Path(root),Path(preview)
+        self.script,self.private,self.phase_owner=script_owner,private_owner,phase_owner
+        self.cwd,self.lease_fd=Path(cwd),lease_fd
+        self.selector_module,self.tunnel=selector_module,tunnel
+        self.guide_command,self.expected_java=guide_command,Path(expected_java)
+        self.deployment_root=Path(deployment_root)
+        self.config=self.root/'runtime/handoff-control.env'
+        self.pids=self.root/'runtime/app-pids';self.logs=self.root/'runtime/app-logs'
+        self._diagnostics_module=diagnostics_module
+        self._diagnostics_recorder=None
+        self._diagnostics_validated=False
+        self._recovery_guard_module=recovery_guard_module
+        self._recovery_guard=recovery_guard
+        self.reconciliation_contract=reconciliation_contract
+    @property
+    def diagnostic_module(self):
+        # Production checks the trusted handoff binding and independent numeric
+        # script contract BEFORE executing the sibling module. An explicitly
+        # supplied module is a fixture API, never a CLI override, and is still
+        # checked against that fixture's own binding/hash/ownership contract.
+        if self._diagnostics_validated:return self._diagnostics_module
+        guard(self.config,self.private)
+        values=envfile(self.config)
+        path=self.root/'operations/stop_diagnostics.py'
+        digest=values.get('R25_STOP_DIAGNOSTICS_SHA256','')
+        must(values.get('R25_STOP_DIAGNOSTICS')==str(path) and
+             re.fullmatch('[0-9a-f]{64}',digest) is not None,'diagnostic_module_binding')
+        guard(path,self.script,0o700,digest)
+        if self._diagnostics_module is None:
+            specification=importlib.util.spec_from_file_location('verified_stop_diagnostics',path)
+            module=importlib.util.module_from_spec(specification)
+            specification.loader.exec_module(module)
+            self._diagnostics_module=module
+        must(Path(self._diagnostics_module.__file__).absolute()==path.absolute() and
+             sha(Path(self._diagnostics_module.__file__))==digest,'loaded_diagnostic_module_identity')
+        self._diagnostics_validated=True
+        return self._diagnostics_module
+    @property
+    def diagnostics(self):
+        if self._diagnostics_recorder is None:
+            self._diagnostics_recorder=self.diagnostic_module.Recorder.inherited('lifecycle')
+        return self._diagnostics_recorder
+    def load_execution_policy(self):
+        path=self.root/'runtime/config/critic-execution-policy.env'
+        must(self.v.get('R25_CRITIC_EXECUTION_POLICY_FILE')==str(path),'execution_policy_path')
+        guard(path,self.private)
+        must(path.stat().st_size<=128,'execution_policy_size')
+        self.execution_policy=parse_execution_policy(path.read_bytes())
+        must(self.kind=='candidate-isolated' or self.execution_policy=='isolated-stub-only',
+             'legacy_execution_policy_forbidden')
+        return self.execution_policy
+    def core_release_guard_module(self):
+        path=self.root/'operations/core_release_guard.py'
+        digest=self.v.get('R25_CORE_RELEASE_GUARD_SHA256','')
+        must(self.v.get('R25_CORE_RELEASE_GUARD')==str(path) and
+             re.fullmatch('[0-9a-f]{64}',digest) is not None,'core_release_guard_binding')
+        guard(path,self.script,0o700,digest)
+        module=getattr(self,'_core_release_guard_module',None)
+        if module is None:
+            import sys
+            raw=path.read_bytes()
+            must(hashlib.sha256(raw).hexdigest()==digest,'core_release_guard_source_bytes')
+            specification=importlib.util.spec_from_file_location('bound_core_release_guard',path)
+            module=importlib.util.module_from_spec(specification)
+            sys.modules[specification.name]=module
+            exec(compile(raw,str(path),'exec',dont_inherit=True),module.__dict__)
+            module.__r25_source_sha256__=digest
+            self._core_release_guard_module=module
+        must(Path(module.__file__).absolute()==path.absolute() and sha(Path(module.__file__))==digest and
+             getattr(module,'__r25_source_sha256__',None)==digest,
+             'loaded_core_release_guard_identity')
+        return module
+    def ai_release_guard_module(self):
+        path=self.root/'operations/ai_release_guard.py'
+        digest=self.v.get('R25_AI_RELEASE_GUARD_SHA256','')
+        must(self.v.get('R25_AI_RELEASE_GUARD')==str(path) and
+             re.fullmatch('[0-9a-f]{64}',digest) is not None,'ai_release_guard_binding')
+        guard(path,self.script,0o700,digest)
+        module=getattr(self,'_ai_release_guard_module',None)
+        if module is None:
+            import sys
+            raw=path.read_bytes()
+            must(hashlib.sha256(raw).hexdigest()==digest,'ai_release_guard_source_bytes')
+            specification=importlib.util.spec_from_file_location('bound_ai_release_guard',path)
+            module=importlib.util.module_from_spec(specification)
+            sys.modules[specification.name]=module
+            exec(compile(raw,str(path),'exec',dont_inherit=True),module.__dict__)
+            module.__r25_source_sha256__=digest
+            self._ai_release_guard_module=module
+        must(Path(module.__file__).absolute()==path.absolute() and sha(Path(module.__file__))==digest and
+             getattr(module,'__r25_source_sha256__',None)==digest,
+             'loaded_ai_release_guard_identity')
+        return module
+    def load_backend_identity(self):
+        # The Critic/Python lineage remains candidate-isolated for both public
+        # projection JARs; never select the legacy Python/wrapper to add a JAR.
+        self.backend=self.v.get('R25_BACKEND_SHA256')
+        allowed={BASE} if self.kind=='current-3260' else {CANDIDATE,HUANIAO_CANDIDATE,COORDINATED_CURRENT,COORDINATED_CANDIDATE}
+        if self.reconciliation_contract is not None:
+            contract=self.reconciliation_contract
+            must(contract['backend_sha256']==COORDINATED_CURRENT and
+                 contract['source_commit']=='d17bee0f84ac1af24faa08fe99acca263cdf0b97' and
+                 contract['declared_backend_sha256']==CANDIDATE and
+                 sha(self.config)==contract['handoff_sha256'],'current_reconciliation_source_binding')
+            manifest=self.root/'release/MANIFEST.json'
+            guard(manifest,self.private,digest=contract['manifest_sha256'])
+            self.backend=COORDINATED_CURRENT
+        else:
+            module=self.core_release_guard_module()
+            module.validate_backend_identity(self.root,self.backend)
+        manifest=self.root/'release/MANIFEST.json';guard(manifest,self.private)
+        must(manifest.stat().st_size<=1024*1024,'backend_manifest_size')
+        document=json.loads(manifest.read_text())
+        must(type(document)is dict and type(document.get('entries'))is list,'backend_manifest_schema')
+        entries=[x for x in document['entries'] if type(x)is dict and x.get('path')=='artifacts/backend.jar']
+        wanted=CANDIDATE if self.reconciliation_contract is not None else self.backend
+        must(len(entries)==1 and entries[0].get('sha256')==wanted,'backend_release_manifest_identity')
+        return self.backend
+    def require_backend_eligible(self,fd):
+        normal_module=self.core_release_guard_module()
+        normal=normal_module.production()
+        if normal.is_registered_backend(self.backend):
+            try:return normal.require_backend_eligible(self.backend,fd)
+            except normal_module.Refused as error:raise Refused(str(error)) from None
+        if self.reconciliation_contract is not None:
+            contract=self.reconciliation_contract;path=Path(contract['guard_path']);digest=contract['guard_sha256']
+            must(path.name=='huaniao_recovery_guard.py' and path.parent.name=='operations' and
+                 path.parent.parent.name=='entry' and path.parent.parent.parent.parent==self.root/'runtime' and
+                 path.parent.parent.parent.name.startswith('huaniao-backend-projection-') and
+                 re.fullmatch('[0-9a-f]{64}',digest) is not None,'staged_reconciliation_guard_binding')
+            guard(path,self.private,0o600,digest)
+        else:
+            path=self.root/'operations/huaniao_recovery_guard.py'
+            digest=self.v.get('R25_HUANIAO_RECOVERY_GUARD_SHA256','')
+            must(self.v.get('R25_HUANIAO_RECOVERY_GUARD')==str(path) and
+                 re.fullmatch('[0-9a-f]{64}',digest) is not None,'huaniao_recovery_guard_binding')
+            guard(path,self.script,0o700,digest)
+        if self._recovery_guard_module is None:
+            specification=importlib.util.spec_from_file_location('bound_huaniao_recovery_guard',path)
+            module=importlib.util.module_from_spec(specification);specification.loader.exec_module(module)
+            self._recovery_guard_module=module
+        module=self._recovery_guard_module
+        must(Path(module.__file__).absolute()==path.absolute() and sha(Path(module.__file__))==digest,
+             'loaded_huaniao_recovery_guard_identity')
+        if self._recovery_guard is None:self._recovery_guard=module.production()
+        try:return self._recovery_guard.require_backend_eligible(self.backend,fd)
+        except module.Refused as error:raise Refused(str(error)) from None
+    def load(self, partial=False):
+        guard(self.config,self.private);self.v=envfile(self.config)
+        fixed={'R25_HANDOFF_ROOT':self.root,'R25_PHASE_STATE':self.root/'runtime/cutover/phase.env',
+               'R25_RELEASE_ROOT':self.root/'release','R25_JAVA_PREVIEW_ROOT':self.preview,
+               'R25_APP_ENV':self.root/'runtime/config/app.env',
+               'R25_APP_CONFIG':self.root/'runtime/config/application.yml',
+               'R25_APP_PID_ROOT':self.pids,'R25_APP_LOG_ROOT':self.logs,
+               'R25_FRONTEND_SELECTION':self.root/'runtime/config/frontend-selection.json',
+               'R25_FRONTEND_SELECTION_REFERENCE':self.root/'runtime/config/frontend-selection.reference',
+               'R25_FRONTEND_SELECTOR':self.root/'operations/frontend_lifecycle_selector.py',
+               'R25_CRITIC_EXECUTION_POLICY_FILE':self.root/'runtime/config/critic-execution-policy.env'}
+        must(all(self.v.get(key)==str(value) for key,value in fixed.items()),'fixed_bindings')
+        guard(Path(self.v['R25_PHASE_STATE']),self.phase_owner)
+        must(envfile(Path(self.v['R25_PHASE_STATE'])).get('phase')=='POSTGRES_WRITES_ENABLED','postgres_authority')
+        for path in [self.pids,self.logs]:guard(path,self.private,0o700,directory=True)
+        for path in [Path(self.v[key]) for key in ['R25_APP_ENV','R25_APP_CONFIG','R25_PROVIDER_ENV','R25_INTERNAL_TOKEN_FILE']]:guard(path,self.private)
+        guard(Path(self.v['R25_CRITIC_EXECUTION_POLICY_FILE']),self.private)
+        diagnostic_module=self.root/'operations/stop_diagnostics.py'
+        must(self.v.get('R25_STOP_DIAGNOSTICS')==str(diagnostic_module),'diagnostic_module_path')
+        diagnostic_digest=self.v.get('R25_STOP_DIAGNOSTICS_SHA256','')
+        must(re.fullmatch('[0-9a-f]{64}',diagnostic_digest) is not None,'diagnostic_module_binding')
+        guard(diagnostic_module,self.script,0o700,diagnostic_digest)
+        self.diagnostic_module
+        selector_path=Path(self.v['R25_FRONTEND_SELECTOR'])
+        must(self.v.get('R25_FRONTEND_SELECTOR_SHA256')==SELECTOR,'selector_manifest_binding')
+        guard(selector_path,self.script,0o700,SELECTOR)
+        reference=Path(self.v['R25_FRONTEND_SELECTION_REFERENCE']);guard(reference,self.private)
+        ref=envfile(reference)
+        must(ref.get('schema')=='ARTLIVE_FRONTEND_SELECTION_REFERENCE_V1' and re.fullmatch('[0-9a-f]{64}',ref.get('selection_sha256','')),'selection_reference')
+        self.selection_sha=ref['selection_sha256']
+        guard(Path(self.v['R25_FRONTEND_SELECTION']),self.private,digest=self.selection_sha)
+        self.kind=self.v.get('R25_LIFECYCLE_RELEASE_KIND')
+        must(self.kind in WRAPPERS,'lifecycle_release_kind')
+        self.load_execution_policy()
+        self.load_backend_identity()
+        for key,port in [('R25_APP_JAVA_PORT',19080),('R25_APP_FRONTEND_PORT',19083),('R25_APP_GUIDE_PORT',19084),('R25_APP_CRITIC_PORT',19085)]:
+            must(self.v.get(key)==str(port),'service_ports')
+        selected=json.loads(Path(self.v['R25_FRONTEND_SELECTION']).read_text())
+        self.lock=self.deployment_root/'runtime/frontend-deployment.lock'
+        must(selected.get('deployment_root')==str(self.deployment_root) and
+             selected.get('shared_lock')==str(self.lock),'shared_deployment_lock_path')
+        guard(self.lock,self.private)
+        if not partial:
+            wanted=self.backend
+            for path in [self.root/'release/artifacts/backend.jar',self.preview/'release/backend.jar']:guard(path,self.private,digest=wanted)
+            launcher_digest=(self.reconciliation_contract['launcher_sha256'] if self.reconciliation_contract is not None else JAVA_LAUNCH)
+            guard(self.root/'operations/r25-production-java-launch.py',self.script,0o700,launcher_digest)
+            wrapper=Path(self.v['R25_R24_CRITIC_ENV_WRAPPER'])
+            must(self.v.get('R25_R24_CRITIC_ENV_WRAPPER_SHA256')==WRAPPERS[self.kind],'wrapper_manifest_binding')
+            guard(wrapper,self.private if self.kind=='current-3260' else self.script,0o700,WRAPPERS[self.kind])
+            if 'R25_AI_RELEASE_GUARD' in self.v:
+                module=self.ai_release_guard_module()
+                for name in ('main.py','config.py','llm.py'):
+                    digest=module.validate_critic_identity(self.root,name)
+                    must(type(digest)is str and re.fullmatch('[0-9a-f]{64}',digest) is not None,
+                         'ai_critic_source_digest')
+                    guard(self.root/'release/critic-service/app'/name,self.script,0o600,digest)
+            else:
+                for name,digest in {**PYTHON[self.kind],'llm.py':LLM}.items():
+                    guard(self.root/'release/critic-service/app'/name,self.script,0o600,digest)
+        if self.selector_module is None:
+            spec=importlib.util.spec_from_file_location('bound_selector',selector_path)
+            self.selector_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.selector_module)
+        if self.tunnel is None:
+            from tunnel_keeper import production_from_handoff
+            self.tunnel=production_from_handoff(self.v,self.private)
+        return self.v
+    @contextlib.contextmanager
+    def lease(self, partial=False, recover_tunnel=False):
+        self.load(partial)
+        fd=os.dup(self.lease_fd) if self.lease_fd is not None else os.open(self.lock,os.O_RDWR|os.O_NOFOLLOW)
+        try:
+            value=os.fstat(fd);wanted=self.lock.stat()
+            must((value.st_dev,value.st_ino)==(wanted.st_dev,wanted.st_ino),'lease_inode')
+            must((value.st_uid,value.st_gid,stat.S_IMODE(value.st_mode))==(*self.private,0o600),'lease_identity')
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:raise Busy('maintenance_busy')
+            self.load(partial)
+            self.diagnostics.emit('SHARED_LEASE_VERIFIED',lock=self.diagnostic_module.lock_proof(self.lock,fd),
+                                  caller=self.diagnostic_module.process(os.getpid()))
+            # Do not make stop/recovery cleanup depend on SQL when retiring an
+            # already-incompatible or partial installation. Every start/status
+            # and watchdog recovery does this authoritative check under lease.
+            if not partial:self.require_backend_eligible(fd)
+            try:self.tunnel.recover() if recover_tunnel else self.tunnel.status()
+            except RuntimeError as error:raise Refused('tunnel_gate_'+str(error)) from None
+            yield fd
+        finally:os.close(fd)
+    def frontend(self, mode, fd):
+        with self.diagnostics.step('delegated_frontend_'+mode,
+                proof=self.diagnostic_module.lock_proof(self.lock,fd)):
+            return self._frontend(mode,fd)
+    def _frontend(self, mode, fd):
+        config=Path(self.v['R25_FRONTEND_SELECTION'])
+        try:
+            owner=self.selector_module.Engine(config,self.selection_sha,self.deployment_root,lease_fd=fd,
+                                               diagnostics=self.diagnostics,diagnostics_module=self.diagnostic_module)
+            if mode in {'start','recover'}:
+                selected=owner.load();state=Path(selected['state'])
+                if state.exists():
+                    saved=envfile(state)
+                    old_service=proc(int(saved['service_pid']))
+                    if old_service is None:
+                        old_supervisor=proc(int(saved['supervisor_pid']))
+                        if old_supervisor and old_supervisor['ticks']==saved['supervisor_start_ticks']:
+                            must(old_supervisor['uid']==[self.private[0]]*4 and
+                                 old_supervisor['pgid']==old_supervisor['pid']==old_supervisor['sid'] and
+                                 old_supervisor['cwd']==selected['release'] and
+                                 selected['controller'] in old_supervisor['argv'] and
+                                 'run' in old_supervisor['argv'],'inactive_frontend_supervisor_identity')
+                            # Let c5ea observe its dead child and exit before it
+                            # could observe a newly committed state belonging
+                            # to a replacement supervisor. No signal/adoption.
+                            deadline=time.monotonic()+3
+                            while time.monotonic()<deadline:
+                                current=proc(old_supervisor['pid'])
+                                if current is None or current['ticks']!=old_supervisor['ticks']:break
+                                time.sleep(.05)
+                            current=proc(old_supervisor['pid'])
+                            must(current is None or current['ticks']!=old_supervisor['ticks'],
+                                 'inactive_frontend_supervisor_did_not_exit')
+            return owner.run(mode)
+        except self.selector_module.Refused as error:
+            if str(error)=='frontend_deployment_busy':raise Busy('maintenance_busy') from None
+            raise Refused('frontend_'+str(error)) from None
+    def listener(self,port):
+        value=subprocess.check_output(['ss','-ltnpH',f'sport = :{port}'],text=True,timeout=5)
+        return value.strip(),set(int(x) for x in re.findall(r'pid=(\d+)',value))
+    def role_identity(self,name,pid,ticks):
+        observed=proc(pid)
+        if observed is None:return None
+        must(observed['ticks']==str(ticks),'stale_or_reused_'+name)
+        must(observed['uid']==[self.private[0]]*4 and observed['cwd']==str(self.cwd),'owned_'+name+'_uid_cwd')
+        must(observed['pgid']==pid and observed['sid']==pid,'owned_'+name+'_session')
+        if name=='java':
+            must(observed['exe']==str(self.expected_java.resolve()) and '-jar' in observed['argv'] and
+                 str(self.preview/'release/backend.jar') in observed['argv'],'owned_java_entry')
+        else:
+            key='R25_GUIDE_PY' if name=='guide' else 'R25_CRITIC_PY'
+            must(observed['exe']==str(Path(self.v[key]).resolve()),'owned_'+name+'_exe')
+            if name=='critic':
+                must('-m' in observed['argv'] and 'uvicorn' in observed['argv'] and 'app.main:app' in observed['argv'] and str(19085) in observed['argv'],'owned_critic_entry')
+                if self.kind=='candidate-isolated':
+                    # Select one non-secret value only. A policy file does not
+                    # prove the existing child inherited the correct policy.
+                    values=(Path('/proc')/str(pid)/'environ').read_bytes().split(b'\0')
+                    selected=[x.split(b'=',1)[1] for x in values if x.startswith(b'AURALINK_CRITIC_EXECUTION_POLICY=')]
+                    must(selected==[self.execution_policy.encode('ascii')],'critic_runtime_policy')
+            elif self.guide_command is None:must('-m' in observed['argv'] and 'guide_service' in observed['argv'],'owned_guide_entry')
+            else:must(observed['argv']==self.guide_command,'owned_guide_substitute_entry')
+        return observed
+    def active(self,name,port,allow_starting=False):
+        file=self.pids/(name+'.pid')
+        if not file.exists():
+            listeners,_=self.listener(port)
+            must(not listeners,'foreign_'+name+'_listener')
+            return None
+        guard(file,self.private);saved=envfile(file)
+        must(saved.get('pid','').isdigit() and saved.get('start_ticks','').isdigit(),'pid_record_'+name)
+        pid=int(saved['pid']);observed=proc(pid)
+        if observed is not None and saved.get('launch_state')=='STARTING':
+            must(observed['ticks']==saved['start_ticks'] and observed['uid']==[self.private[0]]*4 and
+                 observed['cwd']==str(self.cwd) and observed['pgid']==pid and observed['sid']==pid,
+                 'pending_start_identity_'+name)
+            command=json.loads(saved.get('launch_argv','null'))
+            initial=(observed['exe']==str(Path(self.v['R25_PYTHON']).resolve()) and observed['argv']==command)
+            if not initial:self.role_identity(name,pid,saved['start_ticks'])
+            if not allow_starting:raise Refused('service_start_pending_'+name)
+        else:observed=self.role_identity(name,pid,saved['start_ticks'])
+        listeners,owners=self.listener(port)
+        if observed is None:
+            must(not listeners,'foreign_'+name+'_listener')
+            return None
+        must(owners=={pid} or (allow_starting and not listeners),'unique_owned_'+name+'_listener')
+        return observed
+    def stop_role(self,name,port):
+        try:
+            with self.diagnostics.step('stop_role_'+name):
+                return self._stop_role(name,port)
+        except BaseException:
+            self.diagnostics.emit('FAILED_STOP_LISTENER_POSTCONDITION',role=name,
+                                  proof=self.diagnostic_module.listener_proof(port))
+            raise
+    def _stop_role(self,name,port):
+        observed=self.active(name,port,allow_starting=True)
+        if observed is None:
+            self.diagnostics.emit('ROLE_ABSENT',role=name,port=port)
+            return
+        self.diagnostics.emit('ROLE_OWNERSHIP_VERIFIED',role=name,port=port,
+                              process=self.diagnostic_module.process(observed['pid']))
+        saved=envfile(self.pids/(name+'.pid'))
+        if saved.get('launch_state')!='STARTING':self.role_identity(name,observed['pid'],observed['ticks'])
+        else:self.active(name,port,allow_starting=True)
+        os.kill(observed['pid'],signal.SIGTERM)
+        deadline=time.monotonic()+30
+        self.diagnostics.emit('ROLE_SIGNAL_SENT',role=name,signal='SIGTERM',pid=observed['pid'],
+                              expected_start_ticks=observed['ticks'],deadline_seconds=30)
+        while time.monotonic()<deadline and proc(observed['pid']) is not None:time.sleep(.1)
+        current=proc(observed['pid'])
+        self.diagnostics.emit('ROLE_EXIT_POSTCONDITION',role=name,
+                              observed=self.diagnostic_module.process(observed['pid']),
+                              gate_process_absent=current is None,
+                              listener=self.diagnostic_module.listener_proof(port,[observed['pid']]))
+        must(current is None,'stop_timeout_'+name)
+        listener,owners=self.listener(port)
+        self.diagnostics.emit('ROLE_LISTENER_POSTCONDITION',role=name,port=port,
+                              listener_present=bool(listener),owner_pids=sorted(owners))
+        must(not listener,'listener_remains_'+name)
+        # Historical PID evidence is retained. The next owned successful launch
+        # replaces the record through the normal controller, never PID adoption.
+    def wait_http(self,url,seconds=60):
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}));deadline=time.monotonic()+seconds
+        while time.monotonic()<deadline:
+            try:
+                with opener.open(url,timeout=2) as response:
+                    if response.status==200:return
+            except OSError:pass
+            time.sleep(.25)
+        raise Refused('bounded_readiness_timeout')
+    def start_role(self,name,port,command,environment,url,lease_fd=None):
+        must(lease_fd is None or name=='java','only_java_guard_inherits_shared_lease')
+        active=self.active(name,port,allow_starting=True)
+        if active:
+            saved=envfile(self.pids/(name+'.pid'))
+            if saved.get('launch_state')=='STARTING':
+                self.wait_http(url)
+                self.role_identity(name,active['pid'],active['ticks'])
+                atomic(self.pids/(name+'.pid'),f"pid={active['pid']}\nstart_ticks={active['ticks']}\n".encode())
+            return
+        must(not self.listener(port)[0],'foreign_'+name+'_listener')
+        log=self.logs/(name+'.log')
+        if log.exists():guard(log,self.private)
+        else:atomic(log,b'')
+        with log.open('ab') as output:
+            process=subprocess.Popen(command,env=environment,cwd=self.cwd,stdin=subprocess.DEVNULL,
+                                     stdout=output,stderr=subprocess.STDOUT,start_new_session=True,close_fds=True,
+                                     pass_fds=() if lease_fd is None else (lease_fd,))
+        current=proc(process.pid)
+        must(current is not None and current['uid']==[self.private[0]]*4 and current['cwd']==str(self.cwd)
+             and current['pgid']==process.pid and current['sid']==process.pid,'spawn_identity_'+name)
+        # Commit owned launch identity BEFORE readiness can fail or transport
+        # vanish. Rollback can stop this exact pending process without port/name
+        # adoption, even before the trusted wrapper execs the long-lived child.
+        atomic(self.pids/(name+'.pid'),(f"pid={process.pid}\nstart_ticks={current['ticks']}\nlaunch_state=STARTING\nlaunch_argv="+
+               json.dumps(command,separators=(',',':'))+'\n').encode())
+        self.wait_http(url)
+        current=proc(process.pid);must(current is not None,'service_exited_'+name)
+        self.role_identity(name,process.pid,current['ticks'])
+        must(self.listener(port)[1]=={process.pid},'unique_owned_'+name+'_listener')
+        atomic(self.pids/(name+'.pid'),f"pid={process.pid}\nstart_ticks={current['ticks']}\n".encode())
+    def start_locked(self,fd):
+        self.require_backend_eligible(fd)
+        token=Path(self.v['R25_INTERNAL_TOKEN_FILE']).read_text().strip()
+        must(re.fullmatch('[a-f0-9]{72}',token) is not None,'internal_token_shape')
+        common={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'}
+        guide=[self.v['R25_GUIDE_PY'],'-B','-m','guide_service'] if self.guide_command is None else self.guide_command
+        guide_env=dict(common,HOME=str(self.root/'runtime/home'),PYTHONPATH=str(self.root/'release'),
+                       AURALINK_ENV_FILE=self.v['R25_PROVIDER_ENV'],AURALINK_GUIDE_SERVICE_HOST='127.0.0.1',
+                       AURALINK_GUIDE_SERVICE_PORT='19084',GUIDE_AI_SERVICE_URL='http://127.0.0.1:19084',
+                       AURALINK_GUIDE_INTERNAL_TOKEN=token,AURALINK_GUIDE_DIAGNOSTIC_DIR=str(self.root/'evidence/guide-attempts'))
+        self.start_role('guide',19084,guide,guide_env,'http://127.0.0.1:19084/health')
+        self.start_critic_locked()
+        self.start_java_locked(fd)
+        self.frontend('recover',fd);self.wait_http('http://127.0.0.1:19083/login')
+    def start_java_locked(self,fd):
+        self.require_backend_eligible(fd)
+        java=[self.v['R25_PYTHON'],str(self.root/'operations/r25-production-java-launch.py'),'normal',
+              self.v['R25_APP_ENV'],str(self.root/'runtime/config/imported-source.env'),self.v['R25_APP_CONFIG'],
+              str(self.root/'release'),str(self.preview),'19080']
+        self.start_role('java',19080,java,{'PATH':'/usr/bin:/bin','LANG':'C.UTF-8',
+                        'R25_DEPLOYMENT_LEASE_FD':str(fd)},
+                        'http://127.0.0.1:19080/api/v1/paintings?page=0&size=1',lease_fd=fd)
+    def java_status(self):
+        with self.lease():must(self.active('java',19080) is not None,'not_running_java')
+        return dict(result='RUNNING',backend=self.backend)
+    def java_stop(self):
+        with self.lease(partial=True):self.stop_role('java',19080)
+        return dict(result='STOPPED')
+    def java_start(self):
+        with self.lease() as fd:self.start_java_locked(fd)
+        return self.java_status()
+    def status(self):
+        with self.lease() as fd:
+            for name,port in [('guide',19084),('critic',19085),('java',19080)]:must(self.active(name,port) is not None,'not_running_'+name)
+            self.frontend('status',fd)
+            return dict(result='RUNNING',phase='POSTGRES_WRITES_ENABLED',execution_policy=self.execution_policy,tunnel='VERIFIED_EXTERNAL_RUNNING')
+    def start_critic_locked(self):
+        token=Path(self.v['R25_INTERNAL_TOKEN_FILE']).read_text().strip()
+        must(re.fullmatch('[a-f0-9]{72}',token) is not None,'internal_token_shape')
+        critic=[self.v['R25_PYTHON'],self.v['R25_R24_CRITIC_ENV_WRAPPER'],'--env-file',self.v['R25_PROVIDER_ENV'],
+                '--token-file',self.v['R25_INTERNAL_TOKEN_FILE'],'--critic-source',str(self.root/'release/critic-service')]
+        if self.kind=='candidate-isolated':critic+=['--execution-policy',self.execution_policy]
+        critic+=['--exec','--',self.v['R25_CRITIC_PY'],'-B','-m','uvicorn','app.main:app','--host','127.0.0.1','--port','19085']
+        self.start_role('critic',19085,critic,{'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},'http://127.0.0.1:19085/health')
+    def critic_status_locked(self):
+        must(self.kind=='candidate-isolated','critic_only_candidate_required')
+        must(self.active('critic',19085) is not None,'not_running_critic')
+        return dict(result='RUNNING',execution_policy=self.execution_policy)
+    def critic_status(self):
+        with self.lease():return self.critic_status_locked()
+    def critic_stop(self):
+        with self.lease():
+            must(self.kind=='candidate-isolated','critic_only_candidate_required')
+            self.stop_role('critic',19085)
+            return dict(result='STOPPED',execution_policy=self.execution_policy)
+    def critic_start(self):
+        with self.lease():
+            must(self.kind=='candidate-isolated','critic_only_candidate_required')
+            self.start_critic_locked()
+            return self.critic_status_locked()
+    def critic_restart(self):
+        with self.lease():
+            must(self.kind=='candidate-isolated','critic_only_candidate_required')
+            self.stop_role('critic',19085)
+            self.start_critic_locked()
+            return self.critic_status_locked()
+    def start_normal(self):
+        # Healthy Tunnel returns a verified NOOP. Only the keeper's typed
+        # absent-process/no-unrecorded-instance path can restart a stopped one.
+        with self.lease(recover_tunnel=True) as fd:self.start_locked(fd)
+        return self.status()
+    def recover(self):return self.start_normal()
+    def stop_services(self):
+        try:
+            with self.diagnostics.step('stop_services'):
+                return self._stop_services()
+        except BaseException:
+            self.diagnostics.emit('FAILED_APPLICATION_STOP_POSTCONDITION',
+                listeners={str(port):self.diagnostic_module.listener_proof(port) for port in [19080,19083,19084,19085]})
+            raise
+    def _stop_services(self):
+        with self.lease(partial=True) as fd:
+            # All currently running identities are established before signals.
+            frontend_present=bool(self.listener(19083)[0])
+            self.frontend('status' if frontend_present else 'guard',fd)
+            for name,port in [('java',19080),('critic',19085),('guide',19084)]:
+                with self.diagnostics.step('pre_stop_ownership_'+name):self.active(name,port,allow_starting=True)
+            if frontend_present:self.frontend('stop',fd)
+            else:
+                # c5ea intentionally refuses stop on stale records. Before a
+                # selection switch, use its own normal recovery+owned stop to
+                # retire an inactive record. Never delete/rewrite it ourselves.
+                # This is one narrowly scoped Next transition, not another
+                # recovery of a failed Java/application candidate.
+                selection=json.loads(Path(self.v['R25_FRONTEND_SELECTION']).read_text())
+                state=Path(selection['state'])
+                if state.exists():
+                    saved=envfile(state)
+                    must(saved.get('service_pid','').isdigit(),'inactive_frontend_record')
+                    old=proc(int(saved['service_pid']))
+                    must(old is None,'inactive_frontend_process_requires_review')
+                    self.frontend('recover',fd)
+                    self.frontend('stop',fd)
+            for name,port in [('java',19080),('critic',19085),('guide',19084)]:self.stop_role(name,port)
+            try:self.tunnel.status()
+            except RuntimeError as error:raise Refused('tunnel_gate_'+str(error)) from None
+            self.diagnostics.emit('APPLICATION_STOP_POSTCONDITION',result='STOPPED',tunnel='PRESERVED')
+            return dict(result='STOPPED',tunnel='PRESERVED')
+
+    def watchdog_once(self):
+        """Actual shared-lease health/recovery logic; busy never restarts Java."""
+        intentional=self.root/'runtime/app-intentional-stop'
+        if intentional.exists():
+            guard(intentional,self.private)
+            return dict(result='INTENTIONALLY_STOPPED')
+        try:return self.status()
+        except Busy:return dict(result='BUSY_DEFERRED')
+        except Refused:return self.recover()
+    def watchdog_identity(self):
+        path=self.root/'runtime/app-supervisor.pid'
+        if not path.exists():return None
+        guard(path,self.private);values=envfile(path)
+        must(values.get('pid','').isdigit() and values.get('start_ticks','').isdigit(),'watchdog_pid_record')
+        observed=proc(int(values['pid']))
+        if observed is None:return None
+        must(observed['ticks']==values['start_ticks'] and observed['uid']==[self.private[0]]*4 and
+             observed['cwd']==str(self.cwd) and observed['pgid']==observed['pid'] and observed['sid']==observed['pid'],
+             'watchdog_owned_identity')
+        must(observed['exe']==str(Path(self.v['R25_PYTHON']).resolve()),'watchdog_executable')
+        if 'argv' in values:
+            must(observed['argv']==json.loads(values['argv']),'watchdog_command_identity')
+        else:raise Refused('watchdog_command_record_missing')
+        return observed
+    def watchdog_status(self):
+        with self.lease():
+            must(self.watchdog_identity() is not None,'watchdog_not_running')
+            return dict(result='RUNNING')
+    def watchdog_stop_metadata(self):
+        """Only the inputs needed to safely stop an owned watchdog.
+
+        A recognized partial frontend selection/reference pair cannot prevent
+        stopping this exact owned controller. No frontend/service action is
+        permitted by this loader; full start/status retains the complete guard.
+        """
+        guard(self.config,self.private);self.v=envfile(self.config)
+        must(self.v.get('R25_HANDOFF_ROOT')==str(self.root) and
+             self.v.get('R25_PHASE_STATE')==str(self.root/'runtime/cutover/phase.env') and
+             self.v.get('R25_APP_PID_ROOT')==str(self.pids),'watchdog_fixed_metadata_paths')
+        guard(self.root/'runtime/cutover/phase.env',self.phase_owner)
+        must(envfile(self.root/'runtime/cutover/phase.env').get('phase')=='POSTGRES_WRITES_ENABLED','postgres_authority')
+        guard(self.pids,self.private,0o700,directory=True)
+        module=self.root/'operations/lifecycle_adapter.py'
+        must(self.v.get('R25_LIFECYCLE_ADAPTER')==str(module),'watchdog_adapter_path')
+        digest=self.v.get('R25_LIFECYCLE_ADAPTER_SHA256','')
+        must(re.fullmatch('[0-9a-f]{64}',digest) is not None,'watchdog_adapter_manifest_hash')
+        guard(module,self.script,0o700,digest)
+        must(sha(Path(__file__))==digest,'watchdog_loaded_adapter_identity')
+        must(Path(self.v.get('R25_PYTHON','')).is_absolute(),'watchdog_python_path')
+        policy=self.root/'runtime/config/critic-execution-policy.env'
+        must(self.v.get('R25_CRITIC_EXECUTION_POLICY_FILE')==str(policy),'watchdog_policy_path')
+        guard(policy,self.private)
+        self.kind=self.v.get('R25_LIFECYCLE_RELEASE_KIND')
+        must(self.kind in WRAPPERS,'lifecycle_release_kind')
+        self.load_execution_policy()
+        self.load_backend_identity()
+        self.lock=self.deployment_root/'runtime/frontend-deployment.lock'
+        guard(self.lock,self.private)
+    @contextlib.contextmanager
+    def watchdog_stop_lease(self):
+        self.watchdog_stop_metadata()
+        fd=os.dup(self.lease_fd) if self.lease_fd is not None else os.open(self.lock,os.O_RDWR|os.O_NOFOLLOW)
+        try:
+            observed=os.fstat(fd);expected=self.lock.stat()
+            must((observed.st_dev,observed.st_ino)==(expected.st_dev,expected.st_ino),'watchdog_lease_inode')
+            must((observed.st_uid,observed.st_gid,stat.S_IMODE(observed.st_mode))==(*self.private,0o600),'watchdog_lease_identity')
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:raise Busy('maintenance_busy')
+            self.watchdog_stop_metadata();yield fd
+        finally:os.close(fd)
+    def watchdog_run(self):
+        # A detached child cannot retain the coordinator lease and block every
+        # future request. Each loop reloads the persistent kind/config/reference.
+        self.lease_fd=None
+        # Fork can inherit the coordinator's original lease inode through any
+        # descriptor as well as exported42. Close every non-stdio descriptor;
+        # each future status/recover opens its own validated lease afresh.
+        os.closerange(3,65536)
+        while True:
+            try:self.watchdog_once()
+            except (Refused,OSError,ValueError,KeyError,subprocess.SubprocessError):pass
+            time.sleep(2)
+    def watchdog_start(self):
+        with self.lease():return self.watchdog_start_locked()
+    def watchdog_start_locked(self):
+        if self.watchdog_identity() is not None:return dict(result='ALREADY_RUNNING')
+        stop=self.root/'runtime/app-intentional-stop'
+        if stop.exists():
+            guard(stop,self.private)
+            # Supported controller clears only its own intentional-stop marker,
+            # not a historical PID record or an unrelated lock file.
+            stop.unlink()
+        process=os.fork()
+        if process==0:
+            try:
+                os.setsid();os.chdir(self.cwd)
+                log=self.root/'runtime/app-supervisor.log'
+                if not log.exists():atomic(log,b'')
+                guard(log,self.private)
+                descriptor=os.open(log,os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW)
+                os.dup2(descriptor,1);os.dup2(descriptor,2)
+                null=os.open('/dev/null',os.O_RDONLY);os.dup2(null,0)
+                if descriptor>2:os.close(descriptor)
+                if null>2:os.close(null)
+                self.watchdog_run()
+            finally:os._exit(70)
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            value=proc(process)
+            if value and value['pgid']==process and value['sid']==process:break
+            time.sleep(.02)
+        must(value is not None and value['pgid']==process and value['sid']==process,'watchdog_spawn_identity')
+        atomic(self.root/'runtime/app-supervisor.pid',(f"pid={process}\nstart_ticks={value['ticks']}\nargv="+
+               json.dumps(value['argv'],separators=(',',':'))+'\n').encode())
+        must(self.watchdog_identity() is not None,'watchdog_not_running')
+        return dict(result='RUNNING')
+    def watchdog_stop(self):
+        with self.watchdog_stop_lease():return self.watchdog_stop_locked()
+    def watchdog_stop_locked(self):
+        with self.diagnostics.step('watchdog_stop'):
+            return self._watchdog_stop_locked()
+    def _watchdog_stop_locked(self):
+        observed=self.watchdog_identity()
+        atomic(self.root/'runtime/app-intentional-stop',b'intentionally stopped by R25 lifecycle\n')
+        if observed:
+            self.diagnostics.emit('WATCHDOG_OWNERSHIP_VERIFIED',process=self.diagnostic_module.process(observed['pid']))
+            self.watchdog_identity();os.kill(observed['pid'],signal.SIGTERM)
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline and proc(observed['pid']) is not None:time.sleep(.05)
+            must(proc(observed['pid']) is None,'watchdog_stop_timeout')
+        return dict(result='STOPPED')
+
+def production(lease_fd=None):
+    must(os.geteuid()==0,'root_operator')
+    must(os.environ.get('R25_ROOT')==str(ROOT) and os.environ.get('ARTLIVE_R25_HANDOFF_CONFIG')==str(ROOT/'runtime/handoff-control.env'),'exported_invocation')
+    config=ROOT/'runtime/handoff-control.env';guard(config)
+    values=envfile(config);helper=ROOT/'operations/postgres_access.py'
+    must(values.get('R25_POSTGRES_ACCESS')==str(helper) and
+         re.fullmatch('[a-f0-9]{64}',values.get('R25_POSTGRES_ACCESS_SHA256','')) is not None,
+         'trusted_postgres_access_binding')
+    guard(helper,(1000,1000),0o700,values['R25_POSTGRES_ACCESS_SHA256'])
+    specification=importlib.util.spec_from_file_location('trusted_postgres_access',helper)
+    postgres_access=importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(postgres_access)
+    must(Path(postgres_access.__file__).absolute()==helper,'trusted_postgres_access_module')
+    try:owner=postgres_access.service_owner(ROOT)
+    except postgres_access.Refused as error:raise Refused(str(error)) from None
+    return Engine(ROOT,Path('/root/autodl-tmp/artlive/backend-preview/r25-isolated-preview-7694f4069c83c06c'),
+                  phase_owner=owner,lease_fd=lease_fd)
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode',choices=['status','start-normal','recover','stop-services','stop','supervisor-start','supervisor-status','supervisor-stop',
+                                        'critic-status','critic-start','critic-stop','critic-restart','java-status','java-stop','java-start'])
+    args=parser.parse_args();lease=os.environ.get('R25_DEPLOYMENT_LEASE_FD')
+    try:
+        if lease is not None:must(lease=='42','inherited_lease_contract')
+        engine=production(42 if lease else None)
+        result=getattr(engine,{'start-normal':'start_normal','stop-services':'stop_services','stop':'stop_services',
+                              'supervisor-start':'watchdog_start','supervisor-status':'watchdog_status','supervisor-stop':'watchdog_stop',
+                              'critic-status':'critic_status','critic-start':'critic_start','critic-stop':'critic_stop',
+                              'critic-restart':'critic_restart','java-status':'java_status','java-stop':'java_stop',
+                              'java-start':'java_start'}.get(args.mode,args.mode))()
+        prefix='R25_PRODUCTION_APP_SUPERVISOR=' if args.mode.startswith('supervisor-') else 'R25_PRODUCTION_APP='
+        print(prefix+result['result']);return 0
+    except Busy as error:print('R25_PRODUCTION_APP=BUSY reason='+str(error),file=sys.stderr);return 76
+    except (Refused,OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
+        print('R25_PRODUCTION_APP=FAIL reason='+ (str(error) if isinstance(error,Refused) else type(error).__name__),file=sys.stderr);return 75
+if __name__=='__main__':raise SystemExit(main())

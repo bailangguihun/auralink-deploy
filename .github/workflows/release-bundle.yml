@@ -44,6 +44,17 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
             --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
 
+      - name: Package and verify optional VMM extension
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python scripts/package-vmm-extension.py create \
+            --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          python scripts/package-vmm-extension.py verify \
+            --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+
       - name: Retain controller installation artifact
         uses: actions/upload-artifact@v4
         with:
@@ -51,6 +62,16 @@ jobs:
           path: |
             dist/r25-controller/r25-controller.zip
             dist/r25-controller/r25-controller-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Retain optional VMM extension without installation
+        uses: actions/upload-artifact@v4
+        with:
+          name: r25-vmm-extension-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/r25-vmm-extension/vmm-extension.zip
+            dist/r25-vmm-extension/manifest.json
           if-no-files-found: error
           retention-days: 30
 
