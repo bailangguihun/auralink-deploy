@@ -2,6 +2,7 @@
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import signal
@@ -81,6 +82,27 @@ class LifecycleTest(unittest.TestCase):
                              {'PATH': '/usr/bin:/bin', 'R25_VMM_HEALTH_TOKEN': 'fixture'}, self.root,
                              self.port, self.store, startup_seconds=.3, stop_seconds=1, restart_limit=0)
         self.processes = []
+        # Capture the real /proc boundary on runners where a stop is refused.
+        # Only synthetic PID/socket metadata is logged, never service inputs.
+        original_process = life.process
+        def observed_process(pid):
+            value = original_process(pid)
+            if value is None and life.port_busy(self.port):
+                root = Path('/proc') / str(pid)
+                diagnostic = {'pid': pid, 'port': self.port,
+                              'listening_inodes': sorted(life.listening_inodes(self.port))}
+                for name in ('stat', 'status'):
+                    try:
+                        raw = (root / name).read_text()
+                        diagnostic[name] = raw if name == 'stat' else [line for line in raw.splitlines()
+                            if line.startswith(('State:', 'Pid:', 'PPid:', 'Uid:', 'Threads:'))]
+                    except OSError as error:
+                        diagnostic[name] = {'errno': error.errno}
+                print('VMM_CPU_STOP_BOUNDARY=' + json.dumps(diagnostic), flush=True)
+            return value
+        self.process_probe = patch.object(life, 'process', observed_process)
+        self.process_probe.start()
+        self.addCleanup(self.process_probe.stop)
 
     def tearDown(self):
         # Tests clean only their captured child handles; no port/name signaling.
