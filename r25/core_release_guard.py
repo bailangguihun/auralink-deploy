@@ -256,6 +256,17 @@ def verify_core_followup_context(value, predecessor=None, validator=None):
     prior_sha=binding['predecessor_policy_sha256']
     if predecessor is None:
         predecessor=private_record(STORE/'core-followup-baselines'/(prior_sha+'.json'),prior_sha)
+    if binding['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1':
+        previous=core_business.validate_core_followup(predecessor)
+        must(previous['schema']=='R25_ASSISTANT_CORE_FOLLOWUP_V1','managed_vmm_predecessor_contract')
+        up=value['upgrade'];old=predecessor['upgrade']
+        must(all(old['candidate'].get(k)==up['baseline_release'].get(k) for k in ('commit_sha','artifact_sha256')) and
+             old['configuration']['after_sha256']==up['configuration']['before_sha256'] and
+             all(binding[k]==previous[k] for k in binding if k not in {'schema','acceptance','predecessor_policy_sha256'}),
+             'managed_vmm_predecessor_binding')
+        # The immutable AI snapshot still names its original Core transition,
+        # never rewrite it to impersonate this later compatible Core release.
+        return verify_core_followup_context(predecessor,validator=core_business)
     prior=core_business.validate_successor(predecessor)
     up=value['upgrade']; old=predecessor['upgrade']
     must(predecessor.get('schema')==BUSINESS_POLICY_SCHEMA and

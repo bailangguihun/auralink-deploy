@@ -84,3 +84,7 @@ Unsigned plan包含实际所有before/after hash、正式artifact绑定、当前
 ```
 
 本轮测试是真实临时文件/descriptor/flock/fsync/CAS和实际guard/plan/publisher衔接逻辑；OS服务、正式GitHub审批和完整PG契约在controller单元fixture中模拟，不能冒充生产安装或回退。原非空PG/backup证据仅在未改变范围内复用。新PG关键词测试另在真实隔离PostgreSQL执行。无provider/RAG请求。
+
+## 后续 managed VMM Core 的专用入口
+
+上述 Gallery V1 仍是单次绑定，不可再次调用来冒充新 Core 的批准。Gallery 已 COMMITTED 后，新增有限的 [managed VMM Core followup](managed-vmm-core-followup.md) 支持正式新 JAR 与五个私有门禁配置的成对转换、固定音乐在途聚合和原事务恢复；它保持原 Gallery/AI provenance，并明确 Core 先于 disabled VMM overlay 的安装顺序。

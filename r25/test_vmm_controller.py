@@ -42,9 +42,7 @@ class Controller(unittest.TestCase):
         self.assertEqual(v.sha(lifecycle),v.BASE_LIFECYCLE)
         self.put(self.rt.targets()['lifecycle'][0],lifecycle,0o700)
         # Remove exactly this extension's new hook to reconstruct audited base.
-        guard=(HERE/'core_release_guard.py').read_text()
-        start=guard.index("        if 'R25_VMM_CONTROLLER' in values:\n");end=guard.index('        return result\n',start)
-        oldguard=(guard[:start]+guard[end:]).encode();self.assertEqual(v.sha(oldguard),v.BASE_GUARD)
+        oldguard=(HERE/'fixtures/core_release_guard_gallery.py.snapshot').read_bytes();self.assertEqual(v.sha(oldguard),v.BASE_GUARD)
         self.put(self.rt.targets()['operation-guard'][0],oldguard,0o700);self.put(self.rt.targets()['publisher-guard'][0],oldguard)
         handoff=(f'R25_LIFECYCLE_ADAPTER_SHA256={v.BASE_LIFECYCLE}\nR25_CORE_RELEASE_GUARD_SHA256={v.BASE_GUARD}\nUNCHANGED_SETTING=unchanged\n').encode()
         self.put(self.rt.targets()['handoff'][0],handoff)
@@ -77,6 +75,38 @@ class Controller(unittest.TestCase):
 
     def assert_preserved(self):
         for name,path in self.rt.preserved().items():self.assertEqual(path.read_bytes(),self.preserved[name],name)
+
+    def managed_core_baseline(self):
+        raw=self.sources['core_release_guard.py'];guardsha=v.sha(raw)
+        self.policy['upgrade']['core_followup']={'schema':'R25_MANAGED_VMM_CORE_FOLLOWUP_V1'}
+        self.policy['controllers']['core_release_guard.py']=guardsha;self.policy['runtime_modules']['core_release_guard.py']=guardsha
+        self.put(self.rt.preserved()['policy'],v.encoded(self.policy))
+        self.prior={'schema':'R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1','files':{'core_release_guard.py':{'after_sha256':guardsha}},'operational':{'policy':{'after_sha256':v.sha(v.encoded(self.policy))}}}
+        rawplan=v.encoded(self.prior);ident=v.sha(rawplan);folder=self.root/'runtime/core-publications/controller-upgrades'/ident
+        self.put(folder/'approval.json',rawplan);self.put(folder/'journal.json',v.encoded({'phase':'INSTALLED','approval_sha256':ident}))
+        self.put(self.rt.preserved()['original-controller-active'],v.encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident}))
+        self.put(self.rt.targets()['publisher-guard'][0],raw);self.put(self.rt.targets()['operation-guard'][0],raw,0o700)
+        self.put(self.rt.targets()['handoff'][0],('R25_LIFECYCLE_ADAPTER_SHA256='+v.BASE_LIFECYCLE+'\nR25_CORE_RELEASE_GUARD_SHA256='+guardsha+'\n').encode())
+        review=v.encoded({'fixture_only':True,'scope':'managed Core already committed, new explicit extension review'})
+        self.put(self.rt.store/'REVIEW.json',review)
+        request={'schema':'R25_VMM_CONTROLLER_REQUEST_V1','deploy':self.deploy,'review_evidence_sha256':v.sha(review)}
+        self.put(self.rt.store/'REQUEST.json',v.encoded(request));self.req=v.sha(v.encoded(request))
+
+    def test_managed_core_first_then_disabled_overlay_uses_same_formal_guard(self):
+        self.managed_core_baseline();result=v.prepare(self.rt,self.req)
+        plan=json.loads(Path(result['plan_path']).read_bytes());ident=result['plan_sha256']
+        self.put(self.rt.store/'APPROVAL.json',v.encoded(plan));before=self.rt.preserved()['policy'].read_bytes()
+        self.assertEqual(v.bind(self.rt,ident)['outcome'],'INSTALLED')
+        effective=v.apply_policy_overlay(self.policy,v.env_values(self.rt.targets()['handoff'][0].read_bytes()),self.root,fixture_runtime=self.rt)
+        self.assertEqual(effective['upgrade'],self.policy['upgrade']);self.assertEqual(self.rt.preserved()['policy'].read_bytes(),before)
+        self.assertEqual(json.loads(self.rt.targets()['role'][0].read_bytes()),{'schema':'R25_VMM_ROLE_V1','enabled':False})
+
+    def test_managed_overlay_refuses_relabelled_foreign_baseline_guard(self):
+        self.managed_core_baseline()
+        for name in ('publisher-guard','operation-guard'):
+            path,_,mode=self.rt.targets()[name];self.put(path,b'foreign guard, not reviewed bundle',mode)
+        with self.assertRaisesRegex(v.Refused,'formal_guard_baseline'):v.prepare(self.rt,self.req)
+        self.assertEqual(self.events,[])
 
     def test_prepare_has_no_live_mutation_preflight_and_install_disabled(self):
         self.assertEqual(self.events,[]);self.assertEqual(v.preflight(self.rt,self.ident)['outcome'],'PREFLIGHT_PASS')
