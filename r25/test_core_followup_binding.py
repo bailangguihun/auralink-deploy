@@ -281,7 +281,7 @@ print('STANDALONE_CORE_FOLLOWUP_GUARD_OK')
             cwd=f.root,env={'PATH':os.environ['PATH']},text=True,capture_output=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr);self.assertIn('STANDALONE_CORE_FOLLOWUP_GUARD_OK',result.stdout)
 
-    def preparation(self,*,wrong=None):
+    def preparation(self,*,wrong=None,managed=False):
         """Actual prepare path; only Java-bytecode/OS-root boundary is simulated."""
         from contextlib import ExitStack
         from types import SimpleNamespace
@@ -311,6 +311,9 @@ print('STANDALONE_CORE_FOLLOWUP_GUARD_OK')
         request={'schema':'R25_ASSISTANT_CORE_FOLLOWUP_REQUEST_V1','deploy':self.plan['deploy'],'core':core,
             'web_commit':'9'*40,'evidence':self.new['upgrade']['evidence'],'compatibility':self.new['upgrade']['compatibility'],
             'compatibility_evidence_sha256':'c'*64,'review_evidence_sha256':self.plan['review_evidence_sha256']}
+        if managed:
+            request['schema']='R25_MANAGED_VMM_CORE_FOLLOWUP_REQUEST_V1'
+            request['managed_vmm']={'enabled':True,'token-file':'/root/autodl-tmp/artlive-r25-native-pg16/handoff-production-20260923T062101Z/runtime/config/vmm-token','acceptance-owner-id':7,'acceptance-source-painting-id':33,'acceptance-duration-seconds':3}
         request_sha=business.sha(guard.encoded(request))
         # Existing setup's hand-built output is removed only inside this disposable
         # test fixture. The real prepare operation refuses conflicting sidecars.
@@ -333,8 +336,8 @@ print('STANDALONE_CORE_FOLLOWUP_GUARD_OK')
                 patch.object(C,'packaged_verifier',return_value=SimpleNamespace(verify=lambda _:{**actual,
                     'jar_sha256':business.sha(jar.read_bytes()),'jar_bytes':jar.stat().st_size}))):stack.enter_context(context)
             try:
-                result=upgrade.prepare_core_followup(f.rt,request,request_sha,f.bundle)
-                self.assertEqual(upgrade.prepare_core_followup(f.rt,request,request_sha,f.bundle),result)
+                result=upgrade.prepare_core_followup(f.rt,request,request_sha,f.bundle,managed=managed)
+                self.assertEqual(upgrade.prepare_core_followup(f.rt,request,request_sha,f.bundle,managed=managed),result)
                 return result
             finally:
                 self.assertEqual((f.store/'CONTROL_UPGRADE_APPROVAL.json').read_bytes(),approval_before)

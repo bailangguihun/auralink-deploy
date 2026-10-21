@@ -20,7 +20,7 @@ import sys
 import time
 
 import core_release_guard as guard
-from core_acceptance import IDLE_SQL, verify_http, verify_knowledge_http, authenticated_request, verify_gallery_followup_http
+from core_acceptance import IDLE_SQL, verify_http, verify_knowledge_http, authenticated_request, verify_gallery_followup_http, verify_managed_vmm_closed_http
 from publisher_transaction import Release, RecoveryPlan, Refused
 from r25_storage import R25Storage
 
@@ -305,9 +305,11 @@ class CoreRuntime:
                 module=guard.source_module(path,'r25_bound_assistant_acceptance',guard.read_file(path,expected=value['runtime_modules']['assistant_acceptance.py']))
                 receipt['assistant']=module.verify_assistant_http(value,get_authenticated=authenticated_request(token))
                 if 'core_followup' in value['upgrade']:
-                    must(value['upgrade']['core_followup'].get('acceptance') == 'gallery-daily-v1',
+                    must(value['upgrade']['core_followup'].get('acceptance') in {'gallery-daily-v1','managed-vmm-closed-v1'},
                          'core_followup_http_contract')
                     receipt['gallery_daily'] = verify_gallery_followup_http(get_authenticated=authenticated_request(token))
+                    if value['upgrade']['core_followup']['acceptance']=='managed-vmm-closed-v1':
+                        receipt['managed_vmm']=verify_managed_vmm_closed_http(get_authenticated=authenticated_request(token))
         return receipt
 
     def snapshot(self, current, candidate):
