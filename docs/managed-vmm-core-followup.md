@@ -2,6 +2,8 @@
 
 这是实际 Gallery `core_followup V1` 已提交后的单次功能升级入口。它不重放 Gallery、Assistant successor 或首次安装，不是等价 JAR 重打包，也不是任意无限 policy 升级器。它使用原 private owner/CODEOWNER review、正式 release artifacts、共享 lease、Core publisher、一致性 PostgreSQL/private-files backup 和原事务恢复。
 
+已完成本阶段且已安装 disabled VMM overlay/role 的现场，要发布新的同配置 Core 功能修复，应使用[有限 managed Core successor](managed-vmm-core-successor.md)，保留 overlay 和旧批准。下述首次 managed binder 仍只接受 Gallery 前像，不能重放来升级现有 managed Core。
+
 本入口只接受 `R25_ASSISTANT_CORE_FOLLOWUP_V1` 为前像，生成 `R25_MANAGED_VMM_CORE_FOLLOWUP_V1`，绑定 schema 为 `R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1`。新的 Core 和五个 managed 配置值成对通过原 publisher 安装/恢复。旧 policy 保存至原内容寻址 `core-followup-baselines/<sha>.json`；旧 approval/journal/accepted record、AI 源码/CURRENT/配置不重写。AI provenance 继续核对其原始 successor 的 snapshot 与 Core，而不伪造它属于本次后续 Core。
 
 ## 唯一推荐顺序
