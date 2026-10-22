@@ -21,6 +21,7 @@ SCHEMA = 'R25_CORE_BUSINESS_POLICY_V2'
 RECORD_SCHEMA = 'R25_CORE_BUSINESS_RELEASE_V2'
 REPOSITORY = 'Hang-666-star/auralink-core-api'
 CURRENT_REPOSITORY = 'bailangguihun/auralink-core-api'
+MANAGED_CORE_SCHEMAS = ('R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1')
 VERIFIED_REPOSITORIES = (CURRENT_REPOSITORY, REPOSITORY)
 CONFIG_KEYS = ('snapshot-root', 'graph-sha256', 'stats-sha256', 'map-enabled', 'china-sha256')
 ASSETS = {'poetry-graph.json': 'graph-sha256', 'poetry-stats.json': 'stats-sha256',
@@ -202,7 +203,7 @@ def validate_policy(policy):
          legacy['payload_fingerprint'] != identity['payload_fingerprint'], 'business_not_equivalent_repackaging')
     digest(up.get('web_commit'), 40)
     config = up.get('configuration')
-    managed = up.get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1'
+    managed = up.get('core_followup',{}).get('schema') in MANAGED_CORE_SCHEMAS
     must(type(config) is dict and set(config) == ({'before_sha256', 'after_sha256', 'knowledge','assistant'}|({'vmm'} if managed else set()) if assistant else {'before_sha256', 'after_sha256', 'knowledge'}), 'business_configuration')
     digest(config['before_sha256']); digest(config['after_sha256'])
     must((assistant or config['before_sha256'] == legacy['application_configuration_sha256']) and
@@ -335,6 +336,8 @@ def render_configuration(before, policy):
     if 'successor' in policy['upgrade'] or 'core_followup' in policy['upgrade']:
         (validate_successor if 'successor' in policy['upgrade'] else validate_core_followup)(policy)
         validate_existing_assistant_configuration(before, policy)
+        if policy['upgrade'].get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1':
+            validate_existing_managed_vmm_configuration(before,policy)
         must(sha(before) == config['after_sha256'], 'successor_bridge_configuration_unchanged')
         return before
     if policy['upgrade']['capability']=='assistant-v1':
@@ -385,8 +388,9 @@ def validate_core_followup(policy):
         'schema','acceptance','predecessor_policy_sha256','ai_release','ai_policy_sha256','ai_transaction_id',
         'ai_active_sha256','ai_current_sha256','ai_journal_sha256','ai_snapshot_sha256','ai_configuration_sha256'},
         'core_followup_contract_fields')
-    must(value['schema'] in ('R25_ASSISTANT_CORE_FOLLOWUP_V1','R25_MANAGED_VMM_CORE_FOLLOWUP_V1'), 'core_followup_contract_schema')
-    managed=value['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1'
+    must(value['schema'] in ('R25_ASSISTANT_CORE_FOLLOWUP_V1',*MANAGED_CORE_SCHEMAS), 'core_followup_contract_schema')
+    managed=value['schema'] in MANAGED_CORE_SCHEMAS
+    first_managed=value['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1'
     must(value['acceptance']==('managed-vmm-closed-v1' if managed else 'gallery-daily-v1'),'core_followup_acceptance_contract')
     for key in ('predecessor_policy_sha256','ai_policy_sha256','ai_active_sha256','ai_current_sha256',
                 'ai_journal_sha256','ai_snapshot_sha256','ai_configuration_sha256'):digest(value[key])
@@ -395,7 +399,7 @@ def validate_core_followup(policy):
     must(type(ref) is dict and set(ref)=={'commit_sha','source_tree_sha256','record_sha256'}, 'core_followup_ai_reference')
     for key,item in ref.items():digest(item,40 if key=='commit_sha' else 64)
     config=up['configuration']
-    must((config['before_sha256']!=config['after_sha256'] if managed else config['before_sha256']==config['after_sha256']) and
+    must((config['before_sha256']!=config['after_sha256'] if first_managed else config['before_sha256']==config['after_sha256']) and
          config['assistant']['execution.expected-config-sha256']==value['ai_configuration_sha256'] and
          up['assistant']['baseline_policy_sha256']==value['predecessor_policy_sha256'], 'core_followup_configuration_binding')
     if managed:validate_managed_vmm_configuration(config.get('vmm'))
@@ -409,6 +413,19 @@ def validate_managed_vmm_configuration(value):
         must(type(value[key])is int and 0<value[key]<2**63,'managed_vmm_acceptance_identity')
     must(type(value['acceptance-duration-seconds'])is int and 3<=value['acceptance-duration-seconds']<=30,'managed_vmm_duration')
     return value
+
+
+def validate_existing_managed_vmm_configuration(raw,policy):
+    """Same-config successor preserves all five accepted gate properties."""
+    values=validate_managed_vmm_configuration(policy['upgrade']['configuration'].get('vmm'))
+    actual={}
+    for line in raw.decode('utf-8').splitlines():
+        if not line.lstrip().startswith('#') and re.search(r'(?i)vmm[-_.]?managed|vmm[-_.]?acceptance',line):
+            match=re.fullmatch(r'auralink\.vmm-managed\.([a-z-]+): (.+)',line)
+            must(match is not None and match[1] not in actual,'managed_vmm_existing_configuration_alias')
+            actual[match[1]]=strict_json(match[2])
+    must(actual==values,'managed_vmm_existing_configuration_values')
+    return values
 
 
 def render_managed_vmm_configuration(before,policy,*,verify_after=True):
@@ -664,7 +681,7 @@ def acceptance_queries(policy):
     except (UnicodeError, SyntaxError) as error:
         raise Refused('business_acceptance_sql_source') from error
     expected = {'IDLE_SQL', 'PRIVATE_SAMPLE_SQL'}
-    if policy['upgrade'].get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1':
+    if policy['upgrade'].get('core_followup',{}).get('schema') in MANAGED_CORE_SCHEMAS:
         expected.add('MANAGED_VMM_INFLIGHT_SQL')
     values = {}
     for node in tree.body:
@@ -836,7 +853,7 @@ def verify_process(policy, pid, start_ticks, configuration_path, *, proc_root=Pa
     else:
         must(status.get('CapEff') is not None and int(status['CapEff'], 16) == 0, 'business_process_service_identity')
     environment = read('environ').split(b'\0')
-    managed=policy['upgrade'].get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1'
+    managed=policy['upgrade'].get('core_followup',{}).get('schema') in MANAGED_CORE_SCHEMAS
     keys = [entry.partition(b'=')[0].decode('ascii', errors='strict') for entry in environment if entry]
     must(len(keys) == len(set(keys)) and not any(key.startswith(('SPRING_', 'AURALINK_KNOWLEDGE_') + (('AURALINK_ASSISTANT_',) if policy['upgrade']['capability']=='assistant-v1' else ()) + (('AURALINK_VMM_',) if managed else ())) or
          key in {'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS'} or
