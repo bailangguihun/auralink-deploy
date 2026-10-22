@@ -8,6 +8,9 @@ deployment lock. Desired state and an execution budget survive process death.
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
+import math
+import re
 import ctypes
 import fcntl
 import importlib.util
@@ -24,6 +27,7 @@ import urllib.request
 
 BASE_LIFECYCLE_SHA256 = '783c10bca59e8723c2a208970efd566890776aff8813a536bbc4c8e069d1fda3'
 ROLE_SCHEMA = 'R25_VMM_ROLE_V1'
+ACCEPTANCE_COMMAND_SCHEMA = 'R25_VMM_GATE_COMMAND_V2'
 ROOT = Path('/root/autodl-tmp/artlive-r25-native-pg16/handoff-production-20260923T062101Z')
 INTERPRETER = '/root/autodl-tmp/auralink/micromamba/envs/auralink-ai/bin/python'
 
@@ -470,6 +474,156 @@ def managed_role(engine):
                 stop_seconds=policy['stop_seconds'], restart_limit=policy['restart_limit'])
 
 
+
+ACCEPTANCE_LIMITS = {
+    'core_workflow_posts': 1, 'core_creation_posts': 1, 'upstream_music_requests': 1,
+    'concurrency': 1, 'retries': 0, 'repair_calls': 0, 'duration_seconds': 3,
+    'additional_initializations': 0, 'core_connect_seconds': 5, 'core_read_seconds': 600,
+    'acceptance_executor_seconds': 660, 'open_admission': False,
+}
+STARTUP_LIMITS = {
+    'automatic_retries': 0, 'explicit_enable_calls_max': 1, 'explicit_start_calls_max': 1,
+    'generation_requests': 0, 'no_fallback': True, 'open_admission': False,
+    'ready_operator_window_seconds': 600, 'restart_limit': 0,
+    'startup_seconds': 900, 'stop_seconds': 30,
+}
+
+
+def exact_object(actual, expected):
+    # bool == 1 in Python must not turn an altered limit into approval.
+    return (type(actual) is dict and set(actual) == set(expected)
+            and all(type(actual[k]) is type(v) and actual[k] == v for k, v in expected.items()))
+
+
+def acceptance_window(engine, role, command, expected, lifecycle):
+    """Validate the real immutable authorization chain, never a hash-only nonce.
+
+    All paths derive from a checked startup digest, not caller-controlled paths.
+    The original observer owns creation of these private records. Their full
+    hashes bind human approval -> acceptance plan -> command -> startup/READY.
+    This method runs under the original shared deployment lease and does no
+    model loading, generation, retries, clock reset or accounting mutation.
+    """
+    try:
+        common = {'schema', 'mode', 'role_sha256', 'before_gate_sha256', 'permit', 'window'}
+        must(type(command) is dict and set(command) == common
+             and command['schema'] == ACCEPTANCE_COMMAND_SCHEMA, 'vmm_acceptance_window_required')
+        window = command['window']
+        must(type(window) is dict and set(window) == {'startup_plan_sha256', 'first_ready_sha256'}
+             and all(type(v) is str and re.fullmatch('[a-f0-9]{64}', v) for v in window.values()),
+             'vmm_acceptance_window_identity')
+        startup_sha = window['startup_plan_sha256']
+        consumed = lifecycle.get('gate_windows', {})
+        must(type(consumed) is dict, 'vmm_acceptance_window_ledger')
+        must(startup_sha not in consumed, 'vmm_acceptance_window_consumed')
+        directory = private(engine.root / 'runtime/vmm-startup-windows' / startup_sha, True)
+        def record(name, digest=None):
+            path = directory / name
+            value = read(path)
+            must(type(value) is dict, 'vmm_acceptance_window_record_object')
+            if digest is not None:
+                must(sha(path) == digest, 'vmm_acceptance_window_record_hash')
+            return value
+        startup = record('STARTUP_PLAN.json', startup_sha)
+        must(startup.get('schema') == 'ARTLIVE_CLOSED_START_OBSERVER_PLAN_V2'
+             and startup.get('acceptance_gate_schema') == ACCEPTANCE_COMMAND_SCHEMA
+             and startup.get('installed_root') == str(engine.root)
+             and exact_object(startup.get('limits'), STARTUP_LIMITS), 'vmm_acceptance_startup_scope')
+        plan_path = directory / 'SINGLE_REQUEST_ACCEPTANCE_UNSIGNED_PLAN.json'
+        plan = record(plan_path.name)
+        approval = record('ACCEPTANCE_APPROVAL.json')
+        must(exact_object(approval, {
+            'schema': 'ARTLIVE_USER_MUSIC_ACCEPTANCE_APPROVAL_V1', 'plan_sha256': sha(plan_path),
+            'scope': 'ONE_WORKFLOW_CREATE_ONE_CREATION_ONE_UPSTREAM_MUSIC_THREE_SECONDS',
+            'authorized': True}), 'vmm_acceptance_human_approval')
+        must(plan.get('schema') == 'ARTLIVE_VMM_SINGLE_REQUEST_REVIEW_PLAN_V2'
+             and plan.get('startup_plan_sha256') == startup_sha
+             and plan.get('gate_command_sha256') == expected
+             and plan.get('role_sha256') == command['role_sha256']
+             and exact_object(plan.get('limits'), ACCEPTANCE_LIMITS), 'vmm_acceptance_plan_binding')
+        names = {'EXECUTION.json', 'FIRST_READY.json', 'SECOND_AUTHENTICATED_READY.json',
+                 'NATIVE_READY.json', 'READY_TELEMETRY.json', 'READY_GATE.raw.json'}
+        hashes = plan.get('ready_evidence_sha256')
+        must(type(hashes) is dict and set(hashes) == names
+             and all(type(v) is str and re.fullmatch('[a-f0-9]{64}', v) for v in hashes.values())
+             and hashes['FIRST_READY.json'] == window['first_ready_sha256'],
+             'vmm_acceptance_ready_inventory')
+        evidence = {name: record(name, hashes[name]) for name in names}
+        execution, first = evidence['EXECUTION.json'], evidence['FIRST_READY.json']
+        must(execution.get('schema') == 'ARTLIVE_CLOSED_START_WINDOW_V2'
+             and execution.get('plan_sha256') == startup_sha
+             and execution.get('phase') == 'OBSERVING' and execution.get('completed', False) is False
+             and type(execution.get('start_calls')) is int and execution['start_calls'] == 1
+             and type(execution.get('enable_calls')) is int and execution['enable_calls'] == 1
+             and type(execution.get('generation_requests')) is int and execution['generation_requests'] == 0,
+             'vmm_acceptance_execution_state')
+        saved = first['process']
+        must(type(saved) is dict and saved == lifecycle.get('process')
+             and saved == role.owned(lifecycle) and saved['boot_id'] == execution['boot_id']
+             and saved['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+             'vmm_acceptance_process_identity')
+        def number(value):
+            must(type(value) in (int, float) and math.isfinite(value), 'vmm_acceptance_clock_format')
+            return value
+        start = number(execution['start_intent_monotonic'])
+        startup_end = number(execution['startup_deadline_monotonic'])
+        ready, end = number(first['monotonic']), number(first['deadline_monotonic'])
+        actual_start = number(lifecycle['started_monotonic'])
+        must(startup_end == start + 900 and start <= actual_start <= ready < startup_end
+             and end == ready + 600 and ready <= time.monotonic() < end,
+             'vmm_acceptance_original_monotonic_window')
+        def wall(value):
+            moment = dt.datetime.fromisoformat(value)
+            must(moment.tzinfo is not None, 'vmm_acceptance_wall_timezone')
+            return moment.timestamp()
+        observed, expires = wall(first['at']), wall(first['deadline_at'])
+        must(599.5 <= expires - observed <= 600.5
+             and number(lifecycle['started_at']) <= observed <= time.time() < expires,
+             'vmm_acceptance_original_wall_window')
+        must(plan.get('ready_at') == first['at']
+             and plan.get('approval_deadline_wall') == first['deadline_at']
+             and plan.get('approval_deadline_monotonic') == end
+             and plan.get('ready_process') == saved, 'vmm_acceptance_derived_ready')
+        ready_health = first['health']
+        must(type(ready_health) is dict and ready_health.get('contract') == 'artlive-vmm-managed-v1'
+             and ready_health.get('model_ready') is True and ready_health.get('process_alive') is True
+             and ready_health.get('mode') == 'CLOSED' and ready_health.get('dispatch_permitted') is False
+             and type(ready_health.get('attempts')) is int and ready_health['attempts'] == 0
+             and ready_health.get('in_flight') is False and ready_health.get('uncertain') is False,
+             'vmm_acceptance_first_ready')
+        must(evidence['READY_GATE.raw.json'] == {
+                 'schema': 'artlive-vmm-managed-v1', 'mode': 'CLOSED', 'permit': None,
+                 'requests': {}, 'uncertainty_acknowledgements': []}
+             and first['gate_sha256'] == hashes['READY_GATE.raw.json'] == command['before_gate_sha256'],
+             'vmm_acceptance_original_gate')
+        permit = command['permit']
+        must(type(permit) is dict and set(permit) == {'owner_id', 'source_painting_id', 'image_sha256', 'duration'}
+             and all(type(permit[k]) is str and 0 < len(permit[k]) <= 128 for k in ('owner_id', 'source_painting_id'))
+             and type(permit['image_sha256']) is str and re.fullmatch('[a-f0-9]{64}', permit['image_sha256'])
+             and type(permit['duration']) is int and permit['duration'] == 3, 'vmm_acceptance_exact_permit')
+        current = role.status()
+        must(lifecycle['enabled'] is True and lifecycle['desired'] == 'RUNNING'
+             and lifecycle['state'] == 'READY' and lifecycle['attempts'] == 1
+             and current['ready'] is True and current['alive'] is True
+             and current['mode'] == 'CLOSED' and current['dispatch_permitted'] is False
+             and current['attempts'] == 0 and current['in_flight'] is False and current['uncertain'] is False,
+             'vmm_acceptance_current_ready')
+        # The authenticated status GET is bounded but can cross a deadline.
+        # Recheck both original clocks after it; never extend either window.
+        window_context = {'startup_sha256': startup_sha, 'ready_monotonic': ready,
+                          'deadline_monotonic': end, 'ready_wall': observed, 'deadline_wall': expires}
+        check_window_deadline(window_context)
+        return window_context
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        raise Refused('vmm_acceptance_window_invalid_record') from error
+
+
+def check_window_deadline(window):
+    must(window['ready_monotonic'] <= time.monotonic() < window['deadline_monotonic']
+         and window['ready_wall'] <= time.time() < window['deadline_wall'],
+         'vmm_acceptance_observation_expired')
+
+
 def manage(engine, mode):
     with engine.lease():
         role = managed_role(engine)
@@ -492,22 +646,46 @@ def manage(engine, mode):
             must(isinstance(expected, str) and len(expected) == 64 and sha(command_path) == expected,
                  'vmm_gate_approval_identity')
             command = read(command_path)
-            must(command.get('schema') == 'R25_VMM_GATE_COMMAND_V1' and command.get('mode') == mode
+            must(type(command) is dict and command.get('mode') == mode
                  and command.get('role_sha256') == engine.v['R25_VMM_ROLE_SHA256']
                  and command.get('before_gate_sha256') == sha(role.gate.path), 'vmm_gate_command_binding')
             must(role.gate.snapshot()['mode'] == 'CLOSED', 'vmm_gate_close_before_approval')
             value = role.state()
             used = value.setdefault('gate_commands', [])
+            must(type(used) is list and all(type(item) is str and re.fullmatch('[a-f0-9]{64}', item) for item in used),
+                 'vmm_gate_command_ledger')
             must(expected not in used, 'vmm_gate_command_consumed')
-            if mode != 'reconcile':
+            window_context = None
+            if mode == 'acceptance':
+                window_context = acceptance_window(engine, role, command, expected, value)
+            else:
+                fields = {'schema', 'mode', 'role_sha256', 'before_gate_sha256'}
+                if mode == 'reconcile':
+                    fields |= {'request_id', 'reason'}
+                elif 'permit' in command:
+                    fields.add('permit')
+                    must(command['permit'] is None, 'vmm_open_permit')
+                must(command.get('schema') == 'R25_VMM_GATE_COMMAND_V1' and set(command) == fields,
+                     'vmm_gate_command_fields')
+            if mode == 'open':
                 must(role.status()['ready'], 'vmm_model_not_ready')
             used.append(expected)
+            if window_context is not None:
+                value.setdefault('gate_windows', {})[window_context['startup_sha256']] = {
+                    'command_sha256': expected, 'first_ready_sha256': command['window']['first_ready_sha256']}
             write(role.record, value)
+            if window_context is not None:
+                # fsync itself can be delayed. Expiry here retains consumption
+                # and leaves the gate CLOSED; it never grants a retry/refund.
+                check_window_deadline(window_context)
             if mode == 'reconcile':
                 role.gate.acknowledge_unknown(command['request_id'], command['reason'],
                                              expected_sha256=command['before_gate_sha256'])
             else:
-                role.gate.configure(mode.upper(), command.get('permit'), expected_sha256=command['before_gate_sha256'])
+                deadline = ({'monotonic': window_context['deadline_monotonic'],
+                             'wall': window_context['deadline_wall']} if window_context is not None else None)
+                role.gate.configure(mode.upper(), command.get('permit'),
+                                    expected_sha256=command['before_gate_sha256'], acceptance_deadline=deadline)
             return role.status()
         must(mode in {'enable', 'status', 'stop', 'recover'}, 'vmm_mode')
         return getattr(role, mode)()

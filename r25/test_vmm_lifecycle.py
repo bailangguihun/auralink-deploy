@@ -353,7 +353,9 @@ class LifecycleTest(unittest.TestCase):
                 life.manage(engine, 'acceptance')
             self.assertEqual([], self.role.state().get('gate_commands', []))
             self.store.configure('CLOSED')
-            approved = engine.command(self.store, 'acceptance', permit=permit)
+            from test_vmm_window_identity import write_window
+            write_window(engine, self.role)
+            approved = engine.vmm_gate_sha256
             self.assertEqual('ACCEPTANCE', life.manage(engine, 'acceptance')['mode'])
             self.assertEqual([approved], self.role.state()['gate_commands'])
             # Closing without dispatch restores the same gate bytes, but the
