@@ -210,7 +210,7 @@ class WindowIdentityTest(unittest.TestCase):
         self.start(); self.engine = FixtureEngine(self.root)
         self.engine.command(self.store, 'open', random_salt='forbidden')
         with patch.object(life, 'managed_role', return_value=self.role):
-            with self.assertRaisesRegex(life.Refused, 'command_fields'): life.manage(self.engine, 'open')
+            with self.assertRaisesRegex(life.Refused, 'operation_required'): life.manage(self.engine, 'open')
         self.assertNotIn('gate_commands', self.role.state())
 
     def test_real_gate_lock_delay_rejects_expired_admission(self):

@@ -1,5 +1,9 @@
 # Optional managed VMM role
 
+Ordinary website OPEN uses the separately approved operation identity described in
+[OPEN operations](vmm-open-operations.md). V2 single-request ACCEPTANCE remains a
+distinct contract; neither approval substitutes for the other.
+
 This extension is a reviewed, incremental R25 controller change. It does not replace the installation with a V1 controller or start another supervisor. VMM remains disabled after binding. Existing Java, Guide/Critic, c5ea Next and PostgreSQL identities remain authoritative. See [controller transaction](vmm-controller-update.md) for approval-bound prepare/bind/recovery commands.
 
 ## Bound implementation

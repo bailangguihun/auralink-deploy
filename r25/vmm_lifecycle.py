@@ -624,6 +624,213 @@ def check_window_deadline(window):
          'vmm_acceptance_observation_expired')
 
 
+
+# OPEN authorization is distinct from V2 single-request music acceptance.
+OPEN_COMMAND_SCHEMA = 'R25_VMM_OPEN_COMMAND_V2'
+OPEN_OPERATION_SCHEMA = 'ARTLIVE_VMM_OPEN_OPERATION_V1'
+OPEN_STARTUP_SCHEMA = 'ARTLIVE_WEBSITE_CLOSED_START_PLAN_V2'
+OPEN_SCOPE = {'opening_count': 1, 'operator_supervised_seconds': 1800,
+              'authenticated_eligible_users': 'ALL', 'builtin_account_allowlist': False,
+              'builtin_expiry': False, 'builtin_total_request_quota': False,
+              'duration_seconds': [3, 30], 'generation_concurrency': 1,
+              'automatic_retry': False, 'operator_must_close': True}
+OPEN_STARTUP_LIMITS = {'initializations': 1, 'automatic_retries': 0, 'startup_seconds': 900,
+                       'ready_approval_seconds': 600, 'startup_authorizes_open': False,
+                       'tool_generation_requests': 0, 'each_open_requires_separate_approval': True}
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+
+def object_sha(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def open_consumption(value):
+    commands = value.get('gate_commands', [])
+    operations = value.get('open_operations', [])
+    windows = value.get('gate_windows', {})
+    must(type(commands) is list and type(operations) is list and type(windows) is dict
+         and all(type(x) is str and re.fullmatch('[a-f0-9]{64}', x) for x in commands + operations)
+         and len(commands) == len(set(commands)) and len(operations) == len(set(operations)),
+         'vmm_open_consumption_ledger')
+    return {'gate_commands': commands, 'gate_windows': windows, 'open_operations': operations}
+
+
+def open_ready_context(engine, role, startup_sha, lifecycle):
+    """Read original startup/READY evidence, preserving both absolute clocks.
+
+    A later operation may reuse a still-valid READY observation, never reset
+    FIRST_READY or its deadline. After 600 seconds a new approved startup is
+    required by this contract. No model import or initialization occurs here.
+    """
+    must(type(startup_sha) is str and re.fullmatch('[a-f0-9]{64}', startup_sha), 'vmm_open_startup_identity')
+    directory = private(engine.root / 'runtime/vmm-website-windows' / startup_sha, True)
+    startup = read(directory / 'STARTUP_PLAN.json')
+    must(sha(directory / 'STARTUP_PLAN.json') == startup_sha
+         and startup.get('schema') == OPEN_STARTUP_SCHEMA
+         and startup.get('installed_root') == str(engine.root)
+         and startup.get('role_sha256') == engine.v['R25_VMM_ROLE_SHA256']
+         and exact_object(startup.get('limits'), OPEN_STARTUP_LIMITS), 'vmm_open_startup_scope')
+    approval = read(directory / 'STARTUP_APPROVAL.json')
+    must(exact_object(approval, {'schema': 'ARTLIVE_USER_CLOSED_START_APPROVAL_V1',
+         'plan_sha256': startup_sha, 'scope': 'ONE_INITIALIZATION_CLOSED_ZERO_GENERATION',
+         'authorized': True}), 'vmm_open_startup_approval')
+    must(not (directory / 'EXECUTION_ENDED.json').exists(), 'vmm_open_startup_ended')
+    execution = read(directory / 'EXECUTION.json')
+    must(execution.get('startup_sha256') == startup_sha and execution.get('completed', False) is False
+         and type(execution.get('start_calls')) is int and execution['start_calls'] == 1
+         and type(execution.get('enable_calls')) is int and execution['enable_calls'] == 1
+         and type(execution.get('tool_generation_requests')) is int and execution['tool_generation_requests'] == 0,
+         'vmm_open_execution_identity')
+    first = read(directory / 'FIRST_READY.json'); evidence = read(directory / 'READY_EVIDENCE_COMPLETE.json')
+    saved = first['process']
+    must(saved == lifecycle.get('process') == role.owned(lifecycle)
+         and saved['boot_id'] == execution['boot_id'] == Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+         'vmm_open_process_identity')
+    numbers = [execution['intent_monotonic'], execution['startup_deadline'], first['monotonic'],
+               first['deadline_monotonic'], lifecycle['started_monotonic']]
+    must(all(type(x) in (int, float) and math.isfinite(x) for x in numbers), 'vmm_open_clock')
+    start, startup_end, ready, end, actual_start = numbers
+    must(startup_end == start + 900 and start <= actual_start <= ready < startup_end
+         and end == ready + 600, 'vmm_open_original_deadlines')
+    observed = dt.datetime.fromisoformat(first['at']); expires = dt.datetime.fromisoformat(first['deadline_at'])
+    must(observed.tzinfo is not None and expires.tzinfo is not None
+         and 599.5 <= (expires - observed).total_seconds() <= 600.5
+         and lifecycle['started_at'] <= observed.timestamp(), 'vmm_open_wall_deadline')
+    context = {'ready_monotonic': ready, 'deadline_monotonic': end,
+               'ready_wall': observed.timestamp(), 'deadline_wall': expires.timestamp()}
+    check_window_deadline(context)
+    health = first['health']
+    must(health.get('contract') == 'artlive-vmm-managed-v1' and health.get('process_alive') is True
+         and health.get('model_ready') is True and health.get('mode') == 'CLOSED'
+         and health.get('dispatch_permitted') is False and health.get('in_flight') is False
+         and health.get('uncertain') is False, 'vmm_open_original_ready')
+    must(evidence['first_ready'] == first and evidence['second_ready']['process'] == saved
+         and evidence['second_ready']['health']['model_ready'] is True
+         and evidence['native_ready']['status']['ready'] is True, 'vmm_open_complete_ready')
+    initial_gate = read(directory / 'READY_GATE.raw.json')
+    must(initial_gate['mode'] == 'CLOSED' and initial_gate['permit'] is None
+         and sha(directory / 'READY_GATE.raw.json') == first['gate_sha256']
+         and type(health.get('attempts')) is int and health['attempts'] == len(initial_gate['requests']),
+         'vmm_open_original_gate')
+    # Current requests may legitimately differ since the first observation.
+    current = role.status()
+    must(lifecycle['enabled'] is True and lifecycle['desired'] == 'RUNNING'
+         and lifecycle['state'] == 'READY' and lifecycle['attempts'] == 1
+         and current['ready'] is True and current['alive'] is True and current['mode'] == 'CLOSED'
+         and current['in_flight'] is False and current['uncertain'] is False,
+         'vmm_open_current_closed_ready')
+    # Private approval binds every installed module and producer/observer tool.
+    installed = startup.get('installed_code_hashes'); tools = startup.get('tool_hashes')
+    must(type(installed) is dict and {'operations/r25-publisher/vmm_lifecycle.py',
+         'operations/r25-publisher/vmm_service.py', 'operations/r25-publisher/vmm_controller.py'} <= set(installed),
+         'vmm_open_installed_inventory')
+    for relative, digest in installed.items():
+        path = Path(relative)
+        must(not path.is_absolute() and '..' not in path.parts and re.fullmatch('[a-f0-9]{64}', digest),
+             'vmm_open_installed_path')
+        private(engine.root / path); must(sha(engine.root / path) == digest, 'vmm_open_installed_hash')
+    must(type(tools) is dict and bool(tools), 'vmm_open_tool_inventory')
+    tool_dir = private(directory / 'tools', True)
+    for name, digest in tools.items():
+        must(type(name) is str and Path(name).name == name and re.fullmatch('[a-f0-9]{64}', digest), 'vmm_open_tool_path')
+        private(tool_dir / name); must(sha(tool_dir / name) == digest, 'vmm_open_tool_hash')
+    check_window_deadline(context)
+    return directory, first, context
+
+
+def open_command(plan):
+    return {'schema': OPEN_COMMAND_SCHEMA, 'mode': 'open', 'role_sha256': plan['role_sha256'],
+            'before_gate_sha256': plan['before_gate_sha256'], 'operation_sha256': object_sha(plan)}
+
+
+def prepare_open_operation(engine, role, startup_sha):
+    """Actual producer API. Creates immutable technical material, NOT approval.
+
+    Caller holds the existing shared lease. Sequence and predecessor are
+    authoritative consumption state, not caller IDs, salts or business IDs.
+    """
+    value = role.state(); directory, first, context = open_ready_context(engine, role, startup_sha, value)
+    consumption = open_consumption(value)
+    plan = {'schema': OPEN_OPERATION_SCHEMA, 'scope': OPEN_SCOPE,
+            'startup_sha256': startup_sha, 'first_ready_sha256': sha(directory / 'FIRST_READY.json'),
+            'ready_evidence_sha256': sha(directory / 'READY_EVIDENCE_COMPLETE.json'),
+            'role_sha256': engine.v['R25_VMM_ROLE_SHA256'], 'process': first['process'],
+            'before_gate_sha256': sha(role.gate.path), 'consumption_sha256': object_sha(consumption),
+            'sequence': len(consumption['open_operations']) + 1,
+            'previous_operation_sha256': consumption['open_operations'][-1] if consumption['open_operations'] else None,
+            'deadline': context}
+    ident = object_sha(plan); folder = engine.root / 'runtime/vmm-open-operations' / ident
+    folder.parent.mkdir(mode=0o700, exist_ok=True); private(folder.parent, True)
+    folder.mkdir(mode=0o700, exist_ok=True); private(folder, True)
+    for name, body in {'PLAN.json': plan, 'COMMAND.json': open_command(plan)}.items():
+        immutable_open_record(folder / name, body)
+    return {'operation_sha256': ident, 'command_sha256': sha(folder / 'COMMAND.json'), 'directory': str(folder)}
+
+
+def immutable_open_record(path, value):
+    """CAS-free append-only approval material: identical reads are harmless."""
+    raw = canonical(value); private(path.parent, True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        private(path); must(path.read_bytes() == raw, 'vmm_open_immutable_conflict'); return
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+    fd = os.open(path.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def receive_open_approval(engine, operation_sha, payload):
+    """Receiver for an externally entered approval; never invents authorization."""
+    must(type(operation_sha) is str and re.fullmatch('[a-f0-9]{64}', operation_sha), 'vmm_open_operation_identity')
+    folder = private(engine.root / 'runtime/vmm-open-operations' / operation_sha, True)
+    plan = read(folder / 'PLAN.json'); must(sha(folder / 'PLAN.json') == operation_sha, 'vmm_open_plan_hash')
+    expected = {'schema': 'ARTLIVE_HUMAN_OPEN_OPERATION_APPROVAL_V1', 'operation_sha256': operation_sha,
+                'command_sha256': object_sha(open_command(plan)), 'scope': 'ONE_NORMAL_WEBSITE_OPEN', 'authorized': True}
+    must(exact_object(payload, expected), 'vmm_open_separate_human_approval')
+    check_window_deadline(plan['deadline'])
+    immutable_open_record(folder / 'APPROVAL.json', payload)
+    return {'acknowledged': True, 'operation_sha256': operation_sha, 'opened': False}
+
+
+def open_authorization(engine, role, command, expected, lifecycle):
+    try:
+        must(set(command) == {'schema', 'mode', 'role_sha256', 'before_gate_sha256', 'operation_sha256'}
+             and command['schema'] == OPEN_COMMAND_SCHEMA, 'vmm_open_operation_required')
+        ident = command['operation_sha256']
+        must(type(ident) is str and re.fullmatch('[a-f0-9]{64}', ident), 'vmm_open_operation_identity')
+        consumption = open_consumption(lifecycle)
+        must(ident not in consumption['open_operations'], 'vmm_open_operation_consumed')
+        folder = private(engine.root / 'runtime/vmm-open-operations' / ident, True)
+        plan = read(folder / 'PLAN.json')
+        must(set(plan) == {'schema', 'scope', 'startup_sha256', 'first_ready_sha256', 'ready_evidence_sha256',
+             'role_sha256', 'process', 'before_gate_sha256', 'consumption_sha256', 'sequence',
+             'previous_operation_sha256', 'deadline'} and plan['schema'] == OPEN_OPERATION_SCHEMA
+             and canonical(plan['scope']) == canonical(OPEN_SCOPE) and sha(folder / 'PLAN.json') == ident,
+             'vmm_open_plan_identity')
+        must(open_command(plan) == command and expected == object_sha(command)
+             and sha(folder / 'COMMAND.json') == expected, 'vmm_open_command_identity')
+        must(type(plan['sequence']) is int and plan['sequence'] == len(consumption['open_operations']) + 1
+             and plan['previous_operation_sha256'] == (consumption['open_operations'][-1] if consumption['open_operations'] else None)
+             and plan['consumption_sha256'] == object_sha(consumption), 'vmm_open_consumption_preimage')
+        directory, first, context = open_ready_context(engine, role, plan['startup_sha256'], lifecycle)
+        must(plan['first_ready_sha256'] == sha(directory / 'FIRST_READY.json')
+             and plan['ready_evidence_sha256'] == sha(directory / 'READY_EVIDENCE_COMPLETE.json')
+             and plan['process'] == first['process'] and plan['deadline'] == context, 'vmm_open_ready_binding')
+        approval = read(folder / 'APPROVAL.json')
+        must(exact_object(approval, {'schema': 'ARTLIVE_HUMAN_OPEN_OPERATION_APPROVAL_V1',
+             'operation_sha256': ident, 'command_sha256': expected,
+             'scope': 'ONE_NORMAL_WEBSITE_OPEN', 'authorized': True}), 'vmm_open_separate_human_approval')
+        check_window_deadline(context)
+        return context
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        raise Refused('vmm_open_invalid_record') from error
+
+
 def manage(engine, mode):
     with engine.lease():
         role = managed_role(engine)
@@ -658,6 +865,8 @@ def manage(engine, mode):
             window_context = None
             if mode == 'acceptance':
                 window_context = acceptance_window(engine, role, command, expected, value)
+            elif mode == 'open':
+                window_context = open_authorization(engine, role, command, expected, value)
             else:
                 fields = {'schema', 'mode', 'role_sha256', 'before_gate_sha256'}
                 if mode == 'reconcile':
@@ -670,7 +879,9 @@ def manage(engine, mode):
             if mode == 'open':
                 must(role.status()['ready'], 'vmm_model_not_ready')
             used.append(expected)
-            if window_context is not None:
+            if mode == 'open':
+                value.setdefault('open_operations', []).append(command['operation_sha256'])
+            elif window_context is not None:
                 value.setdefault('gate_windows', {})[window_context['startup_sha256']] = {
                     'command_sha256': expected, 'first_ready_sha256': command['window']['first_ready_sha256']}
             write(role.record, value)
@@ -685,7 +896,9 @@ def manage(engine, mode):
                 deadline = ({'monotonic': window_context['deadline_monotonic'],
                              'wall': window_context['deadline_wall']} if window_context is not None else None)
                 role.gate.configure(mode.upper(), command.get('permit'),
-                                    expected_sha256=command['before_gate_sha256'], acceptance_deadline=deadline)
+                                    expected_sha256=command['before_gate_sha256'],
+                                    acceptance_deadline=deadline if mode == 'acceptance' else None,
+                                    open_deadline=deadline if mode == 'open' else None)
             return role.status()
         must(mode in {'enable', 'status', 'stop', 'recover'}, 'vmm_mode')
         return getattr(role, mode)()
