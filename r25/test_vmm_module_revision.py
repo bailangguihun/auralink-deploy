@@ -45,11 +45,11 @@ class ModuleRevision(unittest.TestCase):
         f.f.events.clear()
 
     def package_extension(self):
-        folder=self.root/'operations/r25-vmm-candidates'/('c'*40);data=io.BytesIO()
+        folder=self.root/'operations/r25-vmm-candidates'/getattr(self,'package_commit','c'*40);data=io.BytesIO()
         with zipfile.ZipFile(data,'w') as z:
             for name,raw in self.sources.items():z.writestr(name,raw)
         raw=data.getvalue();manifest={'schema':v.MANIFEST_SCHEMA,'repository':'bailangguihun/auralink-deploy',
-            'ref':'refs/heads/release','commit':'c'*40,'run_id':'125','run_attempt':'1','archive_sha256':v.sha(raw),
+            'ref':'refs/heads/release','commit':getattr(self,'package_commit','c'*40),'run_id':getattr(self,'package_run','125'),'run_attempt':'1','archive_sha256':v.sha(raw),
             'files':[{'path':n,'bytes':len(b),'sha256':v.sha(b)} for n,b in self.sources.items()]}
         self.put(folder/'vmm-extension.zip',raw);self.put(folder/'manifest.json',v.encoded(manifest))
         for n,b in self.sources.items():self.put(folder/n,b)
@@ -57,7 +57,7 @@ class ModuleRevision(unittest.TestCase):
             'manifest_sha256':v.sha(v.encoded(manifest)),'tool_sha256':v.sha(self.sources['vmm_controller.py'])}
 
     def package_controller(self):
-        folder=self.root/'operations/r25-controller-candidates'/('c'*40)
+        folder=self.root/'operations/r25-controller-candidates'/getattr(self,'package_commit','c'*40)
         payload={name:(HERE/name).read_bytes() for name in v.CONTROLLER_FILES}
         payload['core_release_guard.py']=self.sources['core_release_guard.py'];data=io.BytesIO()
         with zipfile.ZipFile(data,'w',compression=zipfile.ZIP_STORED) as z:
@@ -65,7 +65,7 @@ class ModuleRevision(unittest.TestCase):
                 info=zipfile.ZipInfo(name,date_time=(1980,1,1,0,0,0));info.create_system=3
                 info.external_attr=(0o100600)<<16;z.writestr(info,body)
         raw=data.getvalue();manifest={'schema':1,'repository':'bailangguihun/auralink-deploy','ref':'refs/heads/release',
-            'commit':'c'*40,'run_id':'125','run_attempt':'1','status':'NOT_DEPLOYED','installation_performed':False,
+            'commit':getattr(self,'package_commit','c'*40),'run_id':getattr(self,'package_run','125'),'run_attempt':'1','status':'NOT_DEPLOYED','installation_performed':False,
             'archive':{'name':'r25-controller.zip','bytes':len(raw),'sha256':v.sha(raw)},
             'files':[{'path':n,'bytes':len(b),'sha256':v.sha(b)} for n,b in payload.items()]}
         self.put(folder/'r25-controller.zip',raw);self.put(folder/'r25-controller-manifest.json',v.encoded(manifest))
@@ -155,7 +155,7 @@ class ModuleRevision(unittest.TestCase):
         self.assert_preserved();self.runtime()
 
     def test_formal_package_extracted_or_guard_drift_rejected(self):
-        folder=self.root/'operations/r25-controller-candidates'/('c'*40)
+        folder=self.root/'operations/r25-controller-candidates'/getattr(self,'package_commit','c'*40)
         p=folder/'core_runtime.py';raw=p.read_bytes();self.put(p,raw+b' ')
         with self.assertRaisesRegex(v.Refused,'file_digest'):v.bind_module_revision(self.rt,self.ident)
         self.put(p,raw)

@@ -400,7 +400,8 @@ class LifecycleTest(unittest.TestCase):
         self.script.write_text(child)
         self.start()
         engine = FixtureEngine(self.root)
-        approved = engine.command(self.store, 'open')
+        from test_vmm_open_operation import prepare_approved
+        approved = prepare_approved(engine, self.role)['command_sha256']
         marker.write_text('synthetic race boundary')
         with patch.object(life, 'managed_role', return_value=self.role):
             with self.assertRaisesRegex(vmm_service.Refused, 'COMPARE_AND_SWAP_CONFLICT'):
