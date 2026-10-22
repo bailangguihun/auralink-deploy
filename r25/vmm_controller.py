@@ -1,9 +1,10 @@
 """Bound optional VMM controller extension; never an application publication.
 
 Production CLI uses fixed roots. Fixture Runtime is Python-only and cannot be
-selected by environment/CLI. Original POLICY/CURRENT/approval records stay
-byte-identical; a verified installed overlay changes only effective control
-hashes, never application eligibility or historical accepted-record digests.
+selected by environment/CLI. Original overlay approvals and accepted records remain immutable. The base
+overlay changes only effective control hashes. A separate finite successor
+binding may replace the Core policy under its own exact approval and journal,
+while preserving this overlay, disabled role, token and historical records.
 """
 from __future__ import annotations
 import argparse
@@ -342,21 +343,30 @@ def load_plan(rt, ident, recover=False):
     return plan,folder
 
 
-def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False):
+def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=None):
     overrides=role_history(rt,plan,sha(encoded(plan))) if role_overrides else None
     if overrides:read(rt.root/'runtime/config/vmm-service.json',rt.private,expected=overrides['service'])
     for name,(path,owner,permissions) in rt.targets().items():
         e=plan['files'][name]
+        mapping={'vmm_controller.py':('files','vmm_controller.py'),'publisher-guard':('files','core_release_guard.py'),
+                 'operation-guard':('operational','guard'),'handoff':('operational','handoff')}
+        if successor is not None and name in mapping:
+            group,key=mapping[name];e=successor[group][key]
         if runtime and name=='handoff':
             folder=rt.store/'transactions'/sha(encoded(plan))
-            expected=read(folder/'after/handoff',rt.private,expected=e['after_sha256'])
+            expected=read(folder/'after/handoff',rt.private,expected=plan['files'][name]['after_sha256'])
             if overrides:
                 marker=json_read(rt.store/'ROLE_ACTIVE.json',rt.private)
                 expected=read(role_transaction(rt,marker['approval_sha256'])/'handoff.after',rt.private,expected=overrides['handoff'])
-            must(control_handoff_values(read(path,owner,permissions))==control_handoff_values(expected),'runtime_handoff_control_drift')
+            wanted=control_handoff_values(expected)
+            if successor is not None:
+                wanted.update(R25_CORE_RELEASE_GUARD_SHA256=successor['operational']['guard']['after_sha256'],
+                              R25_VMM_CONTROLLER_SHA256=successor['files']['vmm_controller.py']['after_sha256'])
+            must(control_handoff_values(read(path,owner,permissions))==wanted,'runtime_handoff_control_drift')
             continue
         current=sha(read(path,owner,permissions)) if path.exists() else None
-        allowed={overrides[name] if overrides and name in overrides else e['after_sha256']} if mode=='after' else {e['before_sha256']} if mode=='before' else set(e.values())
+        effective_mode='after' if successor is not None and name not in mapping else mode
+        allowed={overrides[name] if overrides and name in overrides and not (successor is not None and name=='handoff') else e['after_sha256']} if effective_mode=='after' else {e['before_sha256']} if effective_mode=='before' else set(e.values())
         must(current in allowed,'target_drift:'+name)
 
 
@@ -477,12 +487,151 @@ def recover(rt,ident,*,rollback=False):
     return {'outcome':'RESTORED','approval_sha256':ident}
 
 
+CORE_SUCCESSOR_SCHEMA = 'R25_MANAGED_VMM_CORE_SUCCESSOR_BINDING_V1'
+CORE_SUCCESSOR_ACTIVE_SCHEMA = 'R25_VMM_CORE_SUCCESSOR_ACTIVE_V1'
+
+
+def core_successor_paths(rt):
+    """Fixed existing private state; never candidate-selected paths."""
+    return {'overlay-active':rt.store/'ACTIVE.json','role-active':rt.store/'ROLE_ACTIVE.json',
+            'role':rt.root/'runtime/config/vmm-role.json','service':rt.root/'runtime/config/vmm-service.json',
+            'token':rt.root/'runtime/config/vmm-token','lifecycle-state':rt.root/'runtime/vmm/lifecycle.json',
+            'gate':rt.root/'runtime/vmm/gate.json'}
+
+
+def core_successor_base(rt, binding):
+    fields={'deploy','overlay_approval_sha256','role_approval_sha256','preserved','control_active_sha256'}
+    must(type(binding)is dict and set(binding)==fields and set(binding['preserved'])==set(core_successor_paths(rt)),
+         'core_successor_vmm_fields')
+    for item in binding['preserved'].values():digest(item)
+    digest(binding['control_active_sha256'])
+    ident=digest(binding['overlay_approval_sha256']);folder=rt.store/'transactions'/ident
+    must(json_read(rt.store/'ACTIVE.json',rt.private,binding['preserved']['overlay-active'])==
+         {'schema':SCHEMA,'approval_sha256':ident},'core_successor_overlay_active')
+    plan=validate_plan(rt,json_read(folder/'approval.json',rt.private,ident))
+    verify_bundle(rt,plan['deploy']);json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    must(journal(rt,folder,ident)['phase']=='INSTALLED','core_successor_overlay_not_installed')
+    roleid=digest(binding['role_approval_sha256'])
+    must(json_read(rt.store/'ROLE_ACTIVE.json',rt.private,binding['preserved']['role-active'])==
+         {'schema':ROLE_BINDING_SCHEMA,'approval_sha256':roleid},'core_successor_role_active')
+    overrides=role_history(rt,plan,ident,roleid)
+    must(overrides is not None and all(overrides[k]==binding['preserved'][k] for k in ('role','service')),
+         'core_successor_role_binding')
+    return plan,overrides
+
+
+def capture_core_successor(rt,deploy):
+    """Unsigned snapshot for one managed-Core successor; no lifecycle mutation."""
+    must(not (rt.store/'CORE_SUCCESSOR_ACTIVE.json').exists(),'core_successor_already_bound')
+    _,sources=verify_bundle(rt,deploy)
+    active=json_read(rt.store/'ACTIVE.json',rt.private);ident=digest(active.get('approval_sha256'))
+    plan=validate_plan(rt,json_read(rt.store/'transactions'/ident/'approval.json',rt.private,ident))
+    rt.require_context(plan['preserved'],runtime=True);rt.require_context()
+    verify_files(rt,plan,'after',role_overrides=True,runtime=True)
+    policy=json_read(rt.preserved()['policy'],rt.private)
+    must(policy['upgrade']['core_followup'].get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1',
+         'core_successor_managed_baseline_required')
+    marker=json_read(rt.store/'ROLE_ACTIVE.json',rt.private)
+    binding={'deploy':deploy,'overlay_approval_sha256':ident,'role_approval_sha256':digest(marker.get('approval_sha256')),
+             'preserved':{name:sha(read(path,rt.private)) for name,path in core_successor_paths(rt).items()},
+             'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private))}
+    core_successor_base(rt,binding);require_core_successor_stopped(rt)
+    # Lifecycle/model wrappers remain byte-identical to their reviewed overlay.
+    for name in ('vmm_lifecycle.py','vmm_service.py'):
+        must(sha(sources[name])==plan['files'][name]['after_sha256'],'core_successor_unrelated_extension_change')
+    return binding
+
+
+def require_core_successor_stopped(rt):
+    require_role_stopped(rt)
+    state=json_read(rt.root/'runtime/vmm/lifecycle.json',rt.private)
+    gate=json_read(rt.root/'runtime/vmm/gate.json',rt.private)
+    role=json_read(rt.root/'runtime/config/vmm-role.json',rt.private)
+    must(role.get('enabled')is False and state.get('enabled')is False and state.get('desired')=='STOPPED' and
+         state.get('process')is None and gate.get('mode')=='CLOSED','core_successor_disabled_stopped_closed')
+
+
+def verify_core_successor(rt,plan,phase='before',*,runtime=False):
+    """Validate original overlay plus a new immutable Core binding proof.
+
+    Runtime checks intentionally leave legitimate application transactions and
+    later lifecycle state to their existing guards. Binding checks freeze the
+    disabled state and ledgers, including after a partially written controller.
+    """
+    must(type(plan)is dict and plan.get('schema')==CORE_SUCCESSOR_SCHEMA and phase in {'before','mixed','after'},
+         'core_successor_plan_schema')
+    binding=plan['vmm'];base,overrides=core_successor_base(rt,binding)
+    _,sources=verify_bundle(rt,binding['deploy'])
+    must(all(binding['deploy'].get(k)==plan['deploy'].get(k) for k in ('repository','ref','commit','run_id','run_attempt')),
+         'core_successor_bundle_provenance')
+    must(plan['files']['vmm_controller.py']['before_sha256']==base['files']['vmm_controller.py']['after_sha256'] and
+         plan['files']['vmm_controller.py']['after_sha256']==sha(sources['vmm_controller.py']) and
+         plan['files']['core_release_guard.py']['before_sha256']==base['files']['publisher-guard']['after_sha256'] and
+         plan['operational']['guard']['before_sha256']==base['files']['operation-guard']['after_sha256'] and
+         plan['files']['core_release_guard.py']['after_sha256']==plan['operational']['guard']['after_sha256']==sha(sources['core_release_guard.py']),
+         'core_successor_control_identity')
+    for name in ('vmm_lifecycle.py','vmm_service.py'):
+        must(sha(sources[name])==base['files'][name]['after_sha256'],'core_successor_unrelated_extension_change')
+    for name,path in core_successor_paths(rt).items():
+        if runtime and name in {'lifecycle-state','gate'}:continue
+        read(path,rt.private,expected=binding['preserved'][name])
+    if not runtime:require_core_successor_stopped(rt)
+    before=plan['operational']['policy']['before_sha256'];after=plan['operational']['policy']['after_sha256']
+    must(base['preserved']['policy']==before and base['preserved']['original-controller-active']==binding['control_active_sha256'],
+         'core_successor_original_context')
+    policy=read(rt.preserved()['policy'],rt.private)
+    must(sha(policy) in ({before} if phase=='before' else {after} if phase=='after' else {before,after}),
+         'core_successor_policy_state')
+    corestore=rt.root/'runtime/core-publications';ident=sha(encoded(plan));folder=corestore/'controller-upgrades'/ident
+    active=read(rt.preserved()['original-controller-active'],rt.private)
+    newactive={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident}
+    if sha(active)==binding['control_active_sha256']:
+        must(phase!='after','core_successor_controller_active_drift');original=active
+    else:
+        must(phase!='before' and json_read(rt.preserved()['original-controller-active'],rt.private,sha(active))==newactive,'core_successor_controller_active_drift')
+        original=read(folder/'before/CONTROL_UPGRADE_ACTIVE.json',rt.private,expected=binding['control_active_sha256'])
+    prior=json.loads(original);priorid=digest(prior.get('approval_sha256'))
+    must(prior=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':priorid},'core_successor_original_controller_active')
+    oldfolder=corestore/'controller-upgrades'/priorid
+    oldplan=json_read(oldfolder/'approval.json',rt.private,priorid);oldjournal=json_read(oldfolder/'journal.json',rt.private)
+    must(oldplan.get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1' and
+         oldplan.get('operational',{}).get('policy',{}).get('after_sha256')==before and
+         oldjournal.get('phase')=='INSTALLED' and oldjournal.get('approval_sha256')==priorid,
+         'core_successor_original_controller_proof')
+    verify_files(rt,base,phase,role_overrides=True,runtime=runtime,successor=plan)
+    return base
+
+
+def applied_core_successor(rt,value,handoff):
+    marker=json_read(rt.store/'CORE_SUCCESSOR_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':CORE_SUCCESSOR_ACTIVE_SCHEMA,'approval_sha256':ident},'core_successor_marker')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident)
+    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    record=json_read(folder/'journal.json',rt.private)
+    must(record.get('schema')==CORE_SUCCESSOR_SCHEMA and record.get('approval_sha256')==ident and
+         record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'core_successor_not_installed')
+    must(json_read(rt.preserved()['original-controller-active'],rt.private)==
+         {'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident},'core_successor_controller_pointer')
+    base=verify_core_successor(rt,plan,'after',runtime=True)
+    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value,'core_successor_policy_argument')
+    must(handoff==env_values(read(rt.targets()['handoff'][0],rt.private)),'core_successor_handoff_argument')
+    must(value.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1' and
+         value['controllers']['lifecycle_adapter.py']==base['files']['lifecycle']['before_sha256'] and
+         value['controllers']['core_release_guard.py']==plan['operational']['guard']['after_sha256'] and
+         value['runtime_modules']['core_release_guard.py']==plan['files']['core_release_guard.py']['after_sha256'],
+         'core_successor_policy_controls')
+    result=copy.deepcopy(value);result['controllers']['lifecycle_adapter.py']=base['files']['lifecycle']['after_sha256']
+    return result
+
+
 def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     """Verified effective control hashes; never rewrite original policy/records."""
     if 'R25_VMM_CONTROLLER' not in handoff:return value
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'CORE_SUCCESSOR_ACTIVE.json').exists():return applied_core_successor(rt,value,handoff)
     active=json_read(rt.store/'ACTIVE.json',rt.private);ident=digest(active.get('approval_sha256'))
     must(active=={'schema':SCHEMA,'approval_sha256':ident},'overlay_active')
     folder=rt.store/'transactions'/ident

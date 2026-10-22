@@ -36,14 +36,20 @@ SCHEMA='R25_ASSISTANT_CONTROLLER_UPGRADE_V1'
 SUCCESSOR_SCHEMA='R25_ASSISTANT_CONTROLLER_SUCCESSOR_V1'
 FOLLOWUP_SCHEMA='R25_ASSISTANT_CORE_FOLLOWUP_BINDING_V1'
 MANAGED_SCHEMA='R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1'
-FOLLOWUP_SCHEMAS=(FOLLOWUP_SCHEMA,MANAGED_SCHEMA)
+MANAGED_SUCCESSOR_SCHEMA='R25_MANAGED_VMM_CORE_SUCCESSOR_BINDING_V1'
+FOLLOWUP_SCHEMAS=(FOLLOWUP_SCHEMA,MANAGED_SCHEMA,MANAGED_SUCCESSOR_SCHEMA)
 FOLLOWUP_CHANGED_FILES=frozenset(('core_business.py','core_release_guard.py','upgrade_assistant_controller.py','core_runtime.py','core_acceptance.py'))
 FILES=('assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py','assistant_acceptance.py','assistant_backup.py','upgrade_assistant_controller.py',
        'core_business.py','core_runtime.py','core_release_guard.py','core_publish.py','publisher_transaction.py','r25_storage.py',
        'ai_release_candidate.py','ai_release_guard.py','ai_runtime.py','ai_publish.py')
 FOLLOWUP_FILES=FILES+('core_acceptance.py',)
+MANAGED_SUCCESSOR_FILES=FOLLOWUP_FILES+('vmm_controller.py',)
+
+def plan_files(plan):
+    return MANAGED_SUCCESSOR_FILES if plan['schema']==MANAGED_SUCCESSOR_SCHEMA else FOLLOWUP_FILES if plan['schema'] in FOLLOWUP_SCHEMAS else FILES
+
 OPERATIONAL=('guard','critic-wrapper','lifecycle','ai-guard','ai-policy','policy','handoff')
-PHASES={'PREPARED','INSTALL_INTENT','INSTALLED','RESTORE_INTENT','RESTORED','RECOVERY_REQUIRED'}
+PHASES={'PREPARED','INSTALL_INTENT','INSTALLED','RESTORE_INTENT','RESTORED','RECOVERY_REQUIRED','VERIFY_INTENT'}
 
 # This is a controller-only repair for the observed failed AI restoration, not
 # an alternate application launcher or a general permission to edit policy.
@@ -80,9 +86,10 @@ def validate(plan):
     bound = successor or followup
     fields={'schema','from_policy_schema','deploy','current_release','next_owner','controller_owner','private_owner','files','operational','review_evidence_sha256'}
     must(type(plan)is dict and set(plan)==fields | ({'current_ai_release','preserved','services'} if bound else set()) |
-         ({'installed_control','frontend'} if followup else set()),'assistant_upgrade_plan_fields')
+         ({'installed_control','frontend'} if followup else set()) |
+         ({'vmm'} if plan.get('schema')==MANAGED_SUCCESSOR_SCHEMA else set()),'assistant_upgrade_plan_fields')
     must(plan['schema'] in (SCHEMA,SUCCESSOR_SCHEMA,*FOLLOWUP_SCHEMAS) and plan['from_policy_schema']=='R25_CORE_BUSINESS_POLICY_V2','assistant_upgrade_requires_installed_v2')
-    must(set(plan['files'])==set(FOLLOWUP_FILES if followup else FILES) and set(plan['operational'])==set(OPERATIONAL),'assistant_upgrade_exact_inventory')
+    must(set(plan['files'])==set(plan_files(plan)) and set(plan['operational'])==set(OPERATIONAL),'assistant_upgrade_exact_inventory')
     must(plan['next_owner']=='c5ea','assistant_next_owner')
     identity=plan['deploy']
     must(set(identity)==({'repository','ref','commit','run_id','run_attempt'} | ({'archive_sha256','manifest_sha256','tool_sha256'} if bound else set())) and identity['repository']=='bailangguihun/auralink-deploy' and identity['ref']=='refs/heads/release','assistant_upgrade_formal_repository')
@@ -114,7 +121,7 @@ def validate(plan):
         for item in plan['installed_control'].values():guard.digest_value(item)
         must(type(plan['frontend']) is dict and set(plan['frontend'])=={'selection_sha256','reference_sha256'}, 'core_followup_frontend_binding')
         for item in plan['frontend'].values():guard.digest_value(item)
-        for name in set(FOLLOWUP_FILES)-FOLLOWUP_CHANGED_FILES:
+        for name in set(plan_files(plan))-FOLLOWUP_CHANGED_FILES-({'vmm_controller.py'} if plan['schema']==MANAGED_SUCCESSOR_SCHEMA else set()):
             must(plan['files'][name]['before_sha256']==plan['files'][name]['after_sha256'], 'core_followup_unrelated_controller_change')
         must(plan['operational']['ai-guard']['before_sha256']==plan['operational']['ai-guard']['after_sha256'], 'core_followup_ai_guard_change')
     return plan
@@ -122,7 +129,7 @@ def validate(plan):
 
 def targets(plan):
     root=guard.ROOT
-    result={name:(root/'operations/r25-publisher'/name,tuple(plan['private_owner']),0o600) for name in (FOLLOWUP_FILES if plan['schema'] in FOLLOWUP_SCHEMAS else FILES)}
+    result={name:(root/'operations/r25-publisher'/name,tuple(plan['private_owner']),0o600) for name in plan_files(plan)}
     result.update(policy=(guard.STORE/'POLICY.json',tuple(plan['private_owner']),0o600),
         handoff=(LIVE_FILES['handoff'],tuple(plan['private_owner']),0o600),
         guard=(root/'operations/core_release_guard.py',tuple(plan['controller_owner']),0o700),
@@ -137,6 +144,7 @@ def entries(plan):return {**plan['files'],**plan['operational']}
 
 
 def source(bundle,name):
+    if name=='vmm_controller.py':return guard.ROOT/'operations/r25-vmm-candidates'/bundle.name/name
     return bundle/({'policy':'POLICY.next.json','handoff':'HANDOFF.next.env','guard':'core_release_guard.py','critic-wrapper':'r25-private-critic-env-policy-v2.py','lifecycle':'lifecycle_adapter.py','ai-policy':'AI_POLICY.next.json','ai-guard':'ai_release_guard.py'}.get(name,name))
 
 
@@ -159,7 +167,7 @@ def verify(rt,plan,bundle,*,mixed=False,after=False):
         prior=rt.read(guard.STORE/'controller-upgrades'/installed['approval_sha256']/'journal.json',installed['journal_sha256'])
         must(prior.get('phase')=='INSTALLED' and prior.get('approval_sha256')==installed['approval_sha256'], 'core_followup_prior_control_incomplete')
         prior_plan=rt.read(guard.STORE/'controller-upgrades'/installed['approval_sha256']/'approval.json',installed['approval_sha256'])
-        must(prior_plan.get('schema')==(FOLLOWUP_SCHEMA if plan['schema']==MANAGED_SCHEMA else SUCCESSOR_SCHEMA) and
+        must(prior_plan.get('schema')==(MANAGED_SCHEMA if plan['schema']==MANAGED_SUCCESSOR_SCHEMA else FOLLOWUP_SCHEMA if plan['schema']==MANAGED_SCHEMA else SUCCESSOR_SCHEMA) and
              prior_plan.get('operational',{}).get('policy',{}).get('after_sha256')==plan['operational']['policy']['before_sha256'],
              'core_followup_prior_control_policy')
         active=rt.read(guard.STORE/'CONTROL_UPGRADE_ACTIVE.json')
@@ -173,6 +181,9 @@ def verify(rt,plan,bundle,*,mixed=False,after=False):
         prior_path=guard.STORE/'core-followup-baselines'/(plan['operational']['policy']['before_sha256']+'.json')
         old=rt.read(prior_path if prior_path.exists() else guard.STORE/'POLICY.json',plan['operational']['policy']['before_sha256'])
         guard.verify_core_followup_context(new,old,core_business)
+    if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:
+        module,vrt=managed_successor_extension(rt,plan)
+        module.verify_core_successor(vrt,plan,phase='after' if after else 'mixed' if mixed else 'before')
     must(bundle==guard.ROOT/'operations/r25-controller-candidates'/plan['deploy']['commit'],'assistant_upgrade_fixed_bundle')
     for name,entry in entries(plan).items():
         rt.identity(source(bundle,name),expected_sha256=entry['after_sha256'])
@@ -195,7 +206,7 @@ def rendered_bindings(rt,plan,bundle):
         expected=plan['files'][name]['after_sha256'] if name in plan['files'] else old['runtime_modules'][name]
         must(new['runtime_modules'][name]==expected,'assistant_upgrade_runtime_bindings')
     must(new['controllers']['core_release_guard.py']==plan['files']['core_release_guard.py']['after_sha256'] and
-         new['controllers']['lifecycle_adapter.py']==plan['operational']['lifecycle']['after_sha256'] and
+         new['controllers']['lifecycle_adapter.py']==(old['controllers']['lifecycle_adapter.py'] if plan['schema']==MANAGED_SUCCESSOR_SCHEMA else plan['operational']['lifecycle']['after_sha256']) and
          new['controllers']['r25-production-java-launch.py']==old['controllers']['r25-production-java-launch.py'],'assistant_upgrade_controller_bindings')
     followup = plan['schema'] in FOLLOWUP_SCHEMAS
     successor = plan['schema'] in (SUCCESSOR_SCHEMA,*FOLLOWUP_SCHEMAS)
@@ -229,6 +240,8 @@ def rendered_bindings(rt,plan,bundle):
         'R25_R24_CRITIC_ENV_WRAPPER_SHA256':plan['operational']['critic-wrapper']['after_sha256'],
         'R25_AI_RELEASE_GUARD_SHA256':plan['operational']['ai-guard']['after_sha256'],
         'R25_AI_RELEASE_POLICY_SHA256':plan['operational']['ai-policy']['after_sha256']})
+    if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:
+        after=replace_env(after,{'R25_VMM_CONTROLLER_SHA256':plan['files']['vmm_controller.py']['after_sha256']})
     must(sha(after)==plan['operational']['handoff']['after_sha256'],'assistant_upgrade_handoff_render')
     # Execute only review-bound validator bytes from this formal controller
     # bundle; do not import an unverified candidate module or cached .pyc.
@@ -279,6 +292,7 @@ def validate_successor_bindings(rt,plan,old,new,bundle):
 
 def validate_core_followup_bindings(rt,plan,old,new,bundle):
     """A new functional Core artifact, with unchanged accepted AI/G1 and data."""
+    if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:return validate_managed_successor_bindings(rt,plan,old,new,bundle)
     if plan['schema']==MANAGED_SCHEMA:return validate_managed_vmm_bindings(rt,plan,old,new,bundle)
     must(old.get('upgrade',{}).get('capability')=='assistant-v1' and 'successor' in old['upgrade'] and
          'core_followup' not in old['upgrade'], 'core_followup_requires_completed_successor')
@@ -350,6 +364,64 @@ def validate_managed_vmm_bindings(rt,plan,old,new,bundle):
     managed_vmm_inventory(rt,new)
 
 
+def managed_successor_extension(rt,plan):
+    """Verify the same-run extension with the installed before-image verifier.
+
+    The new extension is not in the 25-file controller archive; neither a
+    caller-supplied arbitrary source path nor mixed formal runs are accepted.
+    """
+    deployment=plan['vmm']['deploy']
+    must(all(deployment.get(k)==plan['deploy'][k] for k in ('repository','ref','commit','run_id','run_attempt')),
+         'managed_successor_formal_run_mismatch')
+    name='vmm_controller.py';before=plan['files'][name]['before_sha256']
+    saved=guard.STORE/'controller-upgrades'/sha(guard.encoded(plan))/'before'/name
+    path=saved if saved.exists() else targets(plan)[name][0]
+    raw=guard.read_file(path,owner=tuple(plan['private_owner']),expected=before)
+    prior=guard.source_module(path,'managed_successor_extension_verifier',raw)
+    vrt=prior.Runtime(guard.ROOT,private=plan['private_owner'],scripts=plan['controller_owner'])
+    folder,sources=prior.verify_bundle(vrt,deployment)
+    must(sha(sources['core_release_guard.py'])==plan['files']['core_release_guard.py']['after_sha256'],
+         'managed_successor_matching_guards_required')
+    for unchanged in ('vmm_lifecycle.py','vmm_service.py'):
+        guard.read_file(guard.ROOT/'operations/r25-publisher'/unchanged,owner=tuple(plan['private_owner']),expected=sha(sources[unchanged]))
+    must(sha(sources[name])==plan['files'][name]['after_sha256'],'managed_successor_controller_source')
+    module=guard.source_module(folder/name,'managed_successor_verified_extension',sources[name])
+    vrt=module.Runtime(guard.ROOT,private=plan['private_owner'],scripts=plan['controller_owner']);vrt.fd=rt.fd
+    return module,vrt
+
+
+def validate_managed_successor_bindings(rt,plan,old,new,bundle):
+    before,after=old['upgrade'],new['upgrade']
+    must(core_business.validate_core_followup(old)['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1',
+         'managed_successor_requires_committed_managed_core')
+    must(set(new)==set(old) and all(new[k]==old[k] for k in old if k not in {'controllers','runtime_modules','upgrade'}),
+         'managed_successor_policy_unrelated_change')
+    mutable={'candidate','baseline_release','configuration','assistant','compatibility','evidence','core_followup'}
+    must(set(after)==set(before) and all(after[k]==before[k] for k in before if k not in mutable),
+         'managed_successor_upgrade_unrelated_change')
+    expected=copy.deepcopy(before['configuration']);expected['before_sha256']=expected['after_sha256']
+    must(after['configuration']==expected and expected['after_sha256']==plan['preserved']['application'],
+         'managed_successor_configuration_unchanged')
+    a,b=before['assistant'],after['assistant']
+    mutable={'artifacts','configuration_sha256','baseline_policy_sha256','baseline_payload_fingerprint',
+             'compatible_recovery_jar_sha256','compatibility_evidence_sha256','review_evidence_sha256'}
+    must(set(a)==set(b) and all(a[k]==b[k] for k in a if k not in mutable),'managed_successor_assistant_policy_change')
+    must(set(a['artifacts'])==set(b['artifacts']) and all(a['artifacts'][k]==b['artifacts'][k] for k in a['artifacts'] if k not in {'core','deploy'}),
+         'managed_successor_other_artifact_change')
+    must(b['artifacts']['core']=={'repository':after['candidate']['repository'],'commit':after['candidate']['commit_sha'],'sha256':after['candidate']['artifact_sha256']} and
+         b['artifacts']['deploy']=={'repository':plan['deploy']['repository'],'commit':plan['deploy']['commit'],'sha256':plan['deploy']['archive_sha256']},
+         'managed_successor_formal_artifact_binding')
+    must(b['baseline_policy_sha256']==plan['operational']['policy']['before_sha256'] and
+         b['baseline_payload_fingerprint']==before['candidate']['payload_fingerprint'] and
+         b['compatible_recovery_jar_sha256']==plan['current_release']['artifact_sha256'] and
+         b['configuration_sha256']==expected['after_sha256'] and b['review_evidence_sha256']==plan['review_evidence_sha256'],
+         'managed_successor_accepted_baseline_binding')
+    guard.verify_core_followup_context(new,old,core_business)
+    raw=guard.read_file(LIVE_FILES['application'],owner=tuple(plan['private_owner']),expected=plan['preserved']['application'])
+    core_business.validate_existing_managed_vmm_configuration(raw,new)
+    managed_vmm_inventory(rt,new)
+
+
 def managed_vmm_inventory(rt,policy,*,require_clear=True):
     # Only this exact SQL literal from the source-bound official bundle can run;
     # use the established native-PG account/credential/sealed-psql read adapter.
@@ -363,7 +435,7 @@ def managed_vmm_inventory(rt,policy,*,require_clear=True):
         raise
     return value
 
-def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
+def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False,managed_successor=False):
     """Materialize an unsigned, exact plan; never write an approval or policy.
 
     The private request supplies independently obtained formal identities and
@@ -371,8 +443,8 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
     the existing lease. Result is a private reviewable plan, not authorization.
     """
     must(type(request) is dict and set(request)=={'schema','deploy','core','web_commit','evidence',
-        'compatibility','compatibility_evidence_sha256','review_evidence_sha256'}|({'managed_vmm'} if managed else set()), 'core_followup_request_fields')
-    must(request['schema']==('R25_MANAGED_VMM_CORE_FOLLOWUP_REQUEST_V1' if managed else 'R25_ASSISTANT_CORE_FOLLOWUP_REQUEST_V1'),'core_followup_request_schema')
+        'compatibility','compatibility_evidence_sha256','review_evidence_sha256'}|({'managed_vmm'} if managed else {'vmm_deploy'} if managed_successor else set()), 'core_followup_request_fields')
+    must(request['schema']==('R25_MANAGED_VMM_CORE_SUCCESSOR_REQUEST_V1' if managed_successor else 'R25_MANAGED_VMM_CORE_FOLLOWUP_REQUEST_V1' if managed else 'R25_ASSISTANT_CORE_FOLLOWUP_REQUEST_V1'),'core_followup_request_schema')
     must(type(request['core']) is dict and set(request['core'])=={'commit','run_id','run_attempt'}, 'core_followup_request_core_identity')
     deployment=request['deploy']
     must(type(deployment) is dict and set(deployment)=={'repository','ref','commit','run_id','run_attempt','archive_sha256','manifest_sha256','tool_sha256'} and
@@ -384,7 +456,13 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
         import assistant_backup
         assistant_backup.require_terminal(rt)
         old=guard.policy();oldsha=rt.identity(guard.STORE/'POLICY.json')['sha256']
-        if managed:
+        if managed_successor:
+            # Validate the effective live installation before retaining its raw
+            # immutable policy; the raw SHA is the predecessor identity.
+            old=rt.read(guard.STORE/'POLICY.json',oldsha)
+            must(core_business.validate_core_followup(old)['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1','managed_successor_requires_committed_managed_core')
+            guard.verify_core_followup_context(old,validator=core_business)
+        elif managed:
             must('R25_VMM_CONTROLLER' not in env_values(guard.read_file(LIVE_FILES['handoff'],owner=tuple(old['installation']['private_owner']))),'managed_vmm_overlay_requires_explicit_rollback')
             previous=core_business.validate_core_followup(old)
             must(previous['schema']=='R25_ASSISTANT_CORE_FOLLOWUP_V1','managed_vmm_requires_gallery_followup')
@@ -400,7 +478,7 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
         must(rt.read(prior_journal).get('phase')=='INSTALLED','core_followup_prior_control_incomplete')
         review=rt.read(guard.STORE/'CONTROL_UPGRADE_REVIEW.json',request['review_evidence_sha256'])
         must(type(review) is dict,'core_followup_review_record')
-        plan={'schema':MANAGED_SCHEMA if managed else FOLLOWUP_SCHEMA,'from_policy_schema':old['schema'],'deploy':request['deploy'],
+        plan={'schema':MANAGED_SUCCESSOR_SCHEMA if managed_successor else MANAGED_SCHEMA if managed else FOLLOWUP_SCHEMA,'from_policy_schema':old['schema'],'deploy':request['deploy'],
             'current_release':current,'current_ai_release':rt.read(guard.ROOT/'runtime/ai-publications/CURRENT.json')['release'],
             'installed_control':{'approval_sha256':prior_id,'journal_sha256':rt.identity(prior_journal)['sha256']},
             'frontend':{'selection_sha256':rt.identity(guard.ROOT/'runtime/config/frontend-selection.json')['sha256'],
@@ -410,11 +488,15 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
             'private_owner':old['installation']['private_owner'],'files':{},'operational':{},
             'review_evidence_sha256':request['review_evidence_sha256']}
         must(bundle==guard.ROOT/'operations/r25-controller-candidates'/request['deploy']['commit'],'core_followup_fixed_bundle')
-        for name in FOLLOWUP_FILES:
+        for name in plan_files(plan):
             target,owner,mode=targets(plan)[name]
             plan['files'][name]={'before_sha256':rt.identity(target,expected_owner=owner,expected_mode=mode)['sha256'],
-                                'after_sha256':rt.identity(bundle/name,expected_owner=tuple(plan['private_owner']),expected_mode=0o600)['sha256']}
+                                'after_sha256':rt.identity(source(bundle,name),expected_owner=tuple(plan['private_owner']),expected_mode=0o600)['sha256']}
         verify_launcher_repair_bundle(rt,plan,bundle)
+        if managed_successor:
+            plan['vmm']={'deploy':request['vmm_deploy']}
+            module,vrt=managed_successor_extension(rt,plan)
+            plan['vmm']=module.capture_core_successor(vrt,request['vmm_deploy'])
         # Verify official Core package before accepting its fields as input.
         from core_publish import incoming_path
         identity=request['core'];incoming=incoming_path(identity['commit'],identity['run_id'],identity['run_attempt'])
@@ -427,7 +509,7 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
         jar=incoming/'auralink-backend-0.0.1-SNAPSHOT.jar'
         candidate=verifier.verify(incoming/'core-release-candidate.json',jar,incoming/'r25-artifact-verification.json',
             identity['commit'],identity['run_id'],identity['run_attempt'],expected_repository=old['repository'])
-        next_policy=copy.deepcopy(old);up=next_policy['upgrade'];transition=up.pop('core_followup' if managed else 'successor')
+        next_policy=copy.deepcopy(old);up=next_policy['upgrade'];transition=up.pop('core_followup' if managed or managed_successor else 'successor')
         up['candidate']={'repository':candidate['repository'],'commit_sha':identity['commit'],'github_run_id':identity['run_id'],
             'github_run_attempt':identity['run_attempt'],'artifact_sha256':candidate['artifact']['sha256'],
             'artifact_bytes':candidate['artifact']['bytes'],'payload_fingerprint':guard.payload_fingerprint(jar)}
@@ -442,6 +524,9 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
                 ('policy',ai_store/'POLICY.json'),('active',ai_store/'ACTIVE.json'),('current',ai_store/'CURRENT.json'),
                 ('journal',txroot/'journal.json'),('snapshot',txroot/'snapshot.json'),
                 ('configuration',guard.ROOT/'runtime/config/assistant-private/assistant-runtime.json'))}}
+        if managed_successor:
+            up['core_followup']=dict(transition,schema='R25_MANAGED_VMM_CORE_SUCCESSOR_V1',predecessor_policy_sha256=oldsha)
+            must(request['web_commit']==old['upgrade']['web_commit'],'managed_successor_web_binding_unchanged')
         config=up['configuration'];config['before_sha256']=config['after_sha256']=plan['preserved']['application']
         config['assistant']['execution.expected-config-sha256']=up['core_followup']['ai_configuration_sha256']
         if managed:
@@ -473,6 +558,8 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False):
         before=guard.read_file(LIVE_FILES['handoff'],owner=tuple(plan['private_owner']),mode=0o600)
         after=replace_env(before,{'R25_CORE_RELEASE_POLICY_SHA256':plan['operational']['policy']['after_sha256'],
             'R25_CORE_RELEASE_GUARD_SHA256':plan['operational']['guard']['after_sha256']})
+        if managed_successor:
+            after=replace_env(after,{'R25_VMM_CONTROLLER_SHA256':plan['files']['vmm_controller.py']['after_sha256']})
         plan['operational']['handoff']={'before_sha256':sha(before),'after_sha256':materialize(bundle/'HANDOFF.next.env',after)}
         validate(plan);verify(rt,plan,bundle);rendered_bindings(rt,plan,bundle)
         # Existing approved paths are never created/overwritten here.
@@ -535,6 +622,10 @@ def install(rt,plan,bundle,*,approval_sha256):
             digest=plan['operational']['policy']['before_sha256'];retained=root/(digest+'.json')
             if retained.exists():rt.identity(retained,expected_sha256=digest)
             else:rt.storage.atomic_copy_file(folder/'before/policy',retained,digest)
+        if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:
+            saved=folder/'before/CONTROL_UPGRADE_ACTIVE.json'
+            if saved.exists():rt.identity(saved,expected_sha256=plan['vmm']['control_active_sha256'])
+            else:rt.storage.atomic_copy_file(active,saved,plan['vmm']['control_active_sha256'])
         record={'schema':plan['schema'] if plan['schema'] in FOLLOWUP_SCHEMAS else SCHEMA,
                 'approval_sha256':approval_sha256,'phase':'PREPARED','service_identities':before}
         rt.write(journal_path,record)
@@ -547,6 +638,11 @@ def install(rt,plan,bundle,*,approval_sha256):
                 rt.storage.atomic_copy_file(source(bundle,name),path,entry['after_sha256'],replace=entry['before_sha256']is not None,
                     expected_existing_sha256=entry['before_sha256'],target_owner=owner,mode=mode,existing_owner=owner,existing_mode=mode)
             verify(rt,plan,bundle,after=True)
+            if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:
+                marker=guard.ROOT/'runtime/vmm-controller/CORE_SUCCESSOR_ACTIVE.json'
+                must(not marker.exists() and not marker.is_symlink(),'managed_successor_marker_exists')
+                rt.storage.atomic_write_bytes(marker,guard.encoded({'schema':'R25_VMM_CORE_SUCCESSOR_ACTIVE_V1','approval_sha256':approval_sha256}))
+                record['phase']='VERIFY_INTENT';rt.write(journal_path,record)
             if plan['schema'] in (SUCCESSOR_SCHEMA,*FOLLOWUP_SCHEMAS):
                 # Do not fork watchdog with pre-upgrade guard modules cached.
                 engine=rt.engine();rt.verify_current(rt.current())
@@ -593,6 +689,16 @@ def recover(rt,plan,bundle,*,approval_sha256):
             else:
                 rt.storage.atomic_copy_file(folder/'before'/name,path,entry['before_sha256'],replace=True,expected_existing_sha256=actual,
                     target_owner=owner,mode=mode,existing_owner=owner,existing_mode=mode)
+        if plan['schema']==MANAGED_SUCCESSOR_SCHEMA:
+            active=guard.STORE/'CONTROL_UPGRADE_ACTIVE.json'
+            current_sha=rt.identity(active)['sha256']
+            if current_sha!=plan['vmm']['control_active_sha256']:
+                must(rt.read(active)=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':approval_sha256},'managed_successor_active_drift')
+                rt.storage.atomic_copy_file(folder/'before/CONTROL_UPGRADE_ACTIVE.json',active,plan['vmm']['control_active_sha256'],replace=True,expected_existing_sha256=current_sha)
+            marker=guard.ROOT/'runtime/vmm-controller/CORE_SUCCESSOR_ACTIVE.json'
+            if marker.exists():
+                expected=sha(guard.encoded({'schema':'R25_VMM_CORE_SUCCESSOR_ACTIVE_V1','approval_sha256':approval_sha256}))
+                rt.storage.remove_bound_file(marker,expected,expected_owner=tuple(plan['private_owner']))
         must(service_identities(engine)==record['service_identities'],'assistant_upgrade_service_drift')
         engine=rt.engine();rt.verify_current(rt.current())
         engine.watchdog_start_locked();must(engine.watchdog_identity(),'assistant_upgrade_watchdog')
@@ -913,19 +1019,20 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command',choices=('upgrade','recover','preflight-successor','upgrade-successor','recover-successor',
         'prepare-core-followup','preflight-core-followup','bind-core-followup','recover-core-followup',
+        'prepare-managed-vmm-successor','preflight-managed-vmm-successor','bind-managed-vmm-successor','recover-managed-vmm-successor',
         'prepare-managed-vmm-core','preflight-managed-vmm-core','bind-managed-vmm-core','recover-managed-vmm-core','inspect-managed-vmm-work','repair-launcher-import','recover-launcher-import'))
     parser.add_argument('--approval-sha256')
     parser.add_argument('--request-sha256')
     args=parser.parse_args()
     try:
         rt=ControlUpgradeRuntime()
-        if args.command in ('prepare-core-followup','prepare-managed-vmm-core'):
+        if args.command in ('prepare-core-followup','prepare-managed-vmm-core','prepare-managed-vmm-successor'):
             must(args.approval_sha256 is None,'core_followup_prepare_not_approval')
-            request=rt.read(guard.STORE/('MANAGED_VMM_CORE_REQUEST.json' if args.command=='prepare-managed-vmm-core' else 'CORE_FOLLOWUP_REQUEST.json'),guard.digest_value(args.request_sha256))
+            request=rt.read(guard.STORE/('MANAGED_VMM_SUCCESSOR_REQUEST.json' if args.command=='prepare-managed-vmm-successor' else 'MANAGED_VMM_CORE_REQUEST.json' if args.command=='prepare-managed-vmm-core' else 'CORE_FOLLOWUP_REQUEST.json'),guard.digest_value(args.request_sha256))
             bundle=guard.ROOT/'operations/r25-controller-candidates'/guard.digest_value(request['deploy']['commit'],40)
             must(Path(__file__).absolute()==bundle/'upgrade_assistant_controller.py','core_followup_trusted_bundle_location')
             rt.identity(Path(__file__),expected_sha256=request['deploy']['tool_sha256'])
-            print(json.dumps(prepare_core_followup(rt,request,args.request_sha256,bundle,managed=args.command=='prepare-managed-vmm-core'),sort_keys=True));return 0
+            print(json.dumps(prepare_core_followup(rt,request,args.request_sha256,bundle,managed=args.command=='prepare-managed-vmm-core',managed_successor=args.command=='prepare-managed-vmm-successor'),sort_keys=True));return 0
         must(args.request_sha256 is None,'core_followup_request_only_for_prepare')
         guard.digest_value(args.approval_sha256)
         if args.command in ('repair-launcher-import','recover-launcher-import'):
@@ -941,7 +1048,7 @@ def main():
         if args.command=='inspect-managed-vmm-work':
             recorded=guard.STORE/'controller-upgrades'/args.approval_sha256/'approval.json'
             plan=validate(rt.read(recorded,args.approval_sha256))
-            must(plan['schema']==MANAGED_SCHEMA,'managed_vmm_core_cli_contract')
+            must(plan['schema'] in (MANAGED_SCHEMA,MANAGED_SUCCESSOR_SCHEMA),'managed_vmm_core_cli_contract')
             bundle=guard.ROOT/'operations/r25-controller-candidates'/plan['deploy']['commit']
             must(Path(__file__).absolute()==bundle/'upgrade_assistant_controller.py','core_followup_trusted_bundle_location')
             verify_launcher_repair_bundle(rt,plan,bundle)
@@ -955,26 +1062,28 @@ def main():
                 core_acceptance.verify_managed_vmm_inventory(counts)
             return 0
         recorded=guard.STORE/'controller-upgrades'/args.approval_sha256/'approval.json'
-        approval_file=recorded if args.command in ('recover','recover-successor','recover-core-followup','recover-managed-vmm-core') and recorded.exists() else guard.STORE/'CONTROL_UPGRADE_APPROVAL.json'
+        approval_file=recorded if args.command in ('recover','recover-successor','recover-core-followup','recover-managed-vmm-core','recover-managed-vmm-successor') and recorded.exists() else guard.STORE/'CONTROL_UPGRADE_APPROVAL.json'
         plan=validate(rt.read(approval_file,args.approval_sha256))
         bundle=guard.ROOT/'operations/r25-controller-candidates'/plan['deploy']['commit']
         must(Path(__file__).absolute()==bundle/'upgrade_assistant_controller.py','assistant_upgrade_trusted_bundle_location')
         rt.identity(Path(__file__),expected_sha256=plan['files']['upgrade_assistant_controller.py']['after_sha256'])
-        if args.command.endswith('managed-vmm-core'):
+        if args.command.endswith('managed-vmm-successor'):
+            must(plan['schema']==MANAGED_SUCCESSOR_SCHEMA,'managed_successor_cli_contract')
+        elif args.command.endswith('managed-vmm-core'):
             must(plan['schema']==MANAGED_SCHEMA,'managed_vmm_core_cli_contract')
         elif args.command.endswith('core-followup'):
             must(plan['schema']==FOLLOWUP_SCHEMA,'core_followup_cli_contract')
         elif args.command.endswith('successor'):
             must(plan['schema'] == SUCCESSOR_SCHEMA, 'successor_cli_contract')
         else:must(plan['schema'] == SCHEMA, 'legacy_upgrade_cli_contract')
-        if args.command in ('preflight-successor','preflight-core-followup','preflight-managed-vmm-core'):
+        if args.command in ('preflight-successor','preflight-core-followup','preflight-managed-vmm-core','preflight-managed-vmm-successor'):
             with upgrade_lease(rt):
                 approval(rt,plan,args.approval_sha256);verify(rt,plan,bundle);rendered_bindings(rt,plan,bundle)
                 rt.verify_current(rt.current());rt.require_no_active_work()
                 must(service_identities(rt.engine())==plan['services'], 'successor_process_context_drift')
             result='CORE_FOLLOWUP_PREFLIGHT_VERIFIED' if plan['schema'] in FOLLOWUP_SCHEMAS else 'SUCCESSOR_PREFLIGHT_VERIFIED'
         else:
-            result=(install if args.command in ('upgrade','upgrade-successor','bind-core-followup','bind-managed-vmm-core') else recover)(rt,plan,bundle,approval_sha256=args.approval_sha256)
+            result=(install if args.command in ('upgrade','upgrade-successor','bind-core-followup','bind-managed-vmm-core','bind-managed-vmm-successor') else recover)(rt,plan,bundle,approval_sha256=args.approval_sha256)
         print(json.dumps({'outcome':result,'application_restart':False,'database_writes':False}));return 0
     except Exception as error:
         print(json.dumps({'outcome':'ASSISTANT_CONTROLLER_REFUSED_OR_RECOVERY_REQUIRED','failure_class':type(error).__name__,
