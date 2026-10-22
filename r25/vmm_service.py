@@ -166,13 +166,18 @@ class GateStore:
                     'uncertain': any(x['state'] == 'UNKNOWN' and not x.get('acknowledged') for x in requests),
                     'attempts': len(record['requests'])}
 
-    def configure(self, mode, permit=None, *, expected_sha256=None, acceptance_deadline=None):
+    def configure(self, mode, permit=None, *, expected_sha256=None, acceptance_deadline=None, open_deadline=None):
         must(mode in {'CLOSED', 'ACCEPTANCE', 'OPEN'}, 'GATE_MODE')
         if acceptance_deadline is not None:
             must(mode == 'ACCEPTANCE' and type(acceptance_deadline) is dict
                  and set(acceptance_deadline) == {'monotonic', 'wall'}
                  and all(type(value) in (int, float) and math.isfinite(value)
                          for value in acceptance_deadline.values()), 'ACCEPTANCE_DEADLINE_INVALID')
+        if open_deadline is not None:
+            must(mode == 'OPEN' and acceptance_deadline is None and type(open_deadline) is dict
+                 and set(open_deadline) == {'monotonic', 'wall'}
+                 and all(type(value) in (int, float) and math.isfinite(value)
+                         for value in open_deadline.values()), 'OPEN_APPROVAL_DEADLINE_INVALID')
         if mode == 'ACCEPTANCE':
             must(isinstance(permit, dict) and set(permit) >= {'owner_id', 'source_painting_id', 'image_sha256', 'duration'},
                  'ACCEPTANCE_PERMIT_FIELDS')
@@ -201,6 +206,10 @@ class GateStore:
             if acceptance_deadline is not None:
                 must(time.monotonic() < acceptance_deadline['monotonic']
                      and time.time() < acceptance_deadline['wall'], 'ACCEPTANCE_WINDOW_EXPIRED')
+            if open_deadline is not None:
+                # Admission-time approval deadline only, NOT automatic OPEN expiry.
+                must(time.monotonic() < open_deadline['monotonic']
+                     and time.time() < open_deadline['wall'], 'OPEN_APPROVAL_EXPIRED')
             record['mode'], record['permit'] = mode, permit
             self.write(record)
 

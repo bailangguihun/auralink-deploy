@@ -16,7 +16,7 @@
 4. `runtime/config/vmm-role.json`：仅 `service_script_sha256` 值随 service 模块更新；role 仍 enabled=false。
 5. `runtime/handoff-control.env`：仅四个 VMM controller/lifecycle/service/role 摘要值更新，其他原字节保持。
 
-另外保存新的不可变 `MODULE_REVISION_ACTIVE.json` 和 `module-revisions/<approval-sha>` 证明。旧角色批准不会被改签为新 service；运行 guard 先校验新修订，再校验原 overlay、role、Core successor 链，得到有效后像。原始 lifecycle adapter、Core/AI/Web、数据库、配置策略和 generation 行为不变。
+另外保存 `MODULE_REVISION_ACTIVE.json` 指针和不可变 `module-revisions/<approval-sha>` 证明。首次修订只在无指针时写入；后继修订通过精确 CAS 更新该指针，绝不覆盖旧证明。旧角色批准不会被改签为新 service；运行 guard 先校验新修订，再校验原 overlay、role、Core successor 链，得到有效后像。原始 lifecycle adapter、Core/AI/Web、数据库、配置策略和 generation 行为不变。
 
 安装时 VMM 必须 disabled、desired STOPPED、process=null、gate=CLOSED；拒绝端口5001任何监听、DISPATCHED 或未确认 UNKNOWN。原 lifecycle/gate 完整字节也进入保全快照。模块安装和恢复从不写这两份账本。
 
@@ -91,3 +91,36 @@ V2 协议见 [managed lifecycle](vmm-managed-lifecycle.md)。新 service 会改�
 测试使用真实临时文件、manifest、flock、CAS/fsync、实际 prepare/bind/运行 overlay/recover；覆盖精确身份拒绝、每个写入点和 marker 后故障、恢复再次中断、账本漂移拒绝、已提交后 UNKNOWN/新消费保留。监督与应用进程身份是明确 synthetic OS 边界。V2 CPU 子进程/HTTP/期限/消费测试保持；实际 producer/receiver/executor→安装后 consumer 的合成链由本地证据绑定。
 
 离线通过不证明 GPU readiness、生产安装成功或真实音频生成。没有修改模型参数、token、生成超时或重试策略。
+
+## 已 INSTALLED 版本的后继更新
+
+已安装模块 revision 的现场不得重跑 `prepare-modules`，也不得覆盖旧 `MODULE_REQUEST/REVIEW/APPROVAL.json`。使用新正式包的 `prepare-module-successor`，输入保存至：
+
+```text
+$R/runtime/vmm-controller/module-successor-inputs/<request-sha>/request.json
+$R/runtime/vmm-controller/module-successor-inputs/<request-sha>/review.json
+```
+
+request 字段与首次修订相同，schema 为 `R25_VMM_MODULE_REVISION_REQUEST_V2`。两包仍必须同一真实 release/run/attempt，固定库存、全部 hash、双 guard 和原审批规则不变。review 保存真实审查证据，不能合成人工批准。
+
+```bash
+# R、PY、BUNDLE 绑定上文核实后的正式包；这些变量不是最终制品身份。
+: "${REQUEST_SHA256:?actual successor request digest}"
+"$PY" -B "$BUNDLE/vmm_controller.py" prepare-module-successor --request-sha256 "$REQUEST_SHA256"
+```
+
+输出 `R25_VMM_MODULE_REVISION_V2` unsigned plan。它精确绑定当前 INSTALLED 指针、前一计划摘要和 13 份原证明（approval、review、journal，以及五文件 before/after）、当前五前像和全部保全项。只生成计划，不安装。完整证明链逐层检查，拒绝循环或超过 32 层；本次支持现有 V1→V2，后续 V2→V2 同样验证。Core binding 不得借此变更。
+
+计划摘要得到人工明确批准后，原计划字节另存到：
+
+```text
+$R/runtime/vmm-controller/module-successor-approvals/<approval-sha>.json
+```
+
+不改旧批准。再运行原 `preflight-modules`、`bind-modules` 和同一摘要的 `recover-modules`；参数与上文一致。生产 preflight 仍须在具体计划批准之后进行。写入仍只有三模块、role 的 service hash、handoff 四摘要，以及新事务证明和指针 CAS。旧 overlay/role/token、原 Core/AI/Web、锁 inode、权限、数据和消费账本不变。watchdog 按原有界协调程序处理，不能停监督等审查。
+
+- 部分失败：验证新计划、完整父证明、五文件 before/after CAS、账本无漂移，只恢复五文件并把**本事务指针** CAS 回父指针。父证明不修改，消费快照从不恢复。恢复中断可继续同事务。
+- 已 INSTALLED：只能验证当前最新后像并恢复监督。以已被后继替代的旧计划调用恢复会拒绝，不降级 consumer，不删除新消费。
+- 后来发生的 UNKNOWN、新请求、command/window/open-operation 消费，在已提交恢复中保持；部分安装发现账本漂移则拒绝，不能抹除。
+
+后续正式发布必须等 feature/main 和 main/release 的实际 CODEOWNER 审查及 CI，再复用自动 package-only run。此文不提供未产生的包 hash、run ID 或生产批准摘要。模块安装后的 OPEN 工具/新启动/独立运营批准另见 [OPEN operations](vmm-open-operations.md)。
