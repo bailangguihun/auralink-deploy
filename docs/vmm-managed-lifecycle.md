@@ -29,7 +29,42 @@ vmm-reconcile  --vmm-command-sha256 <reviewed digest>
 
 Invoke only through the installed, digest-bound lifecycle with `R25_ROOT` and `ARTLIVE_R25_HANDOFF_CONFIG` set to the existing installation. The public/private application endpoint does not expose these operator commands. A disabled minimal binding requires no token, model assets, output directory or listener.
 
-`runtime/config/vmm-gate-command.json` is mode 0600. Its schema is `R25_VMM_GATE_COMMAND_V1`; fields include `mode`, current `role_sha256`, exact `before_gate_sha256`, and an ACCEPTANCE `permit` (`owner_id`, `source_painting_id`, `image_sha256`, `duration`; optional exact creation/step/retry). Approval is external; the CLI does not approve its own digest. Close admission first, prepare the record, obtain explicit approval, then invoke the exact digest. Commands are consumed durably before their action. The service lock performs a second compare-and-swap of the accounting record. Interrupted commands are not automatically repeated.
+`runtime/config/vmm-gate-command.json` is mode 0600. Approval is external; the CLI does not approve its own digest. Close admission first, prepare the record, obtain explicit approval, then invoke the exact digest. Commands are consumed durably before their action. The service lock performs a second compare-and-swap of the accounting record. Interrupted commands are not automatically repeated.
+
+### One-request acceptance window identity (V2)
+
+New `vmm-acceptance` commands require exactly:
+
+```json
+{
+  "schema": "R25_VMM_GATE_COMMAND_V2",
+  "mode": "acceptance",
+  "role_sha256": "<current bound role SHA-256>",
+  "before_gate_sha256": "<exact unused CLOSED gate bytes SHA-256>",
+  "permit": {
+    "owner_id": "<authorized existing account>",
+    "source_painting_id": "<authorized existing catalog painting>",
+    "image_sha256": "<authorized image bytes SHA-256>",
+    "duration": 3
+  },
+  "window": {
+    "startup_plan_sha256": "<actual separately approved startup plan SHA-256>",
+    "first_ready_sha256": "<actual FIRST_READY.json SHA-256>"
+  }
+}
+```
+
+The two window fields are validated identities, not a nonce. They are included before the acceptance-plan digest is produced, avoiding a plan/command hash cycle. The controller derives the directory `runtime/vmm-startup-windows/<startup_plan_sha256>` under its installed root; the caller cannot supply a path. It requires a private 0700 directory and private 0600 regular single-link records, with no symlink path components. It hashes the actual `STARTUP_PLAN.json` and `FIRST_READY.json` and verifies the six READY evidence records referenced by `SINGLE_REQUEST_ACCEPTANCE_UNSIGNED_PLAN.json`. That acceptance plan must bind the exact command digest, current role, fixed one-request/no-retry/3-second limits, and original process/deadline fields. The exact four-field `ACCEPTANCE_APPROVAL.json` must approve that plan digest and its one-workflow/one-creation/one-music scope. Printed templates and startup approval alone do not satisfy it.
+
+The startup plan must declare `acceptance_gate_schema=R25_VMM_GATE_COMMAND_V2`, the correct installed root, and unchanged 900-second startup / 600-second READY / one-initialization / zero-generation startup limits. The live execution record must remain `OBSERVING`, not completed, with exactly one enable/start and zero generation calls. Original startup/READY monotonic and wall deadlines must remain valid. Recorded boot/PID/start ticks/uid/exe/cwd/argv/process-group/session identity must equal the actual owned process; authenticated current readiness must still be READY and CLOSED with no dispatch, in-flight or uncertain request. No status check loads a model or performs generation. Current readiness is bounded and both original deadlines are checked again after observation and after durable lifecycle consumption. The original startup intent must precede the lifecycle's actual process-start time, which must precede FIRST_READY. The controller passes the same validated absolute deadlines as internal arguments to GateStore.configure; the service rechecks them inside its independent gate lock immediately before recording ACCEPTANCE. Lock contention cannot turn an expired approval into admission. This does not add a public request field or change generation behavior. The acceptance runner also rechecks the original deadline after control returns and before any business POST. A control delay is not authority to submit late, reset the clock or retry.
+
+Before configuring ACCEPTANCE, lifecycle accounting atomically persists both the existing `gate_commands` digest and `gate_windows[startup_plan_sha256] = {command_sha256, first_ready_sha256}` in the same fsynced record. The exact old consumed command remains refused. A changed command, permit, READY file or newly written approval cannot rearm an already consumed startup window. Failure after consumption but before gate configuration remains consumed and requires investigation, not automatic retry. Existing request accounting, UNKNOWN results and reconciliation semantics are unchanged; no ledger is cleared or refunded.
+
+Unconsumed V1 acceptance commands are now refused: their static account/source/image/duration tuple cannot prove a distinct independently approved window. Unknown command/window/permit fields are refused, so adding ignored salt cannot create authority. V1 `open` and `reconcile` retain their separate reviewed contract, with exact command keys (OPEN permits only an optional null `permit`; reconciliation requires `request_id` and `reason`). This patch does not authorize OPEN.
+
+This is a reviewed controller protocol change, not a local-tool-only workaround. The production lifecycle and service modules and their digest bindings must be updated through an independently reviewed compatible controller update before a V2 producer can run. Existing overlay revision approval must not be rewritten or replayed to install new bytes. Package provenance and a concrete supported incremental update/recovery plan remain release prerequisites. A producer must fail preflight against an installed consumer without this declared protocol, before any initialization.
+
+For an already committed managed Core successor, the bounded [module revision contract](vmm-module-revision.md) provides `prepare-modules`, `preflight-modules`, `bind-modules` and `recover-modules`. It preserves the original overlay, role and successor approvals, updates only five controlled files, and never restores lifecycle/request ledgers. Installation remains disabled/stopped/CLOSED and requires a separately approved concrete plan.
 
 For reconcile, specify the existing `request_id` and a factual `reason`; it acknowledges uncertainty but never deletes its request, refunds its count or permits that request ID to execute again. UNKNOWN remains visible. A new request always requires separate applicable authorization.
 

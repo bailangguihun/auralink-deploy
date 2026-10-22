@@ -343,7 +343,7 @@ def load_plan(rt, ident, recover=False):
     return plan,folder
 
 
-def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=None):
+def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=None,revision=None):
     overrides=role_history(rt,plan,sha(encoded(plan))) if role_overrides else None
     if overrides:read(rt.root/'runtime/config/vmm-service.json',rt.private,expected=overrides['service'])
     for name,(path,owner,permissions) in rt.targets().items():
@@ -352,6 +352,7 @@ def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=Non
                  'operation-guard':('operational','guard'),'handoff':('operational','handoff')}
         if successor is not None and name in mapping:
             group,key=mapping[name];e=successor[group][key]
+        if revision is not None and name in revision['files']:e=revision['files'][name]
         if runtime and name=='handoff':
             folder=rt.store/'transactions'/sha(encoded(plan))
             expected=read(folder/'after/handoff',rt.private,expected=plan['files'][name]['after_sha256'])
@@ -362,11 +363,13 @@ def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=Non
             if successor is not None:
                 wanted.update(R25_CORE_RELEASE_GUARD_SHA256=successor['operational']['guard']['after_sha256'],
                               R25_VMM_CONTROLLER_SHA256=successor['files']['vmm_controller.py']['after_sha256'])
+            if revision is not None:
+                wanted.update(revision['handoff_controls'])
             must(control_handoff_values(read(path,owner,permissions))==wanted,'runtime_handoff_control_drift')
             continue
         current=sha(read(path,owner,permissions)) if path.exists() else None
         effective_mode='after' if successor is not None and name not in mapping else mode
-        allowed={overrides[name] if overrides and name in overrides and not (successor is not None and name=='handoff') else e['after_sha256']} if effective_mode=='after' else {e['before_sha256']} if effective_mode=='before' else set(e.values())
+        allowed={overrides[name] if overrides and name in overrides and not (successor is not None and name=='handoff') and not (revision is not None and name in revision['files']) else e['after_sha256']} if effective_mode=='after' else {e['before_sha256']} if effective_mode=='before' else set(e.values())
         must(current in allowed,'target_drift:'+name)
 
 
@@ -551,7 +554,7 @@ def require_core_successor_stopped(rt):
          state.get('process')is None and gate.get('mode')=='CLOSED','core_successor_disabled_stopped_closed')
 
 
-def verify_core_successor(rt,plan,phase='before',*,runtime=False):
+def verify_core_successor(rt,plan,phase='before',*,runtime=False,revision=None):
     """Validate original overlay plus a new immutable Core binding proof.
 
     Runtime checks intentionally leave legitimate application transactions and
@@ -574,7 +577,8 @@ def verify_core_successor(rt,plan,phase='before',*,runtime=False):
         must(sha(sources[name])==base['files'][name]['after_sha256'],'core_successor_unrelated_extension_change')
     for name,path in core_successor_paths(rt).items():
         if runtime and name in {'lifecycle-state','gate'}:continue
-        read(path,rt.private,expected=binding['preserved'][name])
+        expected=(revision['files']['role']['after_sha256'] if revision is not None and name=='role' else binding['preserved'][name])
+        read(path,rt.private,expected=expected)
     if not runtime:require_core_successor_stopped(rt)
     before=plan['operational']['policy']['before_sha256'];after=plan['operational']['policy']['after_sha256']
     must(base['preserved']['policy']==before and base['preserved']['original-controller-active']==binding['control_active_sha256'],
@@ -598,11 +602,11 @@ def verify_core_successor(rt,plan,phase='before',*,runtime=False):
          oldplan.get('operational',{}).get('policy',{}).get('after_sha256')==before and
          oldjournal.get('phase')=='INSTALLED' and oldjournal.get('approval_sha256')==priorid,
          'core_successor_original_controller_proof')
-    verify_files(rt,base,phase,role_overrides=True,runtime=runtime,successor=plan)
+    verify_files(rt,base,phase,role_overrides=True,runtime=runtime,successor=plan,revision=revision)
     return base
 
 
-def applied_core_successor(rt,value,handoff):
+def applied_core_successor(rt,value,handoff,*,revision=None):
     marker=json_read(rt.store/'CORE_SUCCESSOR_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
     must(marker=={'schema':CORE_SUCCESSOR_ACTIVE_SCHEMA,'approval_sha256':ident},'core_successor_marker')
     folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
@@ -613,7 +617,7 @@ def applied_core_successor(rt,value,handoff):
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'core_successor_not_installed')
     must(json_read(rt.preserved()['original-controller-active'],rt.private)==
          {'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident},'core_successor_controller_pointer')
-    base=verify_core_successor(rt,plan,'after',runtime=True)
+    base=verify_core_successor(rt,plan,'after',runtime=True,revision=revision)
     must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value,'core_successor_policy_argument')
     must(handoff==env_values(read(rt.targets()['handoff'][0],rt.private)),'core_successor_handoff_argument')
     must(value.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1' and
@@ -631,6 +635,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'MODULE_REVISION_ACTIVE.json').exists():return applied_module_revision(rt,value,handoff)
     if (rt.store/'CORE_SUCCESSOR_ACTIVE.json').exists():return applied_core_successor(rt,value,handoff)
     active=json_read(rt.store/'ACTIVE.json',rt.private);ident=digest(active.get('approval_sha256'))
     must(active=={'schema':SCHEMA,'approval_sha256':ident},'overlay_active')
@@ -892,12 +897,346 @@ def recover_role(rt,ident):
     rt.supervise('start');return result
 
 
+MODULE_REVISION_SCHEMA = 'R25_VMM_MODULE_REVISION_V1'
+REVISION_NAMES = ('vmm_controller.py', 'vmm_lifecycle.py', 'vmm_service.py', 'role', 'handoff')
+CONTROLLER_FILES = tuple(sorted((
+    'assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py','assistant_acceptance.py',
+    'assistant_backup.py','upgrade_assistant_controller.py','ai_publish.py','ai_release_candidate.py',
+    'ai_release_guard.py','ai_runtime.py','ai-baseline.json','control_overlay.py','core_acceptance.py',
+    'core_publish.py','core_release_guard.py','core_runtime.py','core-release-candidate.py','core_business.py',
+    'core_asset_sandbox.py','upgrade_core_controller.py','install_ai_controller.py','install_core_controller.py',
+    'publisher_transaction.py','r25_storage.py','verify-r25-artifact.py')))
+
+
+def revision_targets(rt):
+    return {name: rt.targets()[name] for name in REVISION_NAMES}
+
+
+def revision_preserved(rt):
+    # These are read/hash assertions only. No recovery path writes these files.
+    return {**rt.preserved(), **{name: path for name,path in core_successor_paths(rt).items() if name != 'role'},
+            'core-successor-active': rt.store/'CORE_SUCCESSOR_ACTIVE.json',
+            'lifecycle-adapter': rt.targets()['lifecycle'][0]}
+
+
+def revision_preserved_read(rt,name,path,expected=None):
+    if name=='lifecycle-adapter':
+        _,owner,mode=rt.targets()['lifecycle']
+        return read(path,owner,mode,expected)
+    return read(path,rt.private,expected=expected)
+
+
+def revision_bundles(rt, extension, controller):
+    folder,sources=verify_bundle(rt,extension)
+    must(type(controller)is dict and set(controller)==set(extension),'revision_controller_fields')
+    must(all(controller[k]==extension[k] for k in ('repository','ref','commit','run_id','run_attempt')),
+         'revision_same_formal_run')
+    location=rt.root/'operations/r25-controller-candidates'/controller['commit']
+    raw=read(location/'r25-controller.zip',rt.private,expected=controller['archive_sha256'])
+    manifest=json_read(location/'r25-controller-manifest.json',rt.private,controller['manifest_sha256'])
+    must(set(manifest)=={'schema','repository','ref','commit','run_id','run_attempt','status','installation_performed','archive','files'}
+         and manifest['schema']==1 and manifest['status']=='NOT_DEPLOYED' and manifest['installation_performed'] is False
+         and all(manifest[k]==controller[k] for k in ('repository','ref','commit','run_id','run_attempt')),
+         'revision_controller_manifest')
+    must(manifest['archive']=={'name':'r25-controller.zip','bytes':len(raw),'sha256':controller['archive_sha256']},
+         'revision_controller_archive')
+    records=manifest['files']
+    must(type(records)is list and [x.get('path') for x in records]==list(CONTROLLER_FILES),'revision_controller_inventory')
+    payload={}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        must(archive.namelist()==list(CONTROLLER_FILES),'revision_controller_zip_inventory')
+        for item in records:
+            must(set(item)=={'path','bytes','sha256'} and type(item['bytes'])is int and 0<item['bytes']<=1024*1024,
+                 'revision_controller_member')
+            name=item['path'];body=archive.read(name)
+            must(len(body)==item['bytes'] and sha(body)==digest(item['sha256']),'revision_controller_member_hash')
+            must(read(location/name,rt.private,expected=item['sha256'])==body,'revision_controller_extracted_hash')
+            payload[name]=body
+    rebuilt=io.BytesIO()
+    with zipfile.ZipFile(rebuilt,'w',compression=zipfile.ZIP_STORED) as archive:
+        for name in CONTROLLER_FILES:
+            info=zipfile.ZipInfo(name,date_time=(1980,1,1,0,0,0));info.create_system=3
+            info.external_attr=(stat.S_IFREG|0o600)<<16;archive.writestr(info,payload[name])
+    must(raw==rebuilt.getvalue(),'revision_controller_canonical_zip')
+    must(sha(payload['upgrade_assistant_controller.py'])==controller['tool_sha256']
+         and payload['core_release_guard.py']==sources['core_release_guard.py'],'revision_paired_guard')
+    must(not (location/'__pycache__').exists() and not any(location.glob('*.py[co]')),'revision_bundle_bytecode')
+    return folder,sources
+
+
+def revision_stopped(rt):
+    require_core_successor_stopped(rt)
+    # No port probing, model import or health/generation calls. Refuse any
+    # listener, including one not described by the managed process record.
+    for name in ('tcp','tcp6'):
+        for line in (Path('/proc/net')/name).read_text().splitlines()[1:]:
+            parts=line.split()
+            must(not (parts[3]=='0A' and int(parts[1].rsplit(':',1)[1],16)==5001),'revision_port_occupied')
+
+
+def revision_apps_committed(rt):
+    for kind in ('core','ai'):
+        store=rt.root/f'runtime/{kind}-publications'
+        for name in ('CURRENT.json','ACTIVE.json'):
+            if name=='ACTIVE.json' and not (store/name).exists():continue
+            tx=json_read(store/name,rt.private).get('transaction_id');digest(tx,32)
+            phase=json_read(store/'transactions'/tx/'journal.json',rt.private).get('phase')
+            must(phase=='COMMITTED' if name=='CURRENT.json' else phase in {'COMMITTED','RESTORED'},'revision_application_active')
+    backup=rt.root/'runtime/assistant-backups/assistant-daily-v1/ACTIVE.json'
+    if backup.exists():
+        day=json_read(backup,rt.private).get('day')
+        must(type(day)is str and re.fullmatch('20[0-9]{2}-[0-9]{2}-[0-9]{2}',day),'revision_backup_day')
+        must(json_read(backup.parent/'runs'/(day+'.json'),rt.private).get('phase') in
+             {'COMMITTED','FAILED_RESUMED','RECOVERED_WITHOUT_REPLAY','PURGED'},'revision_backup_active')
+
+
+def revision_base(rt, expected=None):
+    marker=json_read(rt.store/'CORE_SUCCESSOR_ACTIVE.json',rt.private)
+    ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':CORE_SUCCESSOR_ACTIVE_SCHEMA,'approval_sha256':ident}
+         and (expected is None or expected==ident),'revision_successor_identity')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    record=json_read(folder/'journal.json',rt.private)
+    must(record.get('schema')==CORE_SUCCESSOR_SCHEMA and record.get('approval_sha256')==ident
+         and record.get('phase')=='INSTALLED','revision_successor_not_installed')
+    return ident
+
+
+def revision_render(rt, before, sources):
+    # Only these module identities may change. Endpoint, token, model policy,
+    # service binding, original lifecycle adapter and guards stay byte-identical.
+    for name in ('publisher-guard','operation-guard'):
+        path,owner,mode=rt.targets()[name]
+        must(read(path,owner,mode)==sources['core_release_guard.py'],'revision_guard_must_be_unchanged')
+    role=json.loads(before['role']);service=json_read(rt.root/'runtime/config/vmm-service.json',rt.private)
+    validate_role_documents(rt,role,service,sha(read(rt.root/'runtime/config/vmm-service.json',rt.private)),sha(before['vmm_service.py']))
+    role['service_script_sha256']=sha(sources['vmm_service.py'])
+    after={name:sources[name] for name in REVISION_NAMES[:3]};after['role']=encoded(role)
+    updates={'R25_VMM_CONTROLLER_SHA256':sha(after['vmm_controller.py']),
+             'R25_VMM_LIFECYCLE_SHA256':sha(after['vmm_lifecycle.py']),
+             'R25_VMM_SERVICE_SHA256':sha(after['vmm_service.py']),'R25_VMM_ROLE_SHA256':sha(after['role'])}
+    values=env_values(before['handoff']);raw=before['handoff']
+    for key,value in updates.items():
+        must(key in values,'revision_missing_handoff_binding')
+        line=(key+'='+values[key]+'\n').encode();must(raw.count(line)==1,'revision_handoff_line')
+        raw=raw.replace(line,(key+'='+value+'\n').encode())
+    after['handoff']=raw
+    return after,updates
+
+
+def revision_transaction(rt,ident):
+    return rt.store/'module-revisions'/digest(ident)
+
+
+def revision_validate(rt,plan):
+    must(type(plan)is dict and set(plan)=={'schema','scope','deploy','controller_deploy','review_evidence_sha256',
+         'core_successor_approval_sha256','private_owner','controller_owner','files','preserved','handoff_controls'}
+         and plan['schema']==MODULE_REVISION_SCHEMA and plan['scope']=='V2_ACCEPTANCE_MODULES_ONLY_DISABLED_CLOSED',
+         'revision_plan_fields')
+    must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts)
+         and set(plan['files'])==set(REVISION_NAMES) and set(plan['preserved'])==set(revision_preserved(rt)),
+         'revision_plan_inventory')
+    for entry in plan['files'].values():
+        must(set(entry)=={'before_sha256','after_sha256'},'revision_file_fields')
+        for value in entry.values():digest(value)
+    for value in plan['preserved'].values():digest(value)
+    digest(plan['review_evidence_sha256']);digest(plan['core_successor_approval_sha256'])
+    return plan
+
+
+def revision_check_files(rt,plan,phase,*,runtime=False):
+    for name,(path,owner,mode) in revision_targets(rt).items():
+        if runtime and name=='handoff':
+            # Legitimate later Web selection may change unrelated handoff keys.
+            actual=control_handoff_values(read(path,owner,mode))
+            folder=revision_transaction(rt,sha(encoded(plan)))
+            wanted=control_handoff_values(read(folder/'after/handoff',rt.private,expected=plan['files']['handoff']['after_sha256']))
+            must(actual==wanted,'revision_runtime_handoff');continue
+        current=sha(read(path,owner,mode));entry=plan['files'][name]
+        must(current in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'revision_target_drift:'+name)
+    for name,path in revision_preserved(rt).items():
+        if runtime and name not in {'policy','original-controller-active','overlay-active','role-active','service','token','core-successor-active','lifecycle-adapter'}:continue
+        revision_preserved_read(rt,name,path,plan['preserved'][name])
+
+
+def revision_material(rt,plan,folder):
+    _,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
+    before={name:read(folder/'before'/name,rt.private,expected=plan['files'][name]['before_sha256']) for name in REVISION_NAMES}
+    after,updates=revision_render(rt,before,sources)
+    must(updates==plan['handoff_controls'] and all(sha(after[name])==plan['files'][name]['after_sha256'] for name in REVISION_NAMES),
+         'revision_render_mismatch')
+    for name,raw in after.items():must(read(folder/'after'/name,rt.private)==raw,'revision_after_snapshot')
+    return before,after
+
+
+def revision_journal(rt,folder,ident):
+    value=json_read(folder/'journal.json',rt.private)
+    must(set(value)=={'schema','approval_sha256','phase'} and value['schema']==MODULE_REVISION_SCHEMA
+         and value['approval_sha256']==ident and value['phase'] in PHASES|{'VERIFY_INTENT'},'revision_journal')
+    return value['phase']
+
+
+def prepare_module_revision(rt,request_sha):
+    request=json_read(rt.store/'MODULE_REQUEST.json',rt.private,request_sha)
+    must(set(request)=={'schema','deploy','controller_deploy','review_evidence_sha256'}
+         and request['schema']=='R25_VMM_MODULE_REVISION_REQUEST_V1','revision_request')
+    _,sources=revision_bundles(rt,request['deploy'],request['controller_deploy'])
+    review=read(rt.store/'MODULE_REVIEW.json',rt.private,expected=request['review_evidence_sha256'])
+    must(type(json.loads(review))is dict and bool(json.loads(review)),'revision_review')
+    with rt.lease():
+        must(not (rt.store/'MODULE_REVISION_ACTIVE.json').exists(),'revision_already_bound')
+        base=revision_base(rt);revision_stopped(rt);revision_apps_committed(rt)
+        applied_core_successor(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+        before={name:read(path,owner,mode) for name,(path,owner,mode) in revision_targets(rt).items()}
+        after,updates=revision_render(rt,before,sources)
+        must(all(before[name]!=after[name] for name in REVISION_NAMES[:3]),'revision_requires_changed_modules')
+        plan={'schema':MODULE_REVISION_SCHEMA,'scope':'V2_ACCEPTANCE_MODULES_ONLY_DISABLED_CLOSED',
+              'deploy':request['deploy'],'controller_deploy':request['controller_deploy'],
+              'review_evidence_sha256':request['review_evidence_sha256'],'core_successor_approval_sha256':base,
+              'private_owner':list(rt.private),'controller_owner':list(rt.scripts),
+              'files':{name:{'before_sha256':sha(before[name]),'after_sha256':sha(after[name])} for name in REVISION_NAMES},
+              'preserved':{name:sha(revision_preserved_read(rt,name,path)) for name,path in revision_preserved(rt).items()},'handoff_controls':updates}
+        revision_validate(rt,plan);folder=rt.store/'module-plans'/digest(request_sha)
+        rt.mkdir(folder/'before');rt.mkdir(folder/'after')
+        records={'UNSIGNED_PLAN.json':encoded(plan),'review.json':review,
+                 **{'before/'+k:v for k,v in before.items()},**{'after/'+k:v for k,v in after.items()}}
+        for name,raw in records.items():
+            path=folder/name
+            if path.exists():must(read(path,rt.private)==raw,'revision_preparation_conflict')
+            else:rt.atomic(path,raw)
+    return {'outcome':'MODULE_PREPARED_UNSIGNED','plan_sha256':sha(encoded(plan)),'plan_path':str(folder/'UNSIGNED_PLAN.json')}
+
+
+def revision_load(rt,ident,*,recovering=False):
+    folder=revision_transaction(rt,ident)
+    plan=revision_validate(rt,json_read(folder/'approval.json' if recovering else rt.store/'MODULE_APPROVAL.json',rt.private,ident))
+    must(sha(encoded(plan))==ident,'revision_exact_prepared_plan_bytes')
+    json_read(folder/'review.json' if recovering else rt.store/'MODULE_REVIEW.json',rt.private,plan['review_evidence_sha256'])
+    revision_base(rt,plan['core_successor_approval_sha256'])
+    revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
+    return plan,folder
+
+
+def preflight_module_revision(rt,ident):
+    plan,folder=revision_load(rt,ident)
+    with rt.lease():
+        must(not (rt.store/'MODULE_REVISION_ACTIVE.json').exists(),'revision_already_bound')
+        revision_stopped(rt);revision_apps_committed(rt);revision_check_files(rt,plan,'before')
+        applied_core_successor(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+        before={name:read(path,owner,mode) for name,(path,owner,mode) in revision_targets(rt).items()}
+        _,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy']);after,updates=revision_render(rt,before,sources)
+        must(updates==plan['handoff_controls'] and all(sha(after[n])==plan['files'][n]['after_sha256'] for n in after),'revision_render_mismatch')
+    return {'outcome':'MODULE_PREFLIGHT_PASS','approval_sha256':ident}
+
+
+def bind_module_revision(rt,ident,*,fault=None):
+    plan,folder=revision_load(rt,ident)
+    if (folder/'journal.json').exists():
+        must(revision_journal(rt,folder,ident)=='INSTALLED','recover_original_module_transaction')
+        return recover_module_revision(rt,ident)
+    preflight_module_revision(rt,ident)
+    safe=False
+    try:
+        rt.supervise('stop')
+        with rt.lease():
+            revision_stopped(rt);revision_apps_committed(rt);revision_check_files(rt,plan,'before');rt.require_watchdog_stopped()
+            must(not (rt.store/'MODULE_REVISION_ACTIVE.json').exists(),'revision_already_bound')
+            before={name:read(path,owner,mode) for name,(path,owner,mode) in revision_targets(rt).items()}
+            _,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy']);after,updates=revision_render(rt,before,sources)
+            must(updates==plan['handoff_controls'] and all(sha(after[n])==plan['files'][n]['after_sha256'] for n in after),'revision_render_mismatch')
+            rt.mkdir(folder/'before');rt.mkdir(folder/'after')
+            records={'approval.json':encoded(plan),'review.json':read(rt.store/'MODULE_REVIEW.json',rt.private,expected=plan['review_evidence_sha256']),
+                     **{'before/'+k:v for k,v in before.items()},**{'after/'+k:v for k,v in after.items()}}
+            for name,raw in records.items():
+                path=folder/name
+                if path.exists():must(read(path,rt.private)==raw,'revision_snapshot_conflict')
+                else:rt.atomic(path,raw)
+            rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'INSTALL_INTENT'})
+            try:
+                for name,(path,owner,mode) in revision_targets(rt).items():
+                    rt.atomic(path,after[name],before=plan['files'][name]['before_sha256'],owner=owner,mode=mode)
+                    if fault:fault(name)
+                marker=rt.store/'MODULE_REVISION_ACTIVE.json'
+                rt.atomic(marker,encoded({'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident}))
+                if fault:fault('marker')
+                rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'VERIFY_INTENT'})
+                applied_module_revision(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+                revision_check_files(rt,plan,'after');revision_stopped(rt)
+                if fault:fault('verified')
+                rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'INSTALLED'})
+                safe=True
+            except BaseException:
+                rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'RECOVERY_REQUIRED'});raise
+    except BaseException:
+        try:revision_check_files(rt,plan,'before');safe=True
+        except (Refused,OSError,ValueError,KeyError):pass
+        raise
+    finally:
+        if safe:rt.supervise('start')
+    return {'outcome':'MODULE_INSTALLED_DISABLED','approval_sha256':ident}
+
+
+def applied_module_revision(rt,value,handoff):
+    marker=json_read(rt.store/'MODULE_REVISION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident},'revision_marker')
+    plan,folder=revision_load(rt,ident,recovering=True)
+    must(revision_journal(rt,folder,ident) in {'VERIFY_INTENT','INSTALLED'},'revision_not_installed')
+    revision_material(rt,plan,folder);revision_check_files(rt,plan,'after',runtime=True)
+    return applied_core_successor(rt,value,handoff,revision=plan)
+
+
+def recover_module_revision(rt,ident):
+    folder=revision_transaction(rt,ident)
+    if not (folder/'journal.json').exists():return {'outcome':'MODULE_NOT_STARTED'}
+    plan,folder=revision_load(rt,ident,recovering=True);phase=revision_journal(rt,folder,ident)
+    before,_=revision_material(rt,plan,folder)
+    if phase=='INSTALLED':
+        # Never downgrade a committed consumer after later window consumption.
+        applied_module_revision(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+        rt.supervise('start');return {'outcome':'MODULE_ALREADY_INSTALLED_SUPERVISION_RESTORED'}
+    if phase=='RESTORED':
+        revision_check_files(rt,plan,'before')
+        must(not (rt.store/'MODULE_REVISION_ACTIVE.json').exists(),'revision_foreign_marker')
+        applied_core_successor(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+        rt.supervise('start');return {'outcome':'MODULE_ALREADY_RESTORED'}
+    # Binding already paused supervision. On partial state do not invoke a
+    # potentially inconsistent stop wrapper; prove watchdog stopped under lease.
+    with rt.lease():
+        revision_stopped(rt);revision_apps_committed(rt);rt.require_watchdog_stopped();revision_check_files(rt,plan,'mixed')
+        marker=rt.store/'MODULE_REVISION_ACTIVE.json'
+        if marker.exists():must(json_read(marker,rt.private)=={'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident},'revision_foreign_marker')
+        rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'RESTORE_INTENT'})
+        for name,(path,owner,mode) in reversed(list(revision_targets(rt).items())):
+            current=sha(read(path,owner,mode))
+            if current!=plan['files'][name]['before_sha256']:
+                rt.atomic(path,before[name],before=plan['files'][name]['after_sha256'],owner=owner,mode=mode)
+        if marker.exists():
+            marker.unlink();fd=os.open(marker.parent,os.O_DIRECTORY|os.O_NOFOLLOW)
+            try:os.fsync(fd)
+            finally:os.close(fd)
+        revision_check_files(rt,plan,'before')
+        applied_core_successor(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
+        rt.write_state(folder/'journal.json',{'schema':MODULE_REVISION_SCHEMA,'approval_sha256':ident,'phase':'RESTORED'})
+    rt.supervise('start');return {'outcome':'MODULE_RESTORED','approval_sha256':ident}
+
+
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['prepare','preflight','bind','recover','rollback','prepare-role','bind-role','recover-role'])
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['prepare','preflight','bind','recover','rollback','prepare-role','bind-role','recover-role',
+        'prepare-modules','preflight-modules','bind-modules','recover-modules'])
     parser.add_argument('--request-sha256');parser.add_argument('--approval-sha256');args=parser.parse_args()
     try:
         must(os.geteuid()==0 and sys.platform.startswith('linux'),'root_linux_required')
-        rt=Runtime();ident=args.request_sha256 if args.command in {'prepare','prepare-role'} else args.approval_sha256;digest(ident)
+        rt=Runtime();ident=args.request_sha256 if args.command in {'prepare','prepare-role','prepare-modules'} else args.approval_sha256;digest(ident)
+        if args.command.endswith('-modules'):
+            if args.command=='recover-modules' and not (revision_transaction(rt,ident)/'journal.json').exists():
+                print(json.dumps({'outcome':'MODULE_NOT_STARTED'}));return 0
+            p=(json_read(revision_transaction(rt,ident)/'approval.json',rt.private,ident) if args.command=='recover-modules' else
+               json_read(rt.store/('MODULE_REQUEST.json' if args.command=='prepare-modules' else 'MODULE_APPROVAL.json'),rt.private,ident))
+            folder,_=revision_bundles(rt,p['deploy'],p['controller_deploy'])
+            must(Path(__file__).absolute()==folder/'vmm_controller.py','formal_execution_path')
+            result={'prepare-modules':prepare_module_revision,'preflight-modules':preflight_module_revision,
+                    'bind-modules':bind_module_revision,'recover-modules':recover_module_revision}[args.command](rt,ident)
+            print(json.dumps(result));return 0
         if args.command.endswith('-role'):
             if args.command=='recover-role' and not (role_transaction(rt,ident)/'journal.json').exists():
                 print(json.dumps({'outcome':'ROLE_NOT_STARTED'}));return 0

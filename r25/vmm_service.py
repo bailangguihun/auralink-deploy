@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -165,8 +166,13 @@ class GateStore:
                     'uncertain': any(x['state'] == 'UNKNOWN' and not x.get('acknowledged') for x in requests),
                     'attempts': len(record['requests'])}
 
-    def configure(self, mode, permit=None, *, expected_sha256=None):
+    def configure(self, mode, permit=None, *, expected_sha256=None, acceptance_deadline=None):
         must(mode in {'CLOSED', 'ACCEPTANCE', 'OPEN'}, 'GATE_MODE')
+        if acceptance_deadline is not None:
+            must(mode == 'ACCEPTANCE' and type(acceptance_deadline) is dict
+                 and set(acceptance_deadline) == {'monotonic', 'wall'}
+                 and all(type(value) in (int, float) and math.isfinite(value)
+                         for value in acceptance_deadline.values()), 'ACCEPTANCE_DEADLINE_INVALID')
         if mode == 'ACCEPTANCE':
             must(isinstance(permit, dict) and set(permit) >= {'owner_id', 'source_painting_id', 'image_sha256', 'duration'},
                  'ACCEPTANCE_PERMIT_FIELDS')
@@ -189,6 +195,12 @@ class GateStore:
                 must(not any(x['state'] == 'DISPATCHED' for x in record['requests'].values()), 'VMM_BUSY')
                 must(not any(x['state'] == 'UNKNOWN' and not x.get('acknowledged')
                              for x in record['requests'].values()), 'VMM_OUTCOME_UNCERTAIN')
+            # The controller's original READY deadlines travel as validated
+            # internal arguments, never service HTTP/client fields. Waiting for
+            # this independent accounting lock must not grant late admission.
+            if acceptance_deadline is not None:
+                must(time.monotonic() < acceptance_deadline['monotonic']
+                     and time.time() < acceptance_deadline['wall'], 'ACCEPTANCE_WINDOW_EXPIRED')
             record['mode'], record['permit'] = mode, permit
             self.write(record)
 
