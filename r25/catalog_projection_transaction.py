@@ -76,6 +76,18 @@ def approval_text(digest,count):
             '不授权VMM启动、OPEN、部署或任何生成；不确定结果只读核对，必要时保持维护状态并报告。')
 
 
+def require_prior_repairs_terminal(parent, read):
+    if not parent.exists():return
+    for folder in parent.iterdir():
+        must(folder.is_dir() and not folder.is_symlink(),'repair_namespace_entry')
+        record=folder/'RECORD.json'
+        must(record.exists(),'prior_repair_record_missing_recovery_required')
+        value=read(record)
+        must(value.get('schema')==SCHEMA and value.get('phase') in
+             ('COMMITTED_VERIFIED_RESUMED','NO_COMMIT_VERIFIED_RESUMED'),
+             'prior_repair_unknown_or_recovery_required')
+
+
 def execute(backend, *, recover=False):
     """Backend methods are independently fault-tested; caller holds the lease."""
     if recover:
@@ -207,6 +219,7 @@ class Production:
 
     def preflight(self):
         must(not self.folder.exists(),'plan_already_consumed_or_unknown')
+        require_prior_repairs_terminal(self.folder.parent,self.rt.read)
         self.rt.require_terminal_component_transactions()
         self.identities();self.rt.verify_candidate(self.rt.current());self.rt.require_compatible(self.rt.current())
         self.helper.health();self.media();self.protected()

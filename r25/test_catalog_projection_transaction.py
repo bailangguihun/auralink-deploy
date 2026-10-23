@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -24,6 +25,18 @@ class Backend:
 
 
 class TransactionTest(unittest.TestCase):
+    def test_new_plan_cannot_bypass_an_older_unknown_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);folder=root/'prior';folder.mkdir()
+            read=lambda p:json.loads(p.read_text())
+            with self.assertRaises(RuntimeError):tx.require_prior_repairs_terminal(root,read)
+            record=folder/'RECORD.json'
+            for phase in ('CONSUMED','SQL_SUBMISSION_INTENT','UNKNOWN','RECOVERY_REQUIRED'):
+                record.write_text(json.dumps(dict(schema=tx.SCHEMA,phase=phase)))
+                with self.assertRaises(RuntimeError):tx.require_prior_repairs_terminal(root,read)
+            record.write_text(json.dumps(dict(schema=tx.SCHEMA,phase='NO_COMMIT_VERIFIED_RESUMED')))
+            tx.require_prior_repairs_terminal(root,read)
+
     def test_success_single_submission_consumes_before_stop(self):
         b=Backend();self.assertEqual(tx.execute(b),'COMMITTED_VERIFIED_RESUMED')
         self.assertEqual(b.calls.count('submit_once'),1)
