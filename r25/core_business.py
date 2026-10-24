@@ -21,7 +21,7 @@ SCHEMA = 'R25_CORE_BUSINESS_POLICY_V2'
 RECORD_SCHEMA = 'R25_CORE_BUSINESS_RELEASE_V2'
 REPOSITORY = 'Hang-666-star/auralink-core-api'
 CURRENT_REPOSITORY = 'bailangguihun/auralink-core-api'
-MANAGED_CORE_SCHEMAS = ('R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1')
+MANAGED_CORE_SCHEMAS = ('R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_V1')
 VERIFIED_REPOSITORIES = (CURRENT_REPOSITORY, REPOSITORY)
 CONFIG_KEYS = ('snapshot-root', 'graph-sha256', 'stats-sha256', 'map-enabled', 'china-sha256')
 ASSETS = {'poetry-graph.json': 'graph-sha256', 'poetry-stats.json': 'stats-sha256',
@@ -336,7 +336,7 @@ def render_configuration(before, policy):
     if 'successor' in policy['upgrade'] or 'core_followup' in policy['upgrade']:
         (validate_successor if 'successor' in policy['upgrade'] else validate_core_followup)(policy)
         validate_existing_assistant_configuration(before, policy)
-        if policy['upgrade'].get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1':
+        if policy['upgrade'].get('core_followup',{}).get('schema') in MANAGED_CORE_SCHEMAS[1:]:
             validate_existing_managed_vmm_configuration(before,policy)
         must(sha(before) == config['after_sha256'], 'successor_bridge_configuration_unchanged')
         return before

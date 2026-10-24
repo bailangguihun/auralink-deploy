@@ -256,12 +256,13 @@ def verify_core_followup_context(value, predecessor=None, validator=None):
     prior_sha=binding['predecessor_policy_sha256']
     if predecessor is None:
         predecessor=private_record(STORE/'core-followup-baselines'/(prior_sha+'.json'),prior_sha)
-    if binding['schema']=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1':
+    if binding['schema'] in {'R25_MANAGED_VMM_CORE_SUCCESSOR_V1','R25_MANAGED_VMM_CORE_PUBLICATION_V1'}:
         # One finite successor of the committed managed-Core installation.
         # Keep its original AI snapshot and accepted records immutable; do not
         # turn this into a recursively extensible arbitrary release chain.
         previous=core_business.validate_core_followup(predecessor)
-        must(previous['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1','managed_vmm_successor_predecessor_contract')
+        expected_schema=('R25_MANAGED_VMM_CORE_SUCCESSOR_V1' if binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_V1' else 'R25_MANAGED_VMM_CORE_FOLLOWUP_V1')
+        must(previous['schema']==expected_schema,'managed_vmm_successor_predecessor_contract')
         up=value['upgrade'];old=predecessor['upgrade']
         before=old['configuration'];after=up['configuration']
         expected=dict(before,before_sha256=before['after_sha256'])
