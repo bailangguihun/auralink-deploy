@@ -360,4 +360,3 @@ class PublicationFullPolicy(unittest.TestCase):
         self.assertEqual(case.raw,business.render_configuration(case.raw,value))
 
 if __name__=='__main__':unittest.main()
-
