@@ -147,14 +147,17 @@ class ManagedSuccessor(unittest.TestCase):
             self.vrt.store/'ACTIVE.json',self.vrt.store/'ROLE_ACTIVE.json']
         return {str(path):(path.read_bytes(),path.stat().st_mode&0o777,path.stat().st_uid,path.stat().st_gid) for path in paths if path.is_file()}
 
-    def prepare(self,wrong=None):
+    def prepare(self,wrong=None,*,publication=False,reuse_candidate=False):
         """Actual successor preparation; only fake Java bytecode is adapted."""
         spec=importlib.util.spec_from_file_location('managed_successor_fixture_package',HERE.parent/'scripts/package-r25-release.py')
         package=importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
-        commit='c'*40;self.bundle=self.f.root/'operations/r25-controller-candidates'/commit
+        commit=('9' if publication else 'c')*40;self.bundle=self.f.root/'operations/r25-controller-candidates'/commit
         payload={name:(self.f.bundle/name).read_bytes() for name in package.FILES}
         for name in ('core_release_guard.py','upgrade_assistant_controller.py','core_acceptance.py'):
             payload[name]=(HERE/name).read_bytes()
+        # The inherited policy-inventory stub is an explicit fixture boundary.
+        # Give its new reviewed identity a different digest for copy-failure tests.
+        if publication:payload['core_business.py']+=b'\n# synthetic new publication validator identity\n'
         archive=package.archive_bytes(payload);manifest=package.manifest_for(payload,archive,package.identity('bailangguihun/auralink-deploy',package.REF,commit,'777','1'))
         for name,raw in payload.items():self.put(self.bundle/name,raw)
         self.put(self.bundle/'r25-controller.zip',archive);self.put(self.bundle/'r25-controller-manifest.json',guard.encoded(manifest))
@@ -162,12 +165,13 @@ class ManagedSuccessor(unittest.TestCase):
         deploy.update(archive_sha256=business.sha(archive),manifest_sha256=business.sha(guard.encoded(manifest)),tool_sha256=business.sha(payload['upgrade_assistant_controller.py']))
         self.sources={name:(HERE/name).read_bytes() for name in vmm.MODULES}
         extension=self.package_extension(commit,'777')
-        core={'commit':'b'*40,'run_id':'888','run_attempt':'1'}
-        incoming=self.f.root/'incoming'/(core['commit']+'-888-1');incoming.mkdir(mode=0o700)
+        core={'commit':('a' if publication else 'b')*40,'run_id':'888','run_attempt':'1'}
+        incoming=self.f.root/'incoming'/(core['commit']+'-888-1');incoming.mkdir(mode=0o700,exist_ok=reuse_candidate)
         jar=incoming/C.JAR_NAME
-        with zipfile.ZipFile(jar,'w') as zipped:
-            zipped.writestr('BOOT-INF/classes/application-catalog-postgres-production.yml','synthetic: true\n')
-            zipped.writestr('BOOT-INF/classes/com/auralink/Application.class',b'non-executable synthetic successor JAR')
+        if not reuse_candidate:
+            with zipfile.ZipFile(jar,'w') as zipped:
+                zipped.writestr('BOOT-INF/classes/application-catalog-postgres-production.yml','synthetic: true\n')
+                zipped.writestr('BOOT-INF/classes/com/auralink/Application.class',b'non-executable synthetic publication JAR' if publication else b'non-executable synthetic successor JAR')
         jar.chmod(0o600)
         report={'status':'PASS','jar_sha256':business.sha(jar.read_bytes()),'jar_bytes':jar.stat().st_size,'profile_count':11,'profiles':{},'scope':C.SCOPE}
         self.put(incoming/C.REPORT_NAME,guard.encoded(report))
@@ -179,9 +183,10 @@ class ManagedSuccessor(unittest.TestCase):
         if wrong=='archive':self.put(self.bundle/'r25-controller.zip',archive+b'foreign suffix')
         if wrong=='extension-run':extension['run_id']='999'
         if wrong=='extension-guard':self.put(self.f.root/'operations/r25-vmm-candidates'/commit/'core_release_guard.py',b'foreign source')
-        request={'schema':'R25_MANAGED_VMM_CORE_SUCCESSOR_REQUEST_V1','deploy':deploy,'vmm_deploy':extension,'core':core,
+        request={'schema':'R25_MANAGED_VMM_CORE_PUBLICATION_REQUEST_V1' if publication else 'R25_MANAGED_VMM_CORE_SUCCESSOR_REQUEST_V1','deploy':deploy,'vmm_deploy':extension,'core':core,
             'web_commit':self.old['upgrade']['web_commit'],'evidence':self.old['upgrade']['evidence'],'compatibility':self.old['upgrade']['compatibility'],
-            'compatibility_evidence_sha256':'c'*64,'review_evidence_sha256':self.oldplan['review_evidence_sha256']}
+            'compatibility_evidence_sha256':('8' if reuse_candidate else 'c')*64,'review_evidence_sha256':self.oldplan['review_evidence_sha256']}
+        if publication:self.put(self.f.store/'publication-reviews'/(request['review_evidence_sha256']+'.json'),(self.f.store/'CONTROL_UPGRADE_REVIEW.json').read_bytes())
         digest=business.sha(guard.encoded(request));load=guard.source_module;identity=self.f.rt.identity;validate=self.f.rt.storage.validate_target
         owner=tuple(self.oldplan['private_owner'])
         def source(path,name,raw):return C if Path(path).name=='core-release-candidate.py' else load(path,name,raw)
@@ -198,8 +203,8 @@ class ManagedSuccessor(unittest.TestCase):
                 patch.object(guard,'source_module',side_effect=source),patch.object(self.f.rt,'identity',side_effect=local_identity),
                 patch.object(self.f.rt.storage,'validate_target',side_effect=local_validate),
                 patch.object(C,'packaged_verifier',return_value=SimpleNamespace(verify=lambda _:report))):stack.enter_context(context)
-            result=upgrade.prepare_core_followup(self.f.rt,request,digest,self.bundle,managed_successor=True)
-        self.plan=json.loads(Path(result['path']).read_bytes());self.new=self.f.rt.read(self.bundle/'POLICY.next.json')
+            result=upgrade.prepare_core_followup(self.f.rt,request,digest,self.bundle,managed_successor=not publication,publication=publication)
+        self.plan=json.loads(Path(result['path']).read_bytes());self.new=self.f.rt.read(upgrade.source(self.bundle,'policy',self.plan))
         self.assertFalse(result['approved']);self.assertEqual(self.snapshot(),self.original_snapshot)
         return result
 
