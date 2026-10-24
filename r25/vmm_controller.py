@@ -343,9 +343,9 @@ def load_plan(rt, ident, recover=False):
     return plan,folder
 
 
-def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=None,revision=None):
+def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=None,revision=None, history=None):
     overrides=role_history(rt,plan,sha(encoded(plan))) if role_overrides else None
-    if overrides:read(rt.root/'runtime/config/vmm-service.json',rt.private,expected=overrides['service'])
+    if overrides:proof_read(history,rt.root/'runtime/config/vmm-service.json',rt.private,expected=overrides['service'])
     for name,(path,owner,permissions) in rt.targets().items():
         e=plan['files'][name]
         mapping={'vmm_controller.py':('files','vmm_controller.py'),'publisher-guard':('files','core_release_guard.py'),
@@ -355,19 +355,19 @@ def verify_files(rt,plan,mode,*,role_overrides=False,runtime=False,successor=Non
         if revision is not None and name in revision['files']:e=revision['files'][name]
         if runtime and name=='handoff':
             folder=rt.store/'transactions'/sha(encoded(plan))
-            expected=read(folder/'after/handoff',rt.private,expected=plan['files'][name]['after_sha256'])
+            expected=proof_read(history,folder/'after/handoff',rt.private,expected=plan['files'][name]['after_sha256'])
             if overrides:
-                marker=json_read(rt.store/'ROLE_ACTIVE.json',rt.private)
-                expected=read(role_transaction(rt,marker['approval_sha256'])/'handoff.after',rt.private,expected=overrides['handoff'])
+                marker=proof_json(history,rt.store/'ROLE_ACTIVE.json',rt.private)
+                expected=proof_read(history,role_transaction(rt,marker['approval_sha256'])/'handoff.after',rt.private,expected=overrides['handoff'])
             wanted=control_handoff_values(expected)
             if successor is not None:
                 wanted.update(R25_CORE_RELEASE_GUARD_SHA256=successor['operational']['guard']['after_sha256'],
                               R25_VMM_CONTROLLER_SHA256=successor['files']['vmm_controller.py']['after_sha256'])
             if revision is not None:
                 wanted.update(revision['handoff_controls'])
-            must(control_handoff_values(read(path,owner,permissions))==wanted,'runtime_handoff_control_drift')
+            must(control_handoff_values(proof_read(history,path,owner,permissions))==wanted,'runtime_handoff_control_drift')
             continue
-        current=sha(read(path,owner,permissions)) if path.exists() else None
+        current=sha(proof_read(history,path,owner,permissions)) if path.exists() else None
         effective_mode='after' if successor is not None and name not in mapping else mode
         allowed={overrides[name] if overrides and name in overrides and not (successor is not None and name=='handoff') and not (revision is not None and name in revision['files']) else e['after_sha256']} if effective_mode=='after' else {e['before_sha256']} if effective_mode=='before' else set(e.values())
         must(current in allowed,'target_drift:'+name)
@@ -554,7 +554,7 @@ def require_core_successor_stopped(rt):
          state.get('process')is None and gate.get('mode')=='CLOSED','core_successor_disabled_stopped_closed')
 
 
-def verify_core_successor(rt,plan,phase='before',*,runtime=False,revision=None):
+def verify_core_successor(rt,plan,phase='before',*,runtime=False,revision=None, history=None):
     """Validate original overlay plus a new immutable Core binding proof.
 
     Runtime checks intentionally leave legitimate application transactions and
@@ -578,48 +578,48 @@ def verify_core_successor(rt,plan,phase='before',*,runtime=False,revision=None):
     for name,path in core_successor_paths(rt).items():
         if runtime and name in {'lifecycle-state','gate'}:continue
         expected=(revision['files']['role']['after_sha256'] if revision is not None and name=='role' else binding['preserved'][name])
-        read(path,rt.private,expected=expected)
+        proof_read(history,path,rt.private,expected=expected)
     if not runtime:require_core_successor_stopped(rt)
     before=plan['operational']['policy']['before_sha256'];after=plan['operational']['policy']['after_sha256']
     must(base['preserved']['policy']==before and base['preserved']['original-controller-active']==binding['control_active_sha256'],
          'core_successor_original_context')
-    policy=read(rt.preserved()['policy'],rt.private)
+    policy=proof_read(history,rt.preserved()['policy'],rt.private)
     must(sha(policy) in ({before} if phase=='before' else {after} if phase=='after' else {before,after}),
          'core_successor_policy_state')
     corestore=rt.root/'runtime/core-publications';ident=sha(encoded(plan));folder=corestore/'controller-upgrades'/ident
-    active=read(rt.preserved()['original-controller-active'],rt.private)
+    active=proof_read(history,rt.preserved()['original-controller-active'],rt.private)
     newactive={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident}
     if sha(active)==binding['control_active_sha256']:
         must(phase!='after','core_successor_controller_active_drift');original=active
     else:
-        must(phase!='before' and json_read(rt.preserved()['original-controller-active'],rt.private,sha(active))==newactive,'core_successor_controller_active_drift')
-        original=read(folder/'before/CONTROL_UPGRADE_ACTIVE.json',rt.private,expected=binding['control_active_sha256'])
+        must(phase!='before' and proof_json(history,rt.preserved()['original-controller-active'],rt.private,sha(active))==newactive,'core_successor_controller_active_drift')
+        original=proof_read(history,folder/'before/CONTROL_UPGRADE_ACTIVE.json',rt.private,expected=binding['control_active_sha256'])
     prior=json.loads(original);priorid=digest(prior.get('approval_sha256'))
     must(prior=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':priorid},'core_successor_original_controller_active')
     oldfolder=corestore/'controller-upgrades'/priorid
-    oldplan=json_read(oldfolder/'approval.json',rt.private,priorid);oldjournal=json_read(oldfolder/'journal.json',rt.private)
+    oldplan=proof_json(history,oldfolder/'approval.json',rt.private,priorid);oldjournal=proof_json(history,oldfolder/'journal.json',rt.private)
     must(oldplan.get('schema')=='R25_MANAGED_VMM_CORE_FOLLOWUP_BINDING_V1' and
          oldplan.get('operational',{}).get('policy',{}).get('after_sha256')==before and
          oldjournal.get('phase')=='INSTALLED' and oldjournal.get('approval_sha256')==priorid,
          'core_successor_original_controller_proof')
-    verify_files(rt,base,phase,role_overrides=True,runtime=runtime,successor=plan,revision=revision)
+    verify_files(rt,base,phase,role_overrides=True,runtime=runtime,successor=plan,revision=revision,history=history)
     return base
 
 
-def applied_core_successor(rt,value,handoff,*,revision=None):
-    marker=json_read(rt.store/'CORE_SUCCESSOR_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+def applied_core_successor(rt,value,handoff,*,revision=None, history=None):
+    marker=proof_json(history,rt.store/'CORE_SUCCESSOR_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
     must(marker=={'schema':CORE_SUCCESSOR_ACTIVE_SCHEMA,'approval_sha256':ident},'core_successor_marker')
     folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
-    plan=json_read(folder/'approval.json',rt.private,ident)
-    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
-    record=json_read(folder/'journal.json',rt.private)
+    plan=proof_json(history,folder/'approval.json',rt.private,ident)
+    proof_json(history,folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    record=proof_json(history,folder/'journal.json',rt.private)
     must(record.get('schema')==CORE_SUCCESSOR_SCHEMA and record.get('approval_sha256')==ident and
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'core_successor_not_installed')
-    must(json_read(rt.preserved()['original-controller-active'],rt.private)==
+    must(proof_json(history,rt.preserved()['original-controller-active'],rt.private)==
          {'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident},'core_successor_controller_pointer')
-    base=verify_core_successor(rt,plan,'after',runtime=True,revision=revision)
-    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value,'core_successor_policy_argument')
-    must(handoff==env_values(read(rt.targets()['handoff'][0],rt.private)),'core_successor_handoff_argument')
+    base=verify_core_successor(rt,plan,'after',runtime=True,revision=revision,history=history)
+    must(proof_json(history,rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value,'core_successor_policy_argument')
+    must(handoff==env_values(proof_read(history,rt.targets()['handoff'][0],rt.private)),'core_successor_handoff_argument')
     must(value.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1' and
          value['controllers']['lifecycle_adapter.py']==base['files']['lifecycle']['before_sha256'] and
          value['controllers']['core_release_guard.py']==plan['operational']['guard']['after_sha256'] and
@@ -635,6 +635,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'CORE_PUBLICATION_ACTIVE.json').exists():return applied_core_publication(rt,value,handoff)
     if (rt.store/'MODULE_REVISION_ACTIVE.json').exists():return applied_module_revision(rt,value,handoff)
     if (rt.store/'CORE_SUCCESSOR_ACTIVE.json').exists():return applied_core_successor(rt,value,handoff)
     active=json_read(rt.store/'ACTIVE.json',rt.private);ident=digest(active.get('approval_sha256'))
@@ -920,11 +921,11 @@ def revision_preserved(rt):
             'lifecycle-adapter': rt.targets()['lifecycle'][0]}
 
 
-def revision_preserved_read(rt,name,path,expected=None):
+def revision_preserved_read(rt,name,path,expected=None, history=None):
     if name=='lifecycle-adapter':
         _,owner,mode=rt.targets()['lifecycle']
-        return read(path,owner,mode,expected)
-    return read(path,rt.private,expected=expected)
+        return proof_read(history,path,owner,mode,expected)
+    return proof_read(history,path,rt.private,expected=expected)
 
 
 def revision_bundles(rt, extension, controller):
@@ -1003,14 +1004,14 @@ def revision_base(rt, expected=None):
     return ident
 
 
-def revision_render(rt, before, sources):
+def revision_render(rt, before, sources, history=None):
     # Only these module identities may change. Endpoint, token, model policy,
     # service binding, original lifecycle adapter and guards stay byte-identical.
     for name in ('publisher-guard','operation-guard'):
         path,owner,mode=rt.targets()[name]
-        must(read(path,owner,mode)==sources['core_release_guard.py'],'revision_guard_must_be_unchanged')
-    role=json.loads(before['role']);service=json_read(rt.root/'runtime/config/vmm-service.json',rt.private)
-    validate_role_documents(rt,role,service,sha(read(rt.root/'runtime/config/vmm-service.json',rt.private)),sha(before['vmm_service.py']))
+        must(proof_read(history,path,owner,mode)==sources['core_release_guard.py'],'revision_guard_must_be_unchanged')
+    role=json.loads(before['role']);service=proof_json(history,rt.root/'runtime/config/vmm-service.json',rt.private)
+    validate_role_documents(rt,role,service,sha(proof_read(history,rt.root/'runtime/config/vmm-service.json',rt.private)),sha(before['vmm_service.py']))
     role['service_script_sha256']=sha(sources['vmm_service.py'])
     after={name:sources[name] for name in REVISION_NAMES[:3]};after['role']=encoded(role)
     updates={'R25_VMM_CONTROLLER_SHA256':sha(after['vmm_controller.py']),
@@ -1073,7 +1074,7 @@ def revision_require_marker(rt,expected):
     must(json_read(path,rt.private)==expected if expected is not None else not path.exists(),'revision_active_preimage')
 
 
-def revision_chain(rt,plan,folder,seen=None):
+def revision_chain(rt,plan,folder,seen=None, history=None):
     """Archived proofs remain immutable. Only the newest files are live.
 
     An older committed recovery cannot roll a newer consumer back. Each edge
@@ -1081,20 +1082,20 @@ def revision_chain(rt,plan,folder,seen=None):
     """
     seen=set() if seen is None else set(seen);ident=sha(encoded(plan))
     must(ident not in seen and len(seen)<32,'revision_chain_cycle_or_limit');seen.add(ident)
-    revision_material(rt,plan,folder)
+    revision_material(rt,plan,folder,history=history)
     if 'previous_revision' not in plan:return
     previous=plan['previous_revision'];pid=previous['approval_sha256'];pf=revision_transaction(rt,pid)
-    for name,want in previous['proof_hashes'].items():read(pf/name,rt.private,expected=want)
+    for name,want in previous['proof_hashes'].items():proof_read(history,pf/name,rt.private,expected=want)
     parent,_=revision_load(rt,pid,recovering=True)
     must(revision_marker(parent)==previous['marker'] and revision_journal(rt,pf,pid)=='INSTALLED', 'revision_parent_not_installed')
     must(parent['core_successor_approval_sha256']==plan['core_successor_approval_sha256'],'revision_parent_core_binding')
     for name in REVISION_NAMES:
-        before=read(folder/'before'/name,rt.private,expected=plan['files'][name]['before_sha256'])
-        after=read(pf/'after'/name,rt.private,expected=parent['files'][name]['after_sha256'])
+        before=proof_read(history,folder/'before'/name,rt.private,expected=plan['files'][name]['before_sha256'])
+        after=proof_read(history,pf/'after'/name,rt.private,expected=parent['files'][name]['after_sha256'])
         # A later reviewed Web selection may update unrelated handoff fields.
         must(control_handoff_values(before)==control_handoff_values(after) if name=='handoff' else before==after,
              'revision_parent_preimage:'+name)
-    revision_chain(rt,parent,pf,seen)
+    revision_chain(rt,parent,pf,seen,history=history)
 
 
 def revision_verify_predecessor(rt,plan):
@@ -1108,28 +1109,28 @@ def revision_verify_predecessor(rt,plan):
         applied_core_successor(rt,json_read(rt.preserved()['policy'],rt.private),env_values(read(rt.targets()['handoff'][0],rt.private)))
 
 
-def revision_check_files(rt,plan,phase,*,runtime=False):
+def revision_check_files(rt,plan,phase,*,runtime=False, history=None):
     for name,(path,owner,mode) in revision_targets(rt).items():
         if runtime and name=='handoff':
             # Legitimate later Web selection may change unrelated handoff keys.
-            actual=control_handoff_values(read(path,owner,mode))
+            actual=control_handoff_values(proof_read(history,path,owner,mode))
             folder=revision_transaction(rt,sha(encoded(plan)))
-            wanted=control_handoff_values(read(folder/'after/handoff',rt.private,expected=plan['files']['handoff']['after_sha256']))
+            wanted=control_handoff_values(proof_read(history,folder/'after/handoff',rt.private,expected=plan['files']['handoff']['after_sha256']))
             must(actual==wanted,'revision_runtime_handoff');continue
-        current=sha(read(path,owner,mode));entry=plan['files'][name]
+        current=sha(proof_read(history,path,owner,mode));entry=plan['files'][name]
         must(current in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'revision_target_drift:'+name)
     for name,path in revision_preserved(rt).items():
         if runtime and name not in {'policy','original-controller-active','overlay-active','role-active','service','token','core-successor-active','lifecycle-adapter'}:continue
-        revision_preserved_read(rt,name,path,plan['preserved'][name])
+        revision_preserved_read(rt,name,path,plan['preserved'][name],history=history)
 
 
-def revision_material(rt,plan,folder):
+def revision_material(rt,plan,folder, history=None):
     _,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
-    before={name:read(folder/'before'/name,rt.private,expected=plan['files'][name]['before_sha256']) for name in REVISION_NAMES}
-    after,updates=revision_render(rt,before,sources)
+    before={name:proof_read(history,folder/'before'/name,rt.private,expected=plan['files'][name]['before_sha256']) for name in REVISION_NAMES}
+    after,updates=revision_render(rt,before,sources,history=history)
     must(updates==plan['handoff_controls'] and all(sha(after[name])==plan['files'][name]['after_sha256'] for name in REVISION_NAMES),
          'revision_render_mismatch')
-    for name,raw in after.items():must(read(folder/'after'/name,rt.private)==raw,'revision_after_snapshot')
+    for name,raw in after.items():must(proof_read(history,folder/'after'/name,rt.private)==raw,'revision_after_snapshot')
     return before,after
 
 
@@ -1142,6 +1143,7 @@ def revision_journal(rt,folder,ident):
 
 
 def prepare_module_revision(rt,request_sha,*,successor=False):
+    must(not (rt.store/'CORE_PUBLICATION_ACTIVE.json').exists(),'publication_requires_new_reviewed_transition')
     inputs=rt.store/'module-successor-inputs'/digest(request_sha) if successor else rt.store
     request=json_read(inputs/('request.json' if successor else 'MODULE_REQUEST.json'),rt.private,request_sha)
     must(set(request)=={'schema','deploy','controller_deploy','review_evidence_sha256'}
@@ -1262,13 +1264,13 @@ def bind_module_revision(rt,ident,*,fault=None):
     return {'outcome':'MODULE_INSTALLED_DISABLED','approval_sha256':ident}
 
 
-def applied_module_revision(rt,value,handoff):
-    marker=json_read(rt.store/'MODULE_REVISION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+def applied_module_revision(rt,value,handoff, history=None):
+    marker=proof_json(history,rt.store/'MODULE_REVISION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
     plan,folder=revision_load(rt,ident,recovering=True)
     must(marker==revision_marker(plan),'revision_marker')
     must(revision_journal(rt,folder,ident) in {'VERIFY_INTENT','INSTALLED'},'revision_not_installed')
-    revision_chain(rt,plan,folder);revision_check_files(rt,plan,'after',runtime=True)
-    return applied_core_successor(rt,value,handoff,revision=plan)
+    revision_chain(rt,plan,folder,history=history);revision_check_files(rt,plan,'after',runtime=True,history=history)
+    return applied_core_successor(rt,value,handoff,revision=plan,history=history)
 
 
 def recover_module_revision(rt,ident):
@@ -1311,6 +1313,184 @@ def recover_module_revision(rt,ident):
         revision_verify_predecessor(rt,plan)
         rt.write_state(folder/'journal.json',{'schema':plan['schema'],'approval_sha256':ident,'phase':'RESTORED'})
     rt.supervise('start');return {'outcome':'MODULE_RESTORED','approval_sha256':ident}
+
+
+# One finite transition from the installed Core successor + V2 module chain.
+# No CLI/root override, no alternate ledger, and no rewrite of parent proofs.
+CORE_PUBLICATION_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_BINDING_V1'
+CORE_PUBLICATION_ACTIVE_SCHEMA = 'R25_VMM_CORE_PUBLICATION_ACTIVE_V1'
+PUBLICATION_FILES = ('assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py',
+    'assistant_acceptance.py','assistant_backup.py','upgrade_assistant_controller.py','core_business.py',
+    'core_runtime.py','core_release_guard.py','core_publish.py','publisher_transaction.py','r25_storage.py',
+    'ai_publish.py','ai_release_candidate.py','ai_release_guard.py','ai_runtime.py','core_acceptance.py',
+    'vmm_controller.py','vmm_lifecycle.py','vmm_service.py')
+
+
+def proof_read(history,path,owner=(0,0),mode=0o600,expected=None):
+    """Read a retained preimage only inside a separately verified new proof.
+
+    The map is built from fixed targets, never from paths in an approval. Live
+    after-images are checked separately. Archived files always use private 0600
+    metadata, even when the original operational script was 0700.
+    """
+    if history is not None and Path(path) in history:
+        saved,private,want=history[Path(path)]
+        raw=read(saved,private,expected=want)
+        must(expected is None or sha(raw)==digest(expected),'publication_preimage_digest')
+        return raw
+    return read(path,owner,mode,expected)
+
+
+def proof_json(history,path,owner=(0,0),expected=None):
+    # Use the same strict duplicate-key contract as json_read.
+    def pairs(items):
+        result={}
+        for key,value in items:
+            must(key not in result,'json_duplicate_key');result[key]=value
+        return result
+    return json.loads(proof_read(history,path,owner,expected=expected),object_pairs_hook=pairs)
+
+
+def publication_targets(rt):
+    p=rt.root/'operations/r25-publisher'
+    paths={n:(p/n,rt.private,0o600) for n in PUBLICATION_FILES}
+    paths.update(policy=(rt.root/'runtime/core-publications/POLICY.json',rt.private,0o600),
+        handoff=rt.targets()['handoff'],guard=rt.targets()['operation-guard'],role=rt.targets()['role'],
+        lifecycle=rt.targets()['lifecycle'],
+        **{'critic-wrapper':(rt.root/'operations/r25-private-critic-env-policy-v2.py',rt.scripts,0o700),
+           'ai-policy':(rt.root/'runtime/ai-publications/POLICY.json',rt.private,0o600),
+           'ai-guard':(rt.root/'operations/ai_release_guard.py',rt.scripts,0o700)})
+    return paths
+
+
+def publication_preserved(rt):
+    return {k:p for k,p in revision_preserved(rt).items() if k not in {'policy','original-controller-active'}} | {
+        'module-active':rt.store/'MODULE_REVISION_ACTIVE.json'}
+
+
+def capture_core_publication(rt,deploy):
+    must(not (rt.store/'CORE_PUBLICATION_ACTIVE.json').exists() and not (rt.store/'CORE_PUBLICATION_ACTIVE.json').is_symlink(),'publication_already_bound')
+    revision_stopped(rt);revision_apps_committed(rt)
+    policy=json_read(rt.preserved()['policy'],rt.private)
+    must(policy.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1',
+         'publication_requires_core_successor')
+    marker=json_read(rt.store/'MODULE_REVISION_ACTIVE.json',rt.private)
+    must(marker.get('schema')==MODULE_SUCCESSOR_SCHEMA,'publication_requires_module_v2')
+    ident=digest(marker.get('approval_sha256'));parent,folder=revision_load(rt,ident,recovering=True)
+    must(revision_journal(rt,folder,ident)=='INSTALLED','publication_parent_incomplete')
+    applied_module_revision(rt,policy,env_values(read(rt.targets()['handoff'][0],rt.private)))
+    cid=revision_base(rt);core=rt.root/'runtime/core-publications/controller-upgrades'/cid
+    return {'deploy':deploy,'previous_revision':{'marker':marker,
+            'proof_hashes':{n:sha(read(folder/n,rt.private)) for n in revision_proof_names()}},
+        'core_successor_approval_sha256':cid,'core_successor_journal_sha256':sha(read(core/'journal.json',rt.private)),
+        'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private)),
+        'preserved':{n:sha(revision_preserved_read(rt,n,p)) for n,p in publication_preserved(rt).items()}}
+
+
+def publication_history(rt,plan,phase):
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/sha(encoded(plan))
+    entries={**plan['files'],**plan['operational']};history={}
+    for name,(path,owner,mode) in publication_targets(rt).items():
+        saved=folder/'before'/name
+        if saved.exists():
+            read(saved,rt.private,expected=entries[name]['before_sha256'])
+            history[path]=(saved,rt.private,entries[name]['before_sha256'])
+        else:
+            must(phase=='before','publication_missing_before_snapshot')
+            read(path,owner,mode,entries[name]['before_sha256'])
+    active=rt.preserved()['original-controller-active'];saved=folder/'before/CONTROL_UPGRADE_ACTIVE.json'
+    if saved.exists():history[active]=(saved,rt.private,plan['vmm']['control_active_sha256'])
+    else:
+        must(phase=='before','publication_missing_active_snapshot')
+        read(active,rt.private,expected=plan['vmm']['control_active_sha256'])
+    return history
+
+
+def verify_core_publication(rt,plan,phase='before',*,runtime=False):
+    must(plan.get('schema')==CORE_PUBLICATION_SCHEMA and phase in {'before','mixed','after'},'publication_schema')
+    must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'publication_owner')
+    entries={**plan['files'],**plan['operational']}
+    must(set(plan['files'])==set(PUBLICATION_FILES) and set(entries)==set(publication_targets(rt)), 'publication_inventory')
+    binding=plan['vmm']
+    must(set(binding)=={'deploy','previous_revision','core_successor_approval_sha256','core_successor_journal_sha256',
+         'control_active_sha256','preserved'} and set(binding['preserved'])==set(publication_preserved(rt)), 'publication_binding_fields')
+    previous=binding['previous_revision']
+    must(set(previous)=={'marker','proof_hashes'} and set(previous['proof_hashes'])==set(revision_proof_names()),'publication_parent_fields')
+    marker=previous['marker'];ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':MODULE_SUCCESSOR_SCHEMA,'approval_sha256':ident},'publication_requires_module_v2')
+    revision_require_marker(rt,marker)
+    parent,pf=revision_load(rt,ident,recovering=True)
+    must(revision_journal(rt,pf,ident)=='INSTALLED','publication_parent_incomplete')
+    for name,want in previous['proof_hashes'].items():read(pf/name,rt.private,expected=want)
+    cid=revision_base(rt,binding['core_successor_approval_sha256'])
+    must(parent['core_successor_approval_sha256']==cid,'publication_parent_core')
+    core=rt.root/'runtime/core-publications/controller-upgrades'/cid
+    read(core/'journal.json',rt.private,expected=binding['core_successor_journal_sha256'])
+    _,sources=revision_bundles(rt,binding['deploy'],plan['deploy'])
+    must(all(entries[n]['after_sha256']==sha(sources[n]) for n in MODULES),'publication_module_sources')
+    for name in PUBLICATION_FILES:
+        if name not in MODULES:
+            read(rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/name,rt.private,expected=entries[name]['after_sha256'])
+    for name in ('critic-wrapper','lifecycle','ai-policy','ai-guard'):
+        must(entries[name]['before_sha256']==entries[name]['after_sha256'],'publication_unrelated_control')
+    must(entries['guard']['after_sha256']==entries['core_release_guard.py']['after_sha256'],'publication_same_guard')
+    # Lifecycle and all policy settings stay unchanged; only the managed service
+    # protocol, controller proof loader and approved Core control binding change.
+    must(entries['vmm_lifecycle.py']['before_sha256']==entries['vmm_lifecycle.py']['after_sha256'],'publication_lifecycle_unchanged')
+    history=publication_history(rt,plan,phase)
+    oldpolicy=proof_json(history,rt.preserved()['policy'],rt.private,entries['policy']['before_sha256'])
+    oldhand=proof_read(history,rt.targets()['handoff'][0],rt.private,expected=entries['handoff']['before_sha256'])
+    must(oldpolicy.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_MANAGED_VMM_CORE_SUCCESSOR_V1','publication_requires_core_successor')
+    # Existing complete consumer proof path, against the immutable exact preimage.
+    applied_module_revision(rt,oldpolicy,env_values(oldhand),history=history)
+    oldrole=proof_json(history,rt.targets()['role'][0],rt.private,entries['role']['before_sha256'])
+    role=dict(oldrole,service_script_sha256=entries['vmm_service.py']['after_sha256'])
+    must(sha(encoded(role))==entries['role']['after_sha256'] and role['enabled'] is False,'publication_role_render')
+    updates={'R25_CORE_RELEASE_POLICY_SHA256':entries['policy']['after_sha256'],
+        'R25_CORE_RELEASE_GUARD_SHA256':entries['guard']['after_sha256'],
+        'R25_VMM_CONTROLLER_SHA256':entries['vmm_controller.py']['after_sha256'],
+        'R25_VMM_LIFECYCLE_SHA256':entries['vmm_lifecycle.py']['after_sha256'],
+        'R25_VMM_SERVICE_SHA256':entries['vmm_service.py']['after_sha256'],'R25_VMM_ROLE_SHA256':entries['role']['after_sha256']}
+    afterhand=oldhand;values=env_values(oldhand)
+    for key,want in updates.items():
+        line=(key+'='+values[key]+'\n').encode();must(afterhand.count(line)==1,'publication_handoff_line')
+        afterhand=afterhand.replace(line,(key+'='+want+'\n').encode())
+    must(sha(afterhand)==entries['handoff']['after_sha256'],'publication_handoff_render')
+    for name,(path,owner,mode) in publication_targets(rt).items():
+        raw=read(path,owner,mode);entry=entries[name]
+        if runtime and name=='handoff':
+            current=env_values(raw);wanted=env_values(afterhand)
+            keys=set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}
+            must(all(current.get(k)==wanted[k] for k in keys),'publication_runtime_handoff')
+        else:must(sha(raw) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'publication_target_drift:'+name)
+    for name,path in publication_preserved(rt).items():
+        if runtime and name not in {'overlay-active','role-active','service','token','core-successor-active','lifecycle-adapter','module-active'}:continue
+        revision_preserved_read(rt,name,path,binding['preserved'][name])
+    current=read(rt.preserved()['original-controller-active'],rt.private)
+    newactive=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
+    must(sha(current) in ({binding['control_active_sha256']} if phase=='before' else {sha(newactive)} if phase=='after' else {binding['control_active_sha256'],sha(newactive)}),'publication_controller_pointer')
+    if not runtime:revision_stopped(rt)
+    return oldpolicy
+
+
+def applied_core_publication(rt,value,handoff):
+    marker=json_read(rt.store/'CORE_PUBLICATION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':CORE_PUBLICATION_ACTIVE_SCHEMA,'approval_sha256':ident},'publication_marker')
+    read(rt.store/'CORE_PUBLICATION_ACTIVE.json',rt.private,expected=sha(encoded(marker)))
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident);record=json_read(folder/'journal.json',rt.private)
+    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    must(record.get('schema')==CORE_PUBLICATION_SCHEMA and record.get('approval_sha256')==ident and
+         record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'publication_incomplete')
+    old=verify_core_publication(rt,plan,'after',runtime=True)
+    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+         env_values(read(rt.targets()['handoff'][0],rt.private))==handoff,'publication_arguments')
+    must(value['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_V1' and
+         value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'],
+         'publication_policy_binding')
+    result=copy.deepcopy(value)
+    result['controllers']['lifecycle_adapter.py']=sha(read(rt.targets()['lifecycle'][0],rt.scripts,0o700))
+    return result
 
 
 def main():
