@@ -280,10 +280,32 @@ def request_identity(environ, body):
     must((match.group(1) == 'png' and raw.startswith(b'\x89PNG\r\n\x1a\n'))
          or (match.group(1) == 'jpeg' and raw.startswith(b'\xff\xd8\xff')), 'IMAGE_MIME_MISMATCH', 400)
     result = {'image_sha256': hashlib.sha256(raw).hexdigest(), 'duration': duration(body.get('duration', 10))}
-    for name in ('owner_id', 'source_painting_id', 'creation_id', 'step_id', 'retry_version'):
+    for name in ('owner_id', 'creation_id', 'step_id', 'retry_version'):
         value = environ.get('HTTP_X_ARTLIVE_VMM_' + name.upper(), '')
         must(isinstance(value, str) and 0 < len(value) <= 128 and '\n' not in value, 'CONTEXT_REQUIRED', 400)
         result[name] = value
+    # Authenticated Core derives this namespace from its resolved database source.
+    # Old Core's catalog-only header remains valid; an upload always needs an
+    # explicit kind and its own real asset ID. Never synthesize a painting ID.
+    prefix = 'HTTP_X_ARTLIVE_VMM_'
+    kind = environ.get(prefix + 'SOURCE_KIND')
+    painting = environ.get(prefix + 'SOURCE_PAINTING_ID')
+    asset = environ.get(prefix + 'SOURCE_ASSET_ID')
+    if kind is None:
+        must(asset is None, 'SOURCE_KIND_REQUIRED', 400)
+        kind = 'CATALOG_PAINTING'
+    must(kind in ('CATALOG_PAINTING', 'OWNED_UPLOAD'), 'SOURCE_KIND_INVALID', 400)
+    if kind == 'CATALOG_PAINTING':
+        must(asset is None, 'SOURCE_IDENTITY_AMBIGUOUS', 400)
+        must(isinstance(painting, str) and 0 < len(painting) <= 128
+             and not any(ord(c) < 32 for c in painting), 'SOURCE_PAINTING_REQUIRED', 400)
+        result['source_painting_id'] = painting
+    else:
+        must(painting is None, 'SOURCE_IDENTITY_AMBIGUOUS', 400)
+        must(isinstance(asset, str) and re.fullmatch('[1-9][0-9]{0,18}', asset) is not None,
+             'SOURCE_ASSET_REQUIRED', 400)
+        result['source_asset_id'] = asset
+    result['source_kind'] = kind
     return result
 
 
@@ -318,6 +340,7 @@ class ManagedService:
         state = self.store.snapshot()
         ready = self.ready() is True
         return dict(state, contract=CONTRACT, process_alive=True, model_ready=ready,
+                    source_kinds=['CATALOG_PAINTING', 'OWNED_UPLOAD'],
                     dispatch_permitted=ready and state['mode'] != 'CLOSED' and not state['in_flight'] and not state['uncertain'])
 
     def __call__(self, environ, start_response):
