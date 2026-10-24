@@ -1,0 +1,13 @@
+# Managed VMM owned-upload source identity
+
+Authenticated Core may supply `X-ArtLIVE-VMM-Source-Kind: OWNED_UPLOAD` with `X-ArtLIVE-VMM-Source-Asset-Id` (positive internal media row ID) and no Source-Painting-Id. Catalog requests use `CATALOG_PAINTING` and only their real Source-Painting-Id. Legacy catalog-only Core requests remain supported without Source-Kind; absence never implies upload. Mixed, missing or unrecognized source identity is rejected before ledger consumption or backend entry.
+
+Core is responsible for authenticated ownership, ACTIVE/PRIVATE/IMAGE/PAINTING/USER_UPLOAD metadata and exact image integrity. The managed wrapper authenticates Core, hashes the actual decoded bytes, stores the discriminated identity and existing owner/creation/step/retry metadata durably before dispatch, strips all internal headers before calling the legacy model, and preserves existing request-ID replay/UNKNOWN/concurrency protections. Existing ACCEPTANCE permits remain catalog-only. Duration stays integer 3–30 seconds. OPEN eligibility, lifecycle, deadlines and operation-consumption protocol are unchanged.
+
+`/internal/vmm/status` adds `source_kinds: ["CATALOG_PAINTING", "OWNED_UPLOAD"]`. New Core refuses an upload against an old wrapper that omits upload support. Existing Core and operating tools ignore this additional status field.
+
+CPU coverage: `r25/test_vmm_service.py` runs actual HTTP requests against ManagedService, including upload consumption, namespace confusion, legacy acceptance isolation, restart/replay and UNKNOWN. `tests/fixtures/managed_vmm_cpu_server.py` provides the same wrapper with an explicitly synthetic WAV backend for the Core interoperability test. It imports no model and binds loopback only; it is not shipped as a production entry point.
+
+Production requires normal source review, same-repository main→release promotion and verified package-only controller/extension artifacts. Use the reviewed module transaction for service/role/handoff identities, not an in-place file copy. Core and Web must also be released. Model/AI/database changes are not required. Preserve completed catalog repair, original locks, all receipts/consumption/UNKNOWN, and disable/STOP/CLOSE throughout deployment.
+
+**Publication preparation gap:** the current installed Core is already `R25_MANAGED_VMM_CORE_SUCCESSOR_V1`; the finite prior Core successor binder refuses it, and module revisions freeze the Core policy identities. A reviewed extension for this exact current predecessor is required before preparing an executable Core publication approval. This PR does not relax that refusal or implement that extension. A module-only update cannot stand in for Core publication. Do not repeat the old installation or approvals.

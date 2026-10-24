@@ -87,6 +87,7 @@ class ServiceTest(unittest.TestCase):
                   'X-ArtLIVE-VMM-Creation-ID': 'creation-a', 'X-ArtLIVE-VMM-Step-ID': 'step1',
                   'X-ArtLIVE-VMM-Retry-Version': '0'}
         values.update(headers or {})
+        values = {k: v for k, v in values.items() if v is not None}
         data = None if path in ('/health', '/internal/vmm/status') else json.dumps(body or {'image': DATA, 'duration': 3}).encode()
         req = urllib.request.Request(self.url + path, data=data, headers=values)
         try:
@@ -95,6 +96,60 @@ class ServiceTest(unittest.TestCase):
             response = error
         with response:
             return response.status, json.loads(response.read())
+
+    def upload_headers(self):
+        return {'X-ArtLIVE-VMM-Source-Kind': 'OWNED_UPLOAD',
+                'X-ArtLIVE-VMM-Source-Asset-ID': '44',
+                'X-ArtLIVE-VMM-Source-Painting-ID': None}
+
+    def test_owned_upload_actual_http_boundary_persists_discriminated_identity_and_replay(self):
+        self.store.configure('OPEN')
+        self.assertIn('OWNED_UPLOAD', self.call('/internal/vmm/status')[1]['source_kinds'])
+        status, value = self.call(headers=self.upload_headers())
+        self.assertEqual(status, 200)
+        saved = self.store.read()['requests']['request-1']
+        self.assertEqual(saved['source_kind'], 'OWNED_UPLOAD')
+        self.assertEqual(saved['source_asset_id'], '44')
+        self.assertNotIn('source_painting_id', saved)
+        self.assertEqual(saved['image_sha256'], hashlib.sha256(IMAGE).hexdigest())
+        self.assertEqual(saved['state'], 'SUCCEEDED')
+        # Reusing the request ID with a different namespace cannot execute again.
+        self.assertEqual(self.call()[1]['code'], 'VMM_REQUEST_ALREADY_DISPATCHED')
+        self.assertEqual(self.count, 1)
+        recovered = vmm.GateStore(self.state)
+        recovered.on_start()
+        self.assertEqual(recovered.read()['requests']['request-1'], saved)
+        self.assertEqual(recovered.snapshot()['mode'], 'CLOSED')
+
+    def test_upload_is_not_covered_by_historical_catalog_acceptance(self):
+        self.store.configure('ACCEPTANCE', self.permit())
+        self.assertEqual(self.call(headers=self.upload_headers())[1]['code'], 'VMM_ACCEPTANCE_MISMATCH')
+        self.assertEqual(self.count, 0)
+        self.assertEqual(self.store.snapshot()['attempts'], 0)
+        self.assertEqual(self.call()[0], 200)
+        self.assertEqual(self.count, 1)
+
+    def test_source_namespace_missing_ambiguous_or_wrong_rejected_before_consumption(self):
+        self.store.configure('OPEN')
+        bad = [dict(self.upload_headers(), **{'X-ArtLIVE-VMM-Source-Kind': None}),
+               dict(self.upload_headers(), **{'X-ArtLIVE-VMM-Source-Kind': 'GENERATED'}),
+               dict(self.upload_headers(), **{'X-ArtLIVE-VMM-Source-Painting-ID': '44'}),
+               dict(self.upload_headers(), **{'X-ArtLIVE-VMM-Source-Asset-ID': ''}),
+               dict(self.upload_headers(), **{'X-ArtLIVE-VMM-Source-Asset-ID': '-1'}),
+               {'X-ArtLIVE-VMM-Source-Kind': 'CATALOG_PAINTING', 'X-ArtLIVE-VMM-Source-Asset-ID': '44'}]
+        for headers in bad:
+            with self.subTest(headers=headers):
+                self.assertEqual(self.call(headers=headers)[0], 400)
+        self.assertEqual(self.store.snapshot()['attempts'], 0)
+        self.assertEqual(self.count, 0)
+
+    def test_upload_unknown_is_durable_and_never_replayed(self):
+        self.store.configure('OPEN'); self.fail = True
+        self.assertEqual(self.call(headers=self.upload_headers())[0], 500)
+        self.assertEqual(self.store.read()['requests']['request-1']['state'], 'UNKNOWN')
+        self.assertEqual(self.store.snapshot()['mode'], 'CLOSED')
+        self.assertEqual(self.call(headers=self.upload_headers())[1]['code'], 'VMM_REQUEST_ALREADY_DISPATCHED')
+        self.assertEqual(self.count, 1)
 
     def test_closed_and_authentication_prevent_every_legacy_route(self):
         self.assertEqual(self.call(token='wrong')[0], 401)
