@@ -47,7 +47,11 @@ process.once('SIGTERM',()=>{server.close();setTimeout(()=>console.log('fixture_d
         config=json.dumps(dict(COMMUNITY_DATABASE_URL='postgres://fixture:fixture@127.0.0.1:5432/community_fixture',
             COMMUNITY_CORE_ORIGIN='http://127.0.0.1:39111',COMMUNITY_WEB_ORIGIN='https://fixture.invalid',COMMUNITY_PORT=str(self.port))).encode()
         (self.config/'env.json').write_bytes(config);(self.config/'env.json').chmod(0o600)
-        node=Path(shutil.which('node')).resolve()
+        # Tool-cache executables may be group-writable on hosted CI. Exercise
+        # the real private-runtime contract using an exact isolated byte copy;
+        # do not relax the production executable policy for the runner image.
+        node=self.base/'node'
+        shutil.copyfile(Path(shutil.which('node')).resolve(),node);node.chmod(0o700)
         import subprocess
         self.binding=dict(release_root=str(self.release),manifest_sha256=digest(raw),provenance=self.provenance,
             node=str(node),node_sha256=digest(node.read_bytes()),node_version=subprocess.check_output([str(node),'--version'],text=True).strip(),
@@ -105,6 +109,11 @@ process.once('SIGTERM',()=>{server.close();setTimeout(()=>console.log('fixture_d
         for operation in (lambda:self.role.start(uuid.uuid4().hex),self.role.observe,self.role.stop):
             with self.assertRaisesRegex(StorageRefused,'original_shared'):operation()
         self.assertEqual(list(self.root.iterdir()),[])
+
+    def test_owned_process_can_stop_when_health_endpoint_is_unavailable(self):
+        self.start()
+        with patch('community_lifecycle.http.client.HTTPConnection',side_effect=AssertionError('stop must not require HTTP health')):
+            self.assertEqual(self.role.stop(2),'STOPPED')
 
     def test_release_and_private_config_drift_refused(self):
         (self.release/'src/core.mjs').write_text('drift')

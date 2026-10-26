@@ -145,7 +145,7 @@ class Role:
         self.write(path,record)
         return record['phase']
 
-    def observe(self):
+    def observe(self, check_health=True):
         self.require_lease()
         path, record = self.current()
         if record is None: return 'NOT_STARTED'
@@ -170,6 +170,7 @@ class Role:
             except FileNotFoundError: continue
             if target.startswith('socket:['): owned.add(target[8:-1])
         must(inodes <= owned, 'community_listener_not_owned')
+        if not check_health: return record['phase']
         connection=http.client.HTTPConnection('127.0.0.1',self.binding['port'],timeout=2)
         try:
             connection.request('GET','/health'); response=connection.getresponse()
@@ -186,7 +187,9 @@ class Role:
     def stop(self, timeout=10):
         self.require_lease()
         must(type(timeout) in (int,float) and 0 <= timeout <= 30, 'community_stop_deadline')
-        status = self.observe()
+        # An unhealthy HTTP endpoint must not prevent draining an independently
+        # verified owned process. Shutdown relies on pid/port identity only.
+        status = self.observe(check_health=False)
         if status in ('NOT_STARTED','STOPPED','EXITED'): return status
         must(status != 'UNKNOWN', 'community_unknown_process_no_signal')
         path, record = self.current(); saved = record['process']
@@ -202,4 +205,4 @@ class Role:
             finally: os.close(fd)
         # No second signal for an uncertain prior STOP_INTENT; no SIGKILL,
         # automatic restart or database/operation history restoration.
-        return self.observe()
+        return self.observe(check_health=False)
