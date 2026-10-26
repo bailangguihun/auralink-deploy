@@ -29,6 +29,7 @@ LOCK = Path('/root/autodl-tmp/auralink-web-deploy/runtime/frontend-deployment.lo
 WEB_ORIGIN = LOCK.parent/'community-origin.json'
 SCHEMA = 'ARTLIVE_COMMUNITY_HOST_V1'
 PARENT_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_BINDING_V1'
+SUCCESSOR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_BINDING_V1'
 
 
 def sha(raw):
@@ -77,6 +78,7 @@ class InstalledLease:
     def __init__(self, guard, lock, expected, descriptor=None):
         self.guard, self.lock, self.expected = guard, Path(lock), expected
         self.fd = descriptor
+        self.inherited = descriptor is not None
 
     def require(self):
         must(type(self.fd) is int and self.fd >= 3, 'community_lease_required')
@@ -86,6 +88,12 @@ class InstalledLease:
 
     @contextmanager
     def held(self):
+        if self.inherited:
+            # Inherited original-watchdog descriptor, verified by the retained
+            # guard; never open a second descriptor or unlock the parent's lease.
+            self.require()
+            yield self
+            return
         must(self.fd is None, 'community_nested_lease')
         self.fd = os.open(self.lock, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
@@ -96,7 +104,7 @@ class InstalledLease:
             self.fd = None
 
 
-def production_lease(binding):
+def production_lease(binding, descriptor=None):
     path = ROOT/'operations/core_release_guard.py'
     match(path, binding['guard'])
     must(binding['lock']['path'] == str(LOCK), 'community_original_lock_only')
@@ -113,7 +121,7 @@ def production_lease(binding):
         del sys.modules['core_release_guard']
         raise
     must(hasattr(guard, 'verify_lease') and guard.lock == LOCK, 'community_installed_lease_contract')
-    return InstalledLease(guard, LOCK, binding['lock'])
+    return InstalledLease(guard, LOCK, binding['lock'], descriptor)
 
 
 class Host:
@@ -146,7 +154,7 @@ class Host:
         must(re.fullmatch('[a-f0-9]{40}', p['core_commit']) is not None, 'community_compatible_core')
         must(re.fullmatch('[a-f0-9]{64}', p['review_sha256']) is not None, 'community_review')
         must(re.fullmatch('[a-f0-9]{64}', p['controller_manifest_sha256']) is not None, 'community_controller_binding')
-        must(p['parent']['schema'] == PARENT_SCHEMA, 'community_unsupported_predecessor')
+        must(p['parent']['schema'] in (PARENT_SCHEMA,SUCCESSOR_SCHEMA), 'community_unsupported_predecessor')
         must(p['runtime']['python']['path'] == str(Path(os.sys.executable).resolve()), 'community_python_path')
         match(p['runtime']['python']['path'], p['runtime']['python']['identity'])
         must(hasattr(os,'pidfd_open') and hasattr(signal,'pidfd_send_signal'), 'community_pidfd_required')
@@ -159,6 +167,15 @@ class Host:
                 'runtime/core-publications/POLICY.json','runtime/core-publications/CONTROL_UPGRADE_ACTIVE.json',
                 'runtime/handoff-control.env','runtime/vmm-controller/CORE_PUBLICATION_ACTIVE.json',
                 'runtime/vmm/lifecycle.json','runtime/vmm/gate.json')]
+            parent_id=p['parent']['approval_identity']['sha256']
+            parent_root=ROOT/'runtime/core-publications/controller-upgrades'/parent_id
+            marker=ROOT/'runtime/vmm-controller'/('CORE_PUBLICATION_SUCCESSOR_ACTIVE.json' if p['parent']['schema']==SUCCESSOR_SCHEMA else 'CORE_PUBLICATION_ACTIVE.json')
+            must(p['parent']['approval_path']==str(parent_root/'approval.json') and
+                 p['parent']['journal_path']==str(parent_root/'journal.json') and
+                 strict_json(marker.read_bytes())['approval_sha256']==parent_id and
+                 strict_json((ROOT/'runtime/core-publications/CONTROL_UPGRADE_ACTIVE.json').read_bytes())['approval_sha256']==parent_id,
+                 'community_current_publication_parent')
+            required.append(marker)
             must(all(str(path) in p['preserved'] for path in required), 'community_preservation_inventory')
             current = strict_json((ROOT/'runtime/core-publications/CURRENT.json').read_bytes())
             must(current['release']['commit_sha'] == p['core_commit'], 'community_compatible_core_not_installed')
@@ -170,13 +187,15 @@ class Host:
         parent = p['parent']
         match(parent['approval_path'], parent['approval_identity'])
         approval = strict_json(Path(parent['approval_path']).read_bytes())
-        must(approval['schema'] == PARENT_SCHEMA, 'community_parent_schema')
+        must(approval['schema'] == parent['schema'], 'community_parent_schema')
         match(parent['journal_path'], parent['journal_identity'])
         must(strict_json(Path(parent['journal_path']).read_bytes())['phase'] == 'INSTALLED', 'community_parent_incomplete')
         must(p['service']['port'] == 19086 or self.root != ROOT/'runtime/community', 'community_production_port')
         must(p['service']['node_heap_mib'] == 256 and p['service']['log_limit_bytes'] == 8*1024*1024,
              'community_resource_policy')
-        must(p['service']['restart_budget'] == 0, 'community_no_automatic_restart')
+        must(type(p['service']['restart_budget']) is int and p['service']['restart_budget'] in (0,2), 'community_restart_budget')
+        if p['service']['restart_budget']:
+            must(parent['schema']==SUCCESSOR_SCHEMA,'community_watchdog_requires_successor')
         must(p['web_origin']['before_sha256'] is None, 'community_web_origin_initial_install_only')
         if self.root == ROOT/'runtime/community':must(p['web_origin']['path']==str(WEB_ORIGIN),'community_web_fixed_setting_path')
 

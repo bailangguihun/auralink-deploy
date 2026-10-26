@@ -3,8 +3,8 @@
 This library is not installed or registered with the production watchdog.
 The new [host adapter](community-host-publication.md) adds an explicitly bound
 operator CLI and finite first-install transaction, without authorizing their
-production execution or a migration. Existing Core/VMM successors and their
-control allowlists are unchanged. Modules ship as a separate package-only artifact.
+production execution or a migration. The separate finite publication successor adds exact proof verification and
+the optional original-watchdog hook; VMM execution policy and modules remain unchanged. Modules ship as a separate package-only artifact.
 
 ## Release and process binding
 
@@ -62,8 +62,9 @@ drain and restart persistence. Neither test is production acceptance.
    is not used as the installed contract.
 2. Review the added host adapter and finite new-directory installation
    transaction, using the installed guard's actual lease verifier.
-   The new host adapter is still uninstalled. Its foreground supervision is
-   explicit operator-session supervision, not a new watchdog registration.
+   The new host adapter is still uninstalled. Persistent plans register with
+   the original watchdog, with one initial start plus two total restarts; the
+   older foreground runner is only for explicit zero-restart plans.
 3. Bind the actual release artifacts, explicit community-only migration,
    separate migrator/runtime role privileges, backup/restore boundaries and
    the server-only Web COMMUNITY_INTERNAL_ORIGIN setting. No runtime DDL.
@@ -72,7 +73,8 @@ drain and restart persistence. Neither test is production acceptance.
 5. Publish compatible Core, Community and Web in order, then verify two-account
    business behavior and preservation of the existing application baseline.
 
-The finite installed Core publisher currently refuses the new candidate;
-that separate proof-bound publication prerequisite remains unresolved. No final
+The installed Core publisher still refuses the new candidate. The
+[finite successor](community-publication-successor.md) implements that prerequisite
+for review; it has not been released or installed. No final
 production approval digest or formal release artifact has been invented.
 Community has no GPU/VMM dependency.

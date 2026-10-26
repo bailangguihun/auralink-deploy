@@ -433,6 +433,8 @@ class CoreRuntime:
     def stop_owned_java(self, current):
         self.verify_current(current)
         engine = self.engine()
+        if hasattr(engine, 'community_action'):
+            engine.community_action('drain', self.fd)
         engine.watchdog_stop_locked()
         engine.stop_role('java', 19080)
 
@@ -545,6 +547,8 @@ class CoreRuntime:
     def stop_for_restore(self, plan):
         self.validate_recovery(plan)
         engine = self.engine(partial_recovery=True)
+        if hasattr(engine, 'community_action'):
+            engine.community_action('drain', self.fd)
         engine.watchdog_stop_locked()
         engine.stop_role('java', 19080)
 

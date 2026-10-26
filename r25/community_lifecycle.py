@@ -209,6 +209,25 @@ class Role:
         must(process(saved['pid']) == saved, 'community_process_changed_during_health')
         record['phase']='READY'; self.write(path,record); return 'READY'
 
+    def reconcile_reboot(self):
+        """Only a recorded process from another boot can become EXITED.
+
+        Never infer ownership from a listener or adopt a PID. An unrecorded
+        START_INTENT remains UNKNOWN even after reboot; operator investigation
+        is required. Old process identity remains in the retained run record.
+        """
+        self.require_lease()
+        path, record = self.current()
+        if record is None or record['phase'] in ('STOPPED','EXITED'):return
+        saved=record['process']
+        if saved is None:return
+        boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        if saved['boot_id']==boot:return
+        must(not listeners(self.binding['port']), 'community_foreign_listener_after_reboot')
+        record.update(phase='STOPPED' if record['phase'] in ('STOP_INTENT','STOPPING') else 'EXITED',
+                      reconciled_boot_id=boot, exit_reason='RECORDED_PREVIOUS_BOOT')
+        self.write(path,record)
+
     def stop(self, timeout=10):
         self.require_lease()
         must(type(timeout) in (int,float) and 0 <= timeout <= 30, 'community_stop_deadline')
