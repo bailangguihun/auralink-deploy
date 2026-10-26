@@ -16,7 +16,9 @@ jobs:
   package:
     name: Build controller installation artifact
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Same 626-test gate as PR CI; run 40273289298 needed 598.610s
+    # before archive verification/upload. This remains package-only.
+    timeout-minutes: 15
     steps:
       - name: Require release branch
         shell: bash
