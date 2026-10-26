@@ -256,20 +256,24 @@ def verify_core_followup_context(value, predecessor=None, validator=None):
     prior_sha=binding['predecessor_policy_sha256']
     if predecessor is None:
         predecessor=private_record(STORE/'core-followup-baselines'/(prior_sha+'.json'),prior_sha)
-    if binding['schema'] in {'R25_MANAGED_VMM_CORE_SUCCESSOR_V1','R25_MANAGED_VMM_CORE_PUBLICATION_V1','R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1'}:
+    if binding['schema'] in {'R25_MANAGED_VMM_CORE_SUCCESSOR_V1','R25_MANAGED_VMM_CORE_PUBLICATION_V1','R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1','R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1'}:
         # One finite successor of the committed managed-Core installation.
         # Keep its original AI snapshot and accepted records immutable; do not
         # turn this into a recursively extensible arbitrary release chain.
         previous=core_business.validate_core_followup(predecessor)
-        expected_schema=('R25_MANAGED_VMM_CORE_PUBLICATION_V1' if binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1' else 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1' if binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_V1' else 'R25_MANAGED_VMM_CORE_FOLLOWUP_V1')
+        repair=binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1'
+        expected_schema=('R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1' if repair else 'R25_MANAGED_VMM_CORE_PUBLICATION_V1' if binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1' else 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1' if binding['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_V1' else 'R25_MANAGED_VMM_CORE_FOLLOWUP_V1')
         must(previous['schema']==expected_schema,'managed_vmm_successor_predecessor_contract')
         up=value['upgrade'];old=predecessor['upgrade']
         before=old['configuration'];after=up['configuration']
+        if repair:
+            must(up['candidate']['commit_sha']!=old['candidate']['commit_sha'] and
+                 up['candidate']['artifact_sha256']!=old['candidate']['artifact_sha256'],'publication_repair_requires_new_candidate')
         expected=dict(before,before_sha256=before['after_sha256'])
         retained=STORE/'core-followup-baselines'/(prior_sha+'.json')
         bound=private_record(retained if retained.exists() else STORE/'POLICY.json',prior_sha)
         must(bound==predecessor and
-             all(old['candidate'].get(k)==up['baseline_release'].get(k) for k in ('commit_sha','artifact_sha256')) and
+             (old['baseline_release']==up['baseline_release'] if repair else all(old['candidate'].get(k)==up['baseline_release'].get(k) for k in ('commit_sha','artifact_sha256'))) and
              after==expected and
              all(binding[k]==previous[k] for k in binding if k not in {'schema','predecessor_policy_sha256'}),
              'managed_vmm_successor_predecessor_binding')

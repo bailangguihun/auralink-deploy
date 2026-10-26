@@ -66,6 +66,21 @@ class HostTests(unittest.TestCase):
             time.sleep(.03)
         self.fail('expected '+state+' got '+s)
 
+    def test_host_requires_bound_committed_core_not_restored_candidate(self):
+        import community_host
+        tx='c'*32;root=self.f.base/'committed-core-fixture'
+        journal=root/'runtime/core-publications/transactions'/tx/'journal.json'
+        journal.parent.mkdir(parents=True)
+        current={'transaction_id':tx,'release':{'commit_sha':'a'*40,'artifact_sha256':'b'*64}}
+        journal.write_bytes(encoded({'phase':'COMMITTED','candidate':current['release']}))
+        self.plan['preserved'][str(journal)]=identity(journal)
+        with patch.object(community_host,'ROOT',root):
+            self.host.require_committed_core(current)
+            journal.write_bytes(encoded({'phase':'RESTORED','candidate':current['release']}))
+            with self.assertRaisesRegex(ValueError,'core_not_committed'):self.host.require_committed_core(current)
+            del self.plan['preserved'][str(journal)]
+            with self.assertRaisesRegex(ValueError,'journal_binding'):self.host.require_committed_core(current)
+
     def test_real_guard_install_full_inventory_node_and_drain_preserves_history(self):
         before=self.preserved.read_bytes();ino=self.lease.lock.stat().st_ino
         self.assertEqual(self.install(),'INSTALLED')

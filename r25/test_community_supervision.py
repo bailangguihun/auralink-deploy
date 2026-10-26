@@ -31,6 +31,7 @@ class Persistent(unittest.TestCase):
         # New wrapper each time models separate original-watchdog CLI calls.
         with self.f.lease.held():return Supervisor(self.h).tick(drain=drain)
 
+
     def wait(self,expected):
         deadline=time.monotonic()+6
         while time.monotonic()<deadline:
@@ -181,6 +182,33 @@ print(supervision_command(host,sys.argv[4],bundle))
         with self.f.lease.held():self.assertEqual(self.s.enable(),'ENABLED_NOT_STARTED')
         self.assertEqual(self.tick(),'STARTING');self.wait('READY')
         self.assertEqual(2,len(self.s.load()['attempts']));self.assertGreaterEqual(log.stat().st_size,8*1024*1024)
+
+
+class RepairParent(unittest.TestCase):
+    def test_repair_parent_uses_same_watchdog_budget_and_graceful_drain(self):
+        from community_host import REPAIR_SCHEMA
+        self.bundle=bundle_fixture.ControllerPackage('runTest');self.bundle.setUp();self.addCleanup(self.bundle.doCleanups)
+        f=fixture.HostTests('runTest');f.setUp();self.addCleanup(f.doCleanups)
+        f.ap.write_bytes(encoded(dict(schema=REPAIR_SCHEMA)))
+        f.plan['parent'].update(schema=REPAIR_SCHEMA,approval_identity=identity(f.ap))
+        f.plan['service']['restart_budget']=2;f.plan['controller_manifest_sha256']=self.bundle.digest
+        f.host=Host(f.f.base/'host',f.plan,f.lease);f.approval.write_bytes(encoded(f.plan));f.install()
+        supervisor=Supervisor(f.host)
+        try:
+            with f.lease.held():
+                self.assertEqual(supervisor.register(self.bundle.root),'REGISTERED_NOT_STARTED')
+                self.assertEqual(supervisor.tick(),'STARTING')
+            deadline=time.monotonic()+6
+            while time.monotonic()<deadline:
+                with f.lease.held():value=supervisor.tick()
+                if value=='READY':break
+                time.sleep(.03)
+            self.assertEqual(value,'READY');self.assertEqual(len(supervisor.load()['attempts']),1)
+            with f.lease.held():
+                self.assertIn(supervisor.tick(drain=True),('STOPPING','STOPPED'))
+            self.assertEqual(len(supervisor.load()['attempts']),1)
+        finally:
+            with f.lease.held():f.host.role().stop(5)
 
 
 if __name__=='__main__':unittest.main()

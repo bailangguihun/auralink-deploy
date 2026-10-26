@@ -30,6 +30,7 @@ WEB_ORIGIN = LOCK.parent/'community-origin.json'
 SCHEMA = 'ARTLIVE_COMMUNITY_HOST_V1'
 PARENT_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_BINDING_V1'
 SUCCESSOR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_BINDING_V1'
+REPAIR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_BINDING_V1'
 
 
 def sha(raw):
@@ -154,7 +155,7 @@ class Host:
         must(re.fullmatch('[a-f0-9]{40}', p['core_commit']) is not None, 'community_compatible_core')
         must(re.fullmatch('[a-f0-9]{64}', p['review_sha256']) is not None, 'community_review')
         must(re.fullmatch('[a-f0-9]{64}', p['controller_manifest_sha256']) is not None, 'community_controller_binding')
-        must(p['parent']['schema'] in (PARENT_SCHEMA,SUCCESSOR_SCHEMA), 'community_unsupported_predecessor')
+        must(p['parent']['schema'] in (PARENT_SCHEMA,SUCCESSOR_SCHEMA,REPAIR_SCHEMA), 'community_unsupported_predecessor')
         must(p['runtime']['python']['path'] == str(Path(os.sys.executable).resolve()), 'community_python_path')
         match(p['runtime']['python']['path'], p['runtime']['python']['identity'])
         must(hasattr(os,'pidfd_open') and hasattr(signal,'pidfd_send_signal'), 'community_pidfd_required')
@@ -169,16 +170,19 @@ class Host:
                 'runtime/vmm/lifecycle.json','runtime/vmm/gate.json')]
             parent_id=p['parent']['approval_identity']['sha256']
             parent_root=ROOT/'runtime/core-publications/controller-upgrades'/parent_id
-            marker=ROOT/'runtime/vmm-controller'/('CORE_PUBLICATION_SUCCESSOR_ACTIVE.json' if p['parent']['schema']==SUCCESSOR_SCHEMA else 'CORE_PUBLICATION_ACTIVE.json')
+            marker=ROOT/'runtime/vmm-controller'/('CORE_PUBLICATION_REPAIR_ACTIVE.json' if p['parent']['schema']==REPAIR_SCHEMA else 'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json' if p['parent']['schema']==SUCCESSOR_SCHEMA else 'CORE_PUBLICATION_ACTIVE.json')
             must(p['parent']['approval_path']==str(parent_root/'approval.json') and
                  p['parent']['journal_path']==str(parent_root/'journal.json') and
                  strict_json(marker.read_bytes())['approval_sha256']==parent_id and
                  strict_json((ROOT/'runtime/core-publications/CONTROL_UPGRADE_ACTIVE.json').read_bytes())['approval_sha256']==parent_id,
                  'community_current_publication_parent')
             required.append(marker)
+            if p['parent']['schema']==REPAIR_SCHEMA:
+                required.append(ROOT/'runtime/vmm-controller/CORE_PUBLICATION_SUCCESSOR_ACTIVE.json')
             must(all(str(path) in p['preserved'] for path in required), 'community_preservation_inventory')
             current = strict_json((ROOT/'runtime/core-publications/CURRENT.json').read_bytes())
             must(current['release']['commit_sha'] == p['core_commit'], 'community_compatible_core_not_installed')
+            self.require_committed_core(current)
             life = strict_json((ROOT/'runtime/vmm/lifecycle.json').read_bytes())
             gate = strict_json((ROOT/'runtime/vmm/gate.json').read_bytes())
             must(life['enabled'] is False and life['state']=='DISABLED' and life['desired']=='STOPPED' and
@@ -195,9 +199,17 @@ class Host:
              'community_resource_policy')
         must(type(p['service']['restart_budget']) is int and p['service']['restart_budget'] in (0,2), 'community_restart_budget')
         if p['service']['restart_budget']:
-            must(parent['schema']==SUCCESSOR_SCHEMA,'community_watchdog_requires_successor')
+            must(parent['schema'] in (SUCCESSOR_SCHEMA,REPAIR_SCHEMA),'community_watchdog_requires_successor')
         must(p['web_origin']['before_sha256'] is None, 'community_web_origin_initial_install_only')
         if self.root == ROOT/'runtime/community':must(p['web_origin']['path']==str(WEB_ORIGIN),'community_web_fixed_setting_path')
+
+    def require_committed_core(self,current):
+        p=self.plan
+        current_tx=current.get('transaction_id');must(re.fullmatch('[a-f0-9]{32}',str(current_tx)) is not None,'community_core_transaction_identity')
+        current_journal=ROOT/'runtime/core-publications/transactions'/current_tx/'journal.json'
+        must(str(current_journal) in p['preserved'],'community_core_journal_binding')
+        committed=strict_json(current_journal.read_bytes())
+        must(committed.get('phase')=='COMMITTED' and committed.get('candidate')==current['release'],'community_core_not_committed')
 
     def material(self, archive, manifest, settings, node):
         self.validate()

@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 import uuid
-from community_host import ROOT, SUCCESSOR_SCHEMA, encoded, identity, sha
+from community_host import ROOT, SUCCESSOR_SCHEMA, REPAIR_SCHEMA, encoded, identity, sha
 from r25_storage import must
 
 SCHEMA='ARTLIVE_COMMUNITY_WATCHDOG_V1'
@@ -24,7 +24,7 @@ class Supervisor:
     def installed(self):
         h=self.host
         h.validate(installing=False)
-        must(h.plan['parent']['schema']==SUCCESSOR_SCHEMA and h.plan['service']['restart_budget']==2,
+        must(h.plan['parent']['schema'] in (SUCCESSOR_SCHEMA,REPAIR_SCHEMA) and h.plan['service']['restart_budget']==2,
              'community_persistent_scope_required')
         must(h.read(h.record)['phase']=='INSTALLED' and h.read(h.root/'ACTIVE.json')['plan_sha256']==h.digest,
              'community_not_installed')
