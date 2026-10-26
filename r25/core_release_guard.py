@@ -277,6 +277,10 @@ def verify_core_followup_context(value, predecessor=None, validator=None):
              after==expected and
              all(binding[k]==previous[k] for k in binding if k not in {'schema','predecessor_policy_sha256'}),
              'managed_vmm_successor_predecessor_binding')
+        if repair:
+            must(all(up['assistant'][key]==old['assistant'][key] for key in
+                     ('baseline_policy_sha256','baseline_payload_fingerprint')),
+                 'publication_repair_accepted_baseline_binding')
         return verify_core_followup_context(predecessor,validator=core_business)
     if binding['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1':
         previous=core_business.validate_core_followup(predecessor)

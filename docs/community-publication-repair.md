@@ -111,6 +111,42 @@ forward-schema-preserving recovery. Never restore historical DB/ledger state.
 
 ## Validation boundary
 
+### Accepted Core policy and installed control policy are different identities
+
+The first production repair binding reached `VERIFY_INTENT`, then the original
+accepted-record guard refused `assistant_verified_v2_rollback_record` (exit 65).
+Its approved recovery restored that binding's seven controls and CAS; the prior
+successor remains INSTALLED, the prior failed Core transaction remains RESTORED,
+and Core publication was never called. This is a control-plan defect, not a new
+JAR startup failure. Keep the failed approval consumed and all original reports.
+
+For this finite repair only, both `assistant.baseline_policy_sha256` and
+`assistant.baseline_payload_fingerprint` must be copied from the exact retained
+predecessor's **accepted baseline**, because its candidate Core never committed.
+`core_followup.predecessor_policy_sha256` still names the immediate installed
+control policy. Those two policy hashes must not be conflated. The renderer,
+preflight binding check and standalone guard all enforce this distinction.
+The guard verifies the predecessor's content-addressed bytes and recursively
+checks the existing finite proof chain before accepting the preserved baseline.
+The original `release_record()` identity/hash/schema/repository/policy/payload
+checks remain unchanged; no accepted record is rewritten to fit a new policy.
+
+The added CPU regression invokes that actual accepted-record verifier during
+installation and lost-receipt reconciliation. Before the fix it fails at the
+same post-write boundary with the production error; after the fix it passes.
+Negative tests reject baseline policy/fingerprint drift and modified or unbound
+accepted records. A separate interrupted-binding test restores its own controls,
+prepares a different unsigned plan, and proves the prior RESTORED approval and
+proofs remain immutable and cannot be replayed. This is isolated evidence, not
+another production installation or Core COMMITTED result.
+
+After review and release, use fresh same-run Deploy artifacts and a fresh plan
+bound to the restored live preimages. The already verified Core JAR and its full
+startup evidence remain reusable if their inputs have not changed; a new Core
+build is not needed for this control-only fix. Never edit the failed plan or
+reuse its approval. The original publisher still requires its own fresh scope
+following successful INSTALLED verification, including a new consistent backup.
+
 New transaction tests exercise actual files, guard entry, original flock, full
 proof chains and bundle inventories, CAS, unsupported/changed predecessors,
 drift, partial installation/recovery, lost commit/marker receipts and later
