@@ -1,7 +1,8 @@
 # Community foundation publication proposal
 
-This accompanies an isolated code candidate. It adds no install command,
-changes no installed lifecycle, and authorizes no production migration.
+The initial candidate added no install command. The subsequent reviewed-host
+candidate is described in [Community host publication](community-host-publication.md).
+It changes no installed lifecycle and authorizes no production migration.
 
 ## Components
 

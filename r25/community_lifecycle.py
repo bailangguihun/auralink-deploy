@@ -100,17 +100,19 @@ class Role:
         for p in release.rglob('*'):
             must(not p.is_symlink(), 'community_release_symlink')
         for f in m['files']:
+            must((release/f['path']).lstat().st_nlink == 1, 'community_release_hardlink')
             self.storage.file_identity(release/f['path'],expected_sha256=f['sha256'],expected_bytes=f['bytes'])
         node = Path(b['node'])
         must(node.is_absolute() and str(node.resolve(strict=True)) == str(node), 'community_node_path')
         info = node.stat()
-        must(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022 and info.st_mode & 0o100, 'community_node_mode')
+        must(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not info.st_mode & 0o022 and info.st_mode & 0o100, 'community_node_mode')
         must(hashlib.sha256(node.read_bytes()).hexdigest() == b['node_sha256'], 'community_node_digest')
         must(re.fullmatch(r'v(?:22|24)\.[0-9]+\.[0-9]+',b['node_version']), 'community_node_version')
         must(tuple(map(int,b['node_version'][1:].split('.'))) >= (22,13,0), 'community_node_minimum')
         observed = subprocess.run([str(node),'--version'],env={},capture_output=True,check=True,timeout=5).stdout.decode().strip()
         must(observed == b['node_version'], 'community_node_version_changed')
         env = self.storage.read_private_record(b['config_path'],expected_sha256=b['config_sha256'])
+        must(Path(b['config_path']).lstat().st_nlink == 1, 'community_config_hardlink')
         must(set(env) == {'COMMUNITY_DATABASE_URL','COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_PORT'}, 'community_config_keys')
         must(all(type(v) is str for v in env.values()), 'community_config_values')
         core, web, db = (urlsplit(env[k]) for k in ('COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_DATABASE_URL'))
@@ -122,6 +124,7 @@ class Role:
              db.username and db.password and db.path not in ('','/') and not db.query and not db.fragment, 'community_database_target')
         must(env['COMMUNITY_PORT'].isdigit() and 1024 <= int(env['COMMUNITY_PORT']) <= 65535 and
              int(env['COMMUNITY_PORT']) == b['port'] and b['port'] != core.port, 'community_port')
+        self.argv()  # Resource flags must be valid before START_INTENT.
         return env
 
     def start(self, operation_id):
@@ -138,7 +141,7 @@ class Role:
         log = self.root/('run-'+operation_id+'.log')
         fd = os.open(log,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
         try:
-            child = subprocess.Popen([self.binding['node'],str(Path(self.binding['release_root'])/'src/main.mjs')],
+            child = subprocess.Popen(self.argv(),
                                      cwd=self.binding['release_root'],env=env,stdin=subprocess.DEVNULL,
                                      stdout=fd,stderr=fd,close_fds=True,start_new_session=True)
         finally: os.close(fd)
@@ -151,11 +154,19 @@ class Role:
             record['phase']='EXITED'
         else:
             must(identity['exe'] == self.binding['node'] and identity['cwd'] == self.binding['release_root'] and
-                 identity['argv'] == [self.binding['node'],str(Path(self.binding['release_root'])/'src/main.mjs')] and
+                 identity['argv'] == self.argv() and
                  identity['uid'] == [os.geteuid()]*4, 'community_spawn_identity_unknown')
             record.update(phase='STARTING',process=identity)
         self.write(path,record)
         return record['phase']
+
+    def argv(self):
+        flags = []
+        if 'node_heap_mib' in self.binding:
+            must(type(self.binding['node_heap_mib']) is int and self.binding['node_heap_mib'] == 256,
+                 'community_heap_policy')
+            flags = ['--max-old-space-size=256']
+        return [self.binding['node'], *flags, str(Path(self.binding['release_root'])/'src/main.mjs')]
 
     def observe(self, check_health=True):
         self.require_lease()
