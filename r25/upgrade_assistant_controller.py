@@ -436,7 +436,7 @@ def validate_managed_successor_bindings(rt,plan,old,new,bundle):
     must(b['artifacts']['core']=={'repository':after['candidate']['repository'],'commit':after['candidate']['commit_sha'],'sha256':after['candidate']['artifact_sha256']} and
          b['artifacts']['deploy']=={'repository':plan['deploy']['repository'],'commit':plan['deploy']['commit'],'sha256':plan['deploy']['archive_sha256']},
          'managed_successor_formal_artifact_binding')
-    must(b['baseline_policy_sha256']==plan['operational']['policy']['before_sha256'] and
+    must(b['baseline_policy_sha256']==(a['baseline_policy_sha256'] if plan['schema']==PUBLICATION_REPAIR_SCHEMA else plan['operational']['policy']['before_sha256']) and
          b['baseline_payload_fingerprint']==(a['baseline_payload_fingerprint'] if plan['schema']==PUBLICATION_REPAIR_SCHEMA else before['candidate']['payload_fingerprint']) and
          b['compatible_recovery_jar_sha256']==plan['current_release']['artifact_sha256'] and
          b['configuration_sha256']==expected['after_sha256'] and b['review_evidence_sha256']==plan['review_evidence_sha256'],
@@ -567,7 +567,8 @@ def prepare_core_followup(rt,request,request_sha256,bundle,*,managed=False,manag
             core_business.validate_managed_vmm_configuration(config['vmm'])
             before=guard.read_file(LIVE_FILES['application'],owner=tuple(plan['private_owner']),expected=plan['preserved']['application'])
             config['after_sha256']=sha(core_business.render_managed_vmm_configuration(before,next_policy,verify_after=False))
-        a=up['assistant'];a.update(configuration_sha256=config['after_sha256'],baseline_policy_sha256=oldsha,
+        a=up['assistant'];a.update(configuration_sha256=config['after_sha256'],
+            baseline_policy_sha256=old['upgrade']['assistant']['baseline_policy_sha256'] if publication_repair else oldsha,
             baseline_payload_fingerprint=old['upgrade']['assistant']['baseline_payload_fingerprint'] if publication_repair else old['upgrade']['candidate']['payload_fingerprint'],
             compatible_recovery_jar_sha256=current['artifact_sha256'],compatibility_evidence_sha256=request['compatibility_evidence_sha256'],
             review_evidence_sha256=request['review_evidence_sha256'])

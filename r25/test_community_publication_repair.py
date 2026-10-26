@@ -1,4 +1,5 @@
 """Actual finite proof/lease/CAS transactions; Java/DB are explicit CPU fixtures."""
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
 import fcntl
@@ -62,6 +63,82 @@ class Repair(unittest.TestCase):
         for name in ('vmm_lifecycle.py','vmm_service.py','core_runtime.py','lifecycle','role'):
             self.assertEqual(*u.entries(self.plan)[name].values())
         self.assertEqual(['stop-watchdog','start-watchdog'],self.f.f.rt.events)
+
+    def test_real_current_record_guard_during_install_and_receipt_reconciliation(self):
+        # Exercise the original accepted-record verifier at the actual install
+        # boundary. The older CPU process fixture checked only policy/file SHA.
+        # No accepted record, policy identity or guard predicate is fabricated
+        # to make this boundary pass; all come from the preceding transactions.
+        self.prepare()
+        with self.real_current_record_guard() as seen:
+            self.assertEqual('INSTALLED',self.f.install())
+            self.assertEqual('INSTALLED_VERIFIED_NOOP',self.f.install())
+            self.assertEqual('INSTALLED_NO_RECOVERY',self.f.recover())
+        self.assertGreaterEqual(len(seen),3)
+        self.assertEqual({self.f.old['upgrade']['assistant']['baseline_policy_sha256']},set(seen))
+        self.assertNotEqual(self.f.new['upgrade']['assistant']['baseline_policy_sha256'],
+            self.f.new['upgrade']['core_followup']['predecessor_policy_sha256'])
+        self.runtime();self.preserved()
+
+    @contextmanager
+    def real_current_record_guard(self):
+        runtime=self.f.f.rt;verify=runtime.verify_current
+        seen=[]
+        def verify_current(current):
+            verify(current)
+            policy=runtime.read(self.f.f.store/'POLICY.json')
+            with patch.object(guard,'policy',return_value=policy):
+                record=guard.release_record(current.artifact_sha256,
+                    current.accepted_record_sha256,current.commit_sha)
+            seen.append(record['policy_sha256'])
+        with patch.object(runtime,'verify_current',side_effect=verify_current):
+            yield seen
+
+    def test_baseline_drift_refused_by_preflight_and_retained_context(self):
+        import core_business as business
+        self.prepare()
+        for key in ('baseline_policy_sha256','baseline_payload_fingerprint'):
+            for wrong in ('f'*64,self.plan['operational']['policy']['before_sha256']):
+                bad=deepcopy(self.f.new);bad['upgrade']['assistant'][key]=wrong
+                with self.subTest(key=key,wrong=wrong):
+                    with self.assertRaisesRegex(Exception,'managed_successor_accepted_baseline_binding'):
+                        u.validate_managed_successor_bindings(self.f.f.rt,self.plan,self.f.old,bad,self.f.bundle)
+                    with self.assertRaisesRegex(Exception,'publication_repair_accepted_baseline_binding'):
+                        guard.verify_core_followup_context(bad,self.f.old,business)
+        self.assertEqual([],self.f.f.rt.events);self.preserved()
+
+    def test_real_record_drift_cannot_be_hidden_by_matching_proposed_policy(self):
+        self.prepare();current=self.f.current
+        path=self.f.f.store/'releases'/(current.artifact_sha256+'-'+current.commit_sha)/'record.json'
+        raw=path.read_bytes()
+        try:
+            self.put(path,raw+b' ')
+            with self.real_current_record_guard(),self.assertRaises(Exception):self.f.install()
+            self.assertEqual([],self.f.f.rt.events)
+        finally:self.put(path,raw)
+        with patch.object(guard,'policy',return_value=self.f.new):
+            with self.assertRaisesRegex(Exception,'assistant_verified_v2_rollback_record'):
+                guard.release_record(current.artifact_sha256,None,current.commit_sha)
+        self.preserved()
+
+    def test_fresh_plan_after_restored_binding_preserves_consumed_failure(self):
+        self.prepare();first_plan=deepcopy(self.plan);first_id=self.ident
+        storage=self.f.f.rt.storage;copy=storage.atomic_copy_file
+        def fail(src,dst,*args,**kwargs):
+            value=copy(src,dst,*args,**kwargs)
+            if Path(dst)==self.f.f.store/'POLICY.json':raise InterruptedError('fixture policy receipt loss')
+            return value
+        with patch.object(storage,'atomic_copy_file',side_effect=fail):
+            with self.assertRaises(InterruptedError):self.f.install()
+        with self.real_current_record_guard():self.assertEqual('RESTORED',self.f.recover())
+        folder=self.f.f.store/'controller-upgrades'/first_id
+        consumed={p:p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+        self.prepare(reuse_candidate=True);self.assertNotEqual(first_id,self.ident)
+        with self.real_current_record_guard():self.assertEqual('INSTALLED',self.f.install())
+        for path,raw in consumed.items():self.assertEqual(raw,path.read_bytes())
+        with self.assertRaisesRegex(Exception,'recovery_required'):
+            u.install(self.f.f.rt,first_plan,self.f.bundle,approval_sha256=first_id)
+        self.runtime();self.preserved()
 
     def test_wrong_restored_phase_current_candidate_and_recovery_refuse(self):
         paths=[(self.txroot/'journal.json','phase','COMMITTED'),(self.txroot/'journal.json','transaction_id','0'*32),
