@@ -144,3 +144,10 @@ real-JAR 40260513884, Core CI40261594915, Deploy603/0skip40267834395 and Web
 168-unit/15-shell40267865584 where unchanged. Maven's100 gated skips are not
 passes; failed40260113674 RESULT is invalid. New tests are preparation, never
 production installation or acceptance.
+
+## Restored application follow-up
+
+The installed successor remains terminal even if its Core candidate fails and
+the original publisher restores Core. Do not rerun this binder or edit its
+policy. The separately reviewed finite transition and exact RESTORED proof
+requirements are documented in [community-publication-repair.md](community-publication-repair.md).

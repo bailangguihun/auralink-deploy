@@ -635,6 +635,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json').exists():return applied_publication_repair(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json').exists():return applied_publication_successor(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_ACTIVE.json').exists():return applied_core_publication(rt,value,handoff)
     if (rt.store/'MODULE_REVISION_ACTIVE.json').exists():return applied_module_revision(rt,value,handoff)
@@ -1540,7 +1541,7 @@ def capture_publication_successor(rt,deploy):
         'preserved':{n:sha(revision_preserved_read(rt,n,p)) for n,p in publication_successor_preserved(rt).items()}}
 
 
-def verify_publication_successor(rt,plan,phase='before',*,runtime=False):
+def verify_publication_successor(rt,plan,phase='before',*,runtime=False,historical=None):
     must(plan.get('schema')==PUBLICATION_SUCCESSOR_SCHEMA and phase in {'before','mixed','after'},'publication_successor_schema')
     must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'publication_successor_owner')
     entries={**plan['files'],**plan['operational']}
@@ -1598,7 +1599,7 @@ def verify_publication_successor(rt,plan,phase='before',*,runtime=False):
         afterhand=afterhand.replace(line,(key+'='+want+'\n').encode())
     must(sha(afterhand)==entries['handoff']['after_sha256'],'publication_successor_handoff_render')
     for name,(path,owner,mode) in publication_targets(rt).items():
-        raw=read(path,owner,mode);entry=entries[name]
+        raw=proof_read(historical,path,owner,mode);entry=entries[name]
         if runtime and name=='handoff':
             actual,wanted=env_values(raw),env_values(afterhand)
             keys=set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}
@@ -1608,7 +1609,7 @@ def verify_publication_successor(rt,plan,phase='before',*,runtime=False):
     for name,path in publication_successor_preserved(rt).items():
         if runtime and name not in {'overlay-active','role-active','service','token','core-successor-active','module-active','publication-active'}:continue
         revision_preserved_read(rt,name,path,binding['preserved'][name])
-    current=read(rt.preserved()['original-controller-active'],rt.private)
+    current=proof_read(historical,rt.preserved()['original-controller-active'],rt.private)
     new=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
     allowed={binding['control_active_sha256']} if phase=='before' else {sha(new)} if phase=='after' else {binding['control_active_sha256'],sha(new)}
     must(sha(current) in allowed,'publication_successor_controller_pointer')
@@ -1633,6 +1634,164 @@ def applied_publication_successor(rt,value,handoff):
          'publication_successor_policy_binding')
     result=copy.deepcopy(value)
     result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
+    return result
+
+
+# One repair of the installed Community successor whose Core publish RESTORED.
+# No repeat, arbitrary predecessor, or mutation of the failed candidate proof.
+PUBLICATION_REPAIR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_BINDING_V1'
+PUBLICATION_REPAIR_MARKER = 'R25_VMM_CORE_PUBLICATION_REPAIR_ACTIVE_V1'
+PUBLICATION_REPAIR_MUTABLE = PUBLICATION_SUCCESSOR_MUTABLE - {'core_runtime.py','lifecycle'}
+RESTORED_CORE_PROOFS = frozenset(('journal.json','snapshot.json','assistant-journal.json',
+    'assistant-recovery.json','assistant-backup/manifest.json','http-acceptance.json'))
+
+
+def publication_repair_preserved(rt):
+    return publication_successor_preserved(rt) | {
+        'publication-successor-active':rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json'}
+
+
+def restored_core_evidence(rt,old,bound=None,*,runtime=False):
+    """Fixed retained transaction proofs, never a snapshot restore instruction."""
+    store=rt.root/'runtime/core-publications'
+    active=json_read(store/'ACTIVE.json',rt.private)
+    tx=digest(bound['transaction_id'] if bound is not None else active.get('transaction_id'),32)
+    folder=store/'transactions'/tx
+    hashes={n:sha(read(folder/n,rt.private)) for n in sorted(RESTORED_CORE_PROOFS)}
+    if bound is not None:
+        must(set(bound)=={'transaction_id','proof_hashes','active_sha256','current_sha256'} and
+             hashes==bound['proof_hashes'],'publication_repair_restored_proof_drift')
+    journal=json_read(folder/'journal.json',rt.private)
+    snapshot=json_read(folder/'snapshot.json',rt.private,journal['snapshot_sha256'])
+    baseline=old['upgrade']['baseline_release'];candidate=old['upgrade']['candidate']
+    must(journal.get('schema')=='R25_CORE_TRANSACTION_V1' and journal.get('phase')=='RESTORED' and
+         journal.get('transaction_id')==journal.get('snapshot_id')==tx and
+         journal.get('current')==baseline and
+         all(journal['candidate'].get(k)==candidate[k] for k in ('commit_sha','artifact_sha256')),
+         'publication_repair_requires_restored_candidate')
+    must(snapshot.get('schema')=='R25_CORE_SNAPSHOT_V1' and snapshot.get('transaction_id')==tx and
+         snapshot.get('current')==baseline and snapshot.get('candidate')==journal['candidate'] and
+         snapshot.get('before_current',{}).get('release')==baseline,'publication_repair_snapshot_identity')
+    accepted=store/'releases'/(candidate['artifact_sha256']+'-'+candidate['commit_sha'])/'record.json'
+    record=json_read(accepted,rt.private,journal['candidate']['accepted_record_sha256'])
+    must(record.get('policy_sha256')==sha(encoded(old)) and
+         all(record.get(k)==candidate[k] for k in candidate),'publication_repair_failed_candidate_binding')
+    recovery=json_read(folder/'assistant-recovery.json',rt.private)
+    must(recovery.get('outcome')=='FORWARD_SCHEMA_PRESERVED' and
+         recovery.get('database_restore') is False and recovery.get('automatic_replay') is False,
+         'publication_repair_forward_data_required')
+    schema=json_read(folder/'assistant-journal.json',rt.private)
+    must(schema.get('schema')=='R25_ASSISTANT_SCHEMA_TRANSACTION_V1' and schema.get('phase')=='SCHEMA_READY' and
+         any(row.get('phase')=='BACKUP_VERIFIED' and row.get('manifest_sha256')==hashes['assistant-backup/manifest.json']
+             for row in schema.get('history',[])),'publication_repair_backup_proof')
+    if not runtime:
+        current=json_read(store/'CURRENT.json',rt.private)
+        must(active=={'schema':'R25_CORE_ACTIVE_V1','transaction_id':tx} and
+             current==snapshot['before_current'],'publication_repair_restored_current')
+        revision_apps_committed(rt)
+        if bound is not None:
+            read(store/'ACTIVE.json',rt.private,expected=bound['active_sha256'])
+            read(store/'CURRENT.json',rt.private,expected=bound['current_sha256'])
+    return {'transaction_id':tx,'proof_hashes':hashes,
+        'active_sha256':sha(read(store/'ACTIVE.json',rt.private)),
+        'current_sha256':sha(read(store/'CURRENT.json',rt.private))}
+
+
+def capture_publication_repair(rt,deploy):
+    marker_path=rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json'
+    must(not marker_path.exists() and not marker_path.is_symlink(),'publication_repair_already_bound')
+    must(rt.fd is not None,'lease_required')
+    held,live=os.fstat(rt.fd),rt.lock.stat()
+    must((held.st_dev,held.st_ino)==(live.st_dev,live.st_ino),'lease_inode')
+    revision_stopped(rt);revision_apps_committed(rt)
+    old=json_read(rt.preserved()['policy'],rt.private)
+    must(old['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1',
+         'publication_repair_requires_successor')
+    applied_publication_successor(rt,old,env_values(read(rt.targets()['handoff'][0],rt.private)))
+    marker=json_read(rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json',rt.private)
+    ident=digest(marker.get('approval_sha256'));folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    must(json_read(folder/'journal.json',rt.private).get('phase')=='INSTALLED','publication_repair_parent_incomplete')
+    names=publication_proof_names(rt)
+    must({p.relative_to(folder).as_posix() for p in folder.rglob('*') if not p.is_dir()}==names,
+         'publication_repair_parent_inventory')
+    return {'deploy':deploy,'previous_successor':{'marker':marker,
+        'proof_hashes':{n:sha(read(folder/n,rt.private)) for n in sorted(names)}},
+        'restored_core':restored_core_evidence(rt,old),
+        'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private)),
+        'preserved':{n:sha(revision_preserved_read(rt,n,p)) for n,p in publication_repair_preserved(rt).items()}}
+
+
+def verify_publication_repair(rt,plan,phase='before',*,runtime=False):
+    must(plan.get('schema')==PUBLICATION_REPAIR_SCHEMA and phase in {'before','mixed','after'},'publication_repair_schema')
+    must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'publication_repair_owner')
+    entries={**plan['files'],**plan['operational']};binding=plan['vmm']
+    must(set(plan['files'])==set(PUBLICATION_FILES) and set(entries)==set(publication_targets(rt)),'publication_repair_inventory')
+    must(set(binding)=={'deploy','previous_successor','restored_core','control_active_sha256','preserved'} and
+         set(binding['preserved'])==set(publication_repair_preserved(rt)),'publication_repair_fields')
+    previous=binding['previous_successor'];marker=previous['marker'];ident=digest(marker.get('approval_sha256'))
+    must(set(previous)=={'marker','proof_hashes'} and set(previous['proof_hashes'])==publication_proof_names(rt) and
+         marker=={'schema':PUBLICATION_SUCCESSOR_MARKER,'approval_sha256':ident},'publication_repair_parent_fields')
+    must(json_read(rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json',rt.private)==marker,'publication_repair_parent_pointer')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    for name,want in previous['proof_hashes'].items():read(folder/name,rt.private,expected=want)
+    parent=json_read(folder/'approval.json',rt.private,ident);record=json_read(folder/'journal.json',rt.private)
+    must(parent['schema']==PUBLICATION_SUCCESSOR_SCHEMA and record.get('schema')==PUBLICATION_SUCCESSOR_SCHEMA and
+         record.get('approval_sha256')==ident and record.get('phase')=='INSTALLED','publication_repair_parent_incomplete')
+    must(plan['installed_control']=={'approval_sha256':ident,'journal_sha256':previous['proof_hashes']['journal.json']},
+         'publication_repair_control_parent')
+    history=publication_history(rt,plan,phase)
+    verify_publication_successor(rt,parent,'after',runtime=True,historical=history)
+    old=proof_json(history,rt.preserved()['policy'],rt.private,entries['policy']['before_sha256'])
+    must(entries['policy']['before_sha256']==parent['operational']['policy']['after_sha256'] and
+         old['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1' and
+         plan['current_release']==old['upgrade']['baseline_release'],'publication_repair_baseline')
+    restored_core_evidence(rt,old,binding['restored_core'],runtime=runtime)
+    _,sources=revision_bundles(rt,binding['deploy'],plan['deploy'])
+    for name in PUBLICATION_FILES:
+        if name in MODULES:must(entries[name]['after_sha256']==sha(sources[name]),'publication_repair_module_sources')
+        else:read(rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/name,rt.private,expected=entries[name]['after_sha256'])
+    for name,entry in entries.items():
+        if name not in PUBLICATION_REPAIR_MUTABLE:
+            must(entry['before_sha256']==entry['after_sha256'],'publication_repair_unrelated_change:'+name)
+    must(entries['guard']['after_sha256']==entries['core_release_guard.py']['after_sha256'],'publication_repair_same_guard')
+    afterhand=proof_read(history,rt.targets()['handoff'][0],rt.private,expected=entries['handoff']['before_sha256'])
+    values=env_values(afterhand)
+    for key,name in (('R25_CORE_RELEASE_POLICY_SHA256','policy'),('R25_CORE_RELEASE_GUARD_SHA256','guard'),('R25_VMM_CONTROLLER_SHA256','vmm_controller.py')):
+        line=(key+'='+values[key]+'\n').encode();must(afterhand.count(line)==1,'publication_repair_handoff_line')
+        afterhand=afterhand.replace(line,(key+'='+entries[name]['after_sha256']+'\n').encode())
+    must(sha(afterhand)==entries['handoff']['after_sha256'],'publication_repair_handoff_render')
+    for name,(path,owner,mode) in publication_targets(rt).items():
+        raw=read(path,owner,mode);entry=entries[name]
+        if runtime and name=='handoff':
+            actual,wanted=env_values(raw),env_values(afterhand)
+            must(all(actual.get(k)==wanted[k] for k in set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}),'publication_repair_runtime_handoff')
+        else:must(sha(raw) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'publication_repair_target_drift:'+name)
+    for name,path in publication_repair_preserved(rt).items():
+        if runtime and name not in {'overlay-active','role-active','service','token','core-successor-active','module-active','publication-active','publication-successor-active'}:continue
+        revision_preserved_read(rt,name,path,binding['preserved'][name])
+    current=read(rt.preserved()['original-controller-active'],rt.private)
+    new=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
+    allowed={binding['control_active_sha256']} if phase=='before' else {sha(new)} if phase=='after' else {binding['control_active_sha256'],sha(new)}
+    must(sha(current) in allowed,'publication_repair_controller_pointer')
+    if not runtime:revision_stopped(rt)
+
+
+def applied_publication_repair(rt,value,handoff):
+    marker=json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private)
+    ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':ident},'publication_repair_marker')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident);record=json_read(folder/'journal.json',rt.private)
+    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    must(record.get('schema')==PUBLICATION_REPAIR_SCHEMA and record.get('approval_sha256')==ident and
+         record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'publication_repair_incomplete')
+    verify_publication_repair(rt,plan,'after',runtime=True)
+    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+         env_values(read(rt.targets()['handoff'][0],rt.private))==handoff,'publication_repair_arguments')
+    must(value['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1' and
+         value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'],
+         'publication_repair_policy_binding')
+    result=copy.deepcopy(value);result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
     return result
 
 
