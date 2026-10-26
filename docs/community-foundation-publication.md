@@ -65,7 +65,8 @@ Shared/private thumbnails, rooms, voice, coins and AI are not enabled.
 Knowledge integration follows the user's AutoDL-data requirement; RAGFlow is
 not introduced.
 
-Native PostgreSQL, actual Core integration and installed lifecycle checks
-need their own PASS/FAIL/NOT_RUN evidence. PGlite and HTTP fixtures do not
-establish these facts. This proposal intentionally does not pretend that an
-unverified new service can be installed by the current contract.
+Native PostgreSQL and actual Core integration now have separate tests in the
+Core repository. The follow-up [runtime contract](community-runtime-contract.md)
+describes the new library, package validation, process fault tests and remaining
+host-specific binding. Installed lifecycle checks still need their own evidence.
+PGlite and HTTP fixtures do not establish those facts.

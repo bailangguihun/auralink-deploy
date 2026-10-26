@@ -30,6 +30,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Verify complete R25 test suite
         run: python -B -m unittest discover -s r25 -p 'test_*.py' -v
 
@@ -62,6 +66,23 @@ jobs:
           path: |
             dist/r25-controller/r25-controller.zip
             dist/r25-controller/r25-controller-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Package optional Community lifecycle library without installing
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for mode in create verify; do
+            python scripts/package-community-extension.py "$mode" \
+              --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+              --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: community-controller-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/community-controller/
           if-no-files-found: error
           retention-days: 30
 
