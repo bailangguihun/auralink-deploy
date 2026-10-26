@@ -1,9 +1,10 @@
 # Community runtime candidate
 
 This library is not installed or registered with the production watchdog.
-It adds no new CLI that can activate production and does not authorize a
-migration. The existing Core/VMM successors and their control allowlists are
-unchanged. The new module is distributed as a separate package-only artifact.
+The new [host adapter](community-host-publication.md) adds an explicitly bound
+operator CLI and finite first-install transaction, without authorizing their
+production execution or a migration. Existing Core/VMM successors and their
+control allowlists are unchanged. Modules ship as a separate package-only artifact.
 
 ## Release and process binding
 
@@ -20,7 +21,7 @@ tested Node majors are 22 and 24, with minimum 22.13.0. Every shipped file is
 verified before starting. The process receives exactly the four COMMUNITY_*
 settings; no inherited NODE_OPTIONS, database credentials or provider keys.
 
-The host adapter must call the library as the intended service UID/GID and
+The host adapter calls the library as the intended service UID/GID and
 prepare private 0700 roots and 0600 files owned by that identity. This candidate
 does not change Linux users, sudo policy, groups or ownership on the server.
 
@@ -53,13 +54,16 @@ service. Core's companion integration test separately runs the actual JAR,
 actual Node service and native PostgreSQL, including in-flight transaction
 drain and restart persistence. Neither test is production acceptance.
 
-## Host-specific work still required before production
+## Host-specific publication status
 
-1. Read the live HANDOFF, exact installed controller/guard/watchdog proof chain,
-   service user, Node path, ports, private roots and available resources.
-2. Add the reviewed host adapter and finite control-file installation transaction
-   to that existing chain; bind the original lease and watchdog lifecycle calls.
-   Do not treat this library as an installed adapter.
+1. The original WSL/SSH inspection of current proof chain, service identity,
+   Node/Python, loopback port, private roots, resources and HBA is recorded in
+   [the host contract](community-host-publication.md). Historical README text
+   is not used as the installed contract.
+2. Review the added host adapter and finite new-directory installation
+   transaction, using the installed guard's actual lease verifier.
+   The new host adapter is still uninstalled. Its foreground supervision is
+   explicit operator-session supervision, not a new watchdog registration.
 3. Bind the actual release artifacts, explicit community-only migration,
    separate migrator/runtime role privileges, backup/restore boundaries and
    the server-only Web COMMUNITY_INTERNAL_ORIGIN setting. No runtime DDL.
@@ -68,6 +72,7 @@ drain and restart persistence. Neither test is production acceptance.
 5. Publish compatible Core, Community and Web in order, then verify two-account
    business behavior and preservation of the existing application baseline.
 
-These remaining items require the original server-access workspace. No live
-identity, approval digest, resource capacity or installed-service check has
-been invented by this code review. Community has no GPU/VMM dependency.
+The finite installed Core publisher currently refuses the new candidate;
+that separate proof-bound publication prerequisite remains unresolved. No final
+production approval digest or formal release artifact has been invented.
+Community has no GPU/VMM dependency.

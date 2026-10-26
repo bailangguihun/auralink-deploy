@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-26",
+  "productionDeployment": "NOT_RUN",
+  "productionSQLWrites": 0,
+  "businessTests": "NOT_RUN",
+  "paidCalls": 0,
+  "vmmActions": 0,
+  "source": {
+    "coreMain": "ced10c6b6ae5fcb6a7dbbb222e4a1a2648f076a0",
+    "deployBase": "9464f418e416fdbadbcf226f7096c9969ccfdf4b",
+    "webMain": "6efa951b3a7665cd58e1aeb3aea37bf3b49d707f"
+  },
+  "newChecks": {
+    "hostAndCLI": {
+      "pass": 17,
+      "skip": 0
+    },
+    "nativePostgresActualNode": {
+      "pass": 13,
+      "coreAuthentication": "isolated HTTP fixture; accepted real-JAR run reused separately"
+    },
+    "retainedCorePublicationRefusal": {
+      "pass": 1
+    },
+    "webUnit": {
+      "pass": 168,
+      "skip": 0
+    },
+    "webTypecheckLintBuild": "PASS",
+    "serverOnlyBrowserBundleBoundary": "PASS"
+  },
+  "broadLocalCheckpoint": {
+    "deployPass": 595,
+    "skip": 0,
+    "note": "At earlier 10-host-test checkpoint; subsequent changes covered by targeted checks and final PR CI. Counts overlap; do not sum."
+  },
+  "reused": {
+    "coreRealJar": 40260513884,
+    "coreCI": 40261594915,
+    "deployCI": 40261861869,
+    "deployPass": 585,
+    "deploySkip": 0,
+    "mavenEnvironmentGatedSkips": 100,
+    "invalidCoreResultNotReused": 40260113674
+  },
+  "productionReadOnly": {
+    "at": "2026-10-26T12:07:26+08:00",
+    "actualNewHostFactoryOriginalGuardFullProofChain": "PASS",
+    "originalLeaseVerifier": "PASS",
+    "existingAdminReadOnlySCRAMAccess": "PASS",
+    "hbaChangeRequired": false,
+    "guardFailureBeforeFix": "ModuleNotFoundError: core_release_guard; original stderr retained",
+    "coreCandidateRejection": "business_candidate_not_approved",
+    "coreBinderRefusal": "publication_already_bound"
+  },
+  "localEvidenceSha256": {
+    "HOST_FINAL_WITH_CLI.log": "cc95f282ddf971cd59a79dcf1ac5e77e675a67396c595b1002aa53741229c342",
+    "NATIVE_HOST_SCRAM.log": "0fb7684b8a0f671bbaf8440a369ae935147dd5ddb0160f285161b43dd34bb930",
+    "CORE_PUBLICATION_BOUNDARY_2.log": "bb0ec1f313712875f890990e8f7031dfa7add7e7da2e75eb5334fc0998dfb2c4",
+    "DEPLOY_REQUIRED_SUITE_1.log": "f841b0bd69d56b44ea9ab6447ec74e3136d67de98a061c3bd1a7031dece0a7ab",
+    "WEB_REQUIRED_TESTS_1.log": "d18c748f3a18e5ea99f1d612aaf0be0a63348e85e6c9c06c34e9e503b02183aa",
+    "WEB_TYPECHECK_1.log": "d3c88e4ec12edf428ecdea59101b81a8d8d549865864df8b24e3817428d42f1b",
+    "WEB_LINT_1.log": "f645d1a223bb769d68570742991cf7e6080032758c156a4012c7685f670017f2",
+    "WEB_BUILD_1.log": "fd8e67f08249f90cd15631560f77a3aa7b59c599cf89f63caaa81e229c4da913"
+  },
+  "remaining": [
+    "Finite Core publication prerequisite under retained VMM proofs unresolved; installed VMM consumer unchanged.",
+    "Owner review, compatible release promotions, actual automatic artifacts, concrete approval and production acceptance remain."
+  ]
+}

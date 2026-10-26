@@ -9,7 +9,7 @@ import re
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
-MODULES=('community_bundle.py','community_lifecycle.py','r25_storage.py')
+MODULES=('community_bundle.py','community_lifecycle.py','community_host.py','community_host_cli.py','community_migration.py','r25_storage.py')
 
 
 def materialize(root, provenance):
