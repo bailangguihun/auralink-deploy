@@ -1,8 +1,9 @@
 # Community host adapter and publication boundary
 
-Status: review candidate, **NOT_DEPLOYED**. This adapter installs only
-the separate Community files. It cannot publish the required new Core JAR.
-Do not promote Web while that prerequisite remains unresolved.
+Status: review candidate, **NOT_DEPLOYED**. The host adapter installs only the separate Community files. The new finite
+[publication successor](community-publication-successor.md) prepares the
+compatible Core binding and original-watchdog hook. Neither is installed.
+Keep Web promotion pending until approved backend publication is verified.
 
 ## Observed predecessor (2026-10-26, original WSL/SSH profile)
 
@@ -72,26 +73,51 @@ copies, reconcile a lost pointer/receipt. A foreign pointer is never overwritten
 An orphan before its journal exists requires manual read-only reconciliation.
 No deletion of evidence, resetting approval or historical snapshot restoration.
 
-The foreground `supervise` command starts one explicitly identified operation
-and observes it under short acquisitions of the original guard's lease. It is
-an operator-session runner, **not** registration in the existing watchdog and
-not a promise of unattended operation. It never auto-restarts Community. Node
-closes every inherited lease FD, and serves HTTP without taking that lock.
-Community reads do not consult VMM/GPU state. Install is restricted to a stopped
-VMM baseline, as required by the current maintenance scope.
+Persistent operation now uses `register` and the original R25 watchdog's
+optional Community tick. The finite publication successor installs the exact
+hook; a host plan binds `restart_budget: 2`, the successor proof, full seven-file
+controller inventory, Python, Node and private settings. Registration does not
+start Node. The original watchdog starts it on a subsequent tick under the
+original guard's real verifier and inherited lease descriptor. No new daemon,
+lock, PID file replacement or HTTP-level deployment lock is introduced.
 
-SIGINT/TERM/HUP requests graceful drain. STOP_INTENT signals the verified pidfd
-once, then only observes. STOPPING/UNKNOWN is not STOPPED. A killed runner,
-lost start identity or reboot must be reconciled from retained boot/PID/ticks/
-argv/listener proofs; do not adopt a PID, repeat a signal or start another run.
-Core/AI/Web supervision is never paused by this runner. Normal deployment-lock
-contention waits for release; it does not replay an application operation.
+Each registration permits **one initial start plus two automatic restarts total**.
+The persistent attempts list consumes a slot before each start. Terminal exit,
+SSH loss, watchdog replacement, `enable`, register receipt loss and reboot do
+not reset it. A dead recorded child can restart only after verified EXITED and
+an empty listener. A saved process from another boot is reconciled as exited
+only with no listener; its original identity remains in its run record. Missing
+process identity, unknown start decision or a foreign listener requires
+investigation. Never adopt a PID or automatically replay a start/stop intent.
 
-Logs rotate by operation: each fresh explicit run has a new retained log.
-At 8 MiB the observer requests graceful drain; it does not truncate an open FD
-or automatically restart to hide the limit. This threshold is not a hard disk
-quota. Archive/retention needs operator review; no history is automatically
-deleted. Check free disk and bound actual usage before approving a session.
+Ordinary Node HTTP continues if the CLI/operator terminal exits. If the original
+watchdog dies, Node can continue but crash recovery/health/drain observation is
+unavailable until the existing watchdog is recovered. Host reboot still needs
+the existing R25 application-baseline recovery; this patch adds **no OS boot
+service** and does not enlarge that baseline's restart budget. Once the original
+watchdog resumes, Community reconciles its own retained state within its same
+three-attempt lifetime budget. Exhaustion requires a separately reviewed future
+registration transition; deleting state or reinstalling to reset it is forbidden.
+
+A continuous 60-second STARTING/unhealthy observation requests graceful drain;
+only verified exit can permit a remaining restart. STOP_INTENT sends the exact
+pidfd one SIGTERM; STOPPING/UNKNOWN is never reported as STOPPED or followed by
+SIGKILL. Maintenance `watchdog-drain` and `disable` persist desired STOPPED
+before signalling, so maintenance cannot accidentally auto-restart Community.
+Core's original publisher and the original application/java stop entry call
+this drain before stopping Java. Pending/unknown drain refuses further stop.
+After maintenance, `enable` is explicit and retains the remaining budget.
+Community failure is diagnosed independently and cannot trigger Core/AI restart.
+
+Normal HTTP does not consult VMM or hold the deployment lease. Installation
+still requires the stopped VMM baseline. The older foreground `supervise` is
+retained for zero-restart plans only; it is not the ordinary persistent path.
+Do not combine that runner with watchdog registration.
+
+Logs rotate by operation, retaining all old logs. At 8 MiB the observer drains
+and disables automatic start; it never truncates or deletes logs. This is a
+threshold, not a hard disk quota. Retention/free space need operator review.
+The 256 MiB Node old-space limit is not a total RSS cap.
 
 ## Explicit database preparation
 
@@ -163,42 +189,33 @@ a receipt. A lost receipt verifies exact bytes, never starts/redeploys anything.
 Foreign existing content is refused. Release promotion and automatic Web
 deployment remain separately authorized; this action does not merge release.
 
-## Unresolved Core publication boundary — do not bypass
+## Core publication successor and coordinated dependencies
 
-Current installed POLICY is SHA-256
-`1821f4153285ca632d9f80074322f50f127831549932b61a54f8f035b45efee7`.
-The original publisher calls `candidate_matches`: a new Core commit/JAR is
-rejected as `business_candidate_not_approved`. Existing
-`capture_core_publication` refuses `publication_already_bound` after the
-installed proof. The old VMM applied proof pins the POLICY and control-file
-afterimages. Reusing the earlier binder, changing only a hash or falsifying its
-predecessor cannot publish Community's compatible Core.
+The installed POLICY `1821f4153285ca632d9f80074322f50f127831549932b61a54f8f035b45efee7`
+rejects the new Core candidate, and `capture_core_publication` still refuses
+`publication_already_bound`. Those refusals remain. The separate finite
+successor verifies the entire retained proof against immutable before-images,
+limits control changes, adds a new proof marker and keeps VMM behavior unchanged.
+See [exact contract and recovery](community-publication-successor.md).
 
-The host adapter deliberately does not modify that installed VMM consumer or
-weaken its proof checks. A separately reviewed finite **Core publication**
-successor compatible with these retained proofs is still required. Its exact
-permitted control-file changes must be resolved before a coordinated production
-plan can be signed. The new Node role and Web setting cannot solve that guard
-restriction. The regression keeps the refusal and parent/consumption records.
-
-## Release order and approvals still outstanding
-
-1. Review the new host and server-only Web configuration PRs. Core #34, Deploy
-   #41 and Web #46 are already merged; do not request their review again.
-2. Resolve/review the finite Core publication prerequisite above. Then normal
-   same-repository main-to-release promotions. Core `R25_DEPLOY_ENABLED` was
-   absent in repository and production environment; keep it off. The Community
-   workflow is package-only, but Core's separate JAR publisher is conditional.
-3. Reuse the automatic Core service/JAR and Deploy controller packages from
-   their actual release runs. Verify outer/inner inventories and actual
-   run/attempt/manifest digests; no fabricated hashes or duplicate dispatch.
-4. Bind current proof/process/database/media preimages, new Node runtime,
-   private settings, SQL, verified backup and maintenance/recovery into the
-   final plan. Only then request its concrete production authorization.
-5. Compatible Core through its original publisher; Community role/database/
-   schema/install and supervised readiness; backend compatibility; private Web
-   origin; authorized Web release/environment deployment; read-only health.
-   Any two-account business acceptance requires its applicable explicit scope.
+1. Deploy #42 (`a87efa8…`) and Web #47 (`4f21143…`) are merged. Review only the
+   new finite-successor/watchdog change, then normal Core/Deploy main→release
+   merge-commit promotions. Keep Core `R25_DEPLOY_ENABLED` off; Web release
+   pushes may deploy and must remain pending.
+2. Reuse automatic formal Core JAR/Community packages and same-run Deploy
+   controller/VMM/Community artifacts. Verify full inventories, guards, source
+   SHA/run/attempt, archive and manifest digests. No duplicate build dispatch.
+3. Bind current predecessor, lifecycle renderer, application/process/data/media,
+   original lock, Node/Python, explicit SQL/minimal grants, settings and backups
+   into concrete plans. Request applicable production authorization only then.
+4. Apply the finite binding first, verify INSTALLED, then compatible Core through
+   its original publisher with controlled maintenance and backup. No model work.
+5. Explicit Community roles/schema transaction, host installation, registration,
+   verified original-watchdog readiness and compatibility; then the one private
+   Web origin setting. Only after backend verification and its authorized scope,
+   promote Web and use its automatic production deployment/environment approval.
+6. Read-only health/identity checks and separately scoped two-account business
+   acceptance. Rooms/voice/coins/uploads/shared media/AI remain disabled.
 
 No final production plan digest exists yet. All commands below are interfaces,
 not instructions to run with placeholders or old approvals:
@@ -212,9 +229,13 @@ not instructions to run with placeholders or old approvals:
 ```
 
 After exact authorization: `install` adds `--approval`; interrupted install
-uses `recover` with the same inputs. A fresh approved foreground `supervise`
-uses the same plan bindings plus `--operation-id <fresh-32-hex>`; `observe` and
-`stop` reconcile existing process evidence. `bind-web` is the one setting action.
+uses `recover` with the same inputs. Persistent plans next use `register` with
+the same exact plan/bundle arguments; no operation ID is manually assembled.
+`observe` reads the current role, `disable` records stop and drains; `enable`
+resumes only a drained registration without resetting attempts. `watchdog-tick`
+and `watchdog-drain` are original-watchdog/publisher entries requiring its real
+inherited `--lease-fd`; operators must not invent that descriptor. `bind-web`
+is the one setting action.
 No CLI command calls Core publication, VMM, a provider or schema SQL.
 
 ## Evidence to reuse

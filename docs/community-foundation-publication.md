@@ -2,7 +2,9 @@
 
 The initial candidate added no install command. The subsequent reviewed-host
 candidate is described in [Community host publication](community-host-publication.md).
-It changes no installed lifecycle and authorizes no production migration.
+Its optional original-watchdog integration requires the separate
+[finite publication successor](community-publication-successor.md). Neither
+candidate authorizes production installation or migration.
 
 ## Components
 
