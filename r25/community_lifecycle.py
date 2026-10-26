@@ -49,6 +49,18 @@ def listeners(port):
     return found
 
 
+def stopping_alive(saved):
+    # During exit Linux can remove exe/cwd before the task disappears. Those
+    # links are readiness evidence, not a reliable stop-completion predicate.
+    try:
+        raw = (Path('/proc')/str(saved['pid'])/'stat').read_text()
+    except FileNotFoundError:
+        return False
+    fields = raw[raw.rfind(')')+2:].split()
+    must(fields[19] == saved['ticks'], 'community_stopping_pid_reused')
+    return fields[0] != 'Z'
+
+
 class Role:
     def __init__(self, root, binding, require_lease):
         self.root, self.binding, self.require_lease = Path(root), binding, require_lease
@@ -153,7 +165,9 @@ class Role:
         if record['process'] is None: return 'UNKNOWN'
         saved = record['process']
         must(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == saved['boot_id'], 'community_boot_changed')
-        now = process(saved['pid'])
+        stopping = record['phase'] in ('STOP_INTENT','STOPPING')
+        if stopping and stopping_alive(saved): return record['phase']
+        now = None if stopping else process(saved['pid'])
         if now is None:
             child=self.children.pop(saved['pid'],None)
             if child: child.wait(timeout=1)

@@ -115,6 +115,11 @@ process.once('SIGTERM',()=>{server.close();setTimeout(()=>console.log('fixture_d
         with patch('community_lifecycle.http.client.HTTPConnection',side_effect=AssertionError('stop must not require HTTP health')):
             self.assertEqual(self.role.stop(2),'STOPPED')
 
+    def test_stop_observation_does_not_require_disappearing_exe_or_cwd_links(self):
+        self.start();self.assertEqual(self.role.stop(0),'STOPPING')
+        with patch('community_lifecycle.process',side_effect=AssertionError('exit is checked by start ticks, not exe/cwd')):
+            self.wait('STOPPED')
+
     def test_release_and_private_config_drift_refused(self):
         (self.release/'src/core.mjs').write_text('drift')
         with self.assertRaisesRegex(StorageRefused,'sha256'):self.role.start(uuid.uuid4().hex)
