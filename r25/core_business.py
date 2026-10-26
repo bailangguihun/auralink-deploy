@@ -399,9 +399,14 @@ def validate_core_followup(policy):
     must(type(ref) is dict and set(ref)=={'commit_sha','source_tree_sha256','record_sha256'}, 'core_followup_ai_reference')
     for key,item in ref.items():digest(item,40 if key=='commit_sha' else 64)
     config=up['configuration']
+    repair=value['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1'
+    # The repair's control predecessor never committed its candidate Core.
+    # Its accepted baseline policy remains older; the guard must bind this
+    # identity to the exact immutable predecessor, not to the control SHA.
+    digest(up['assistant']['baseline_policy_sha256'])
     must((config['before_sha256']!=config['after_sha256'] if first_managed else config['before_sha256']==config['after_sha256']) and
          config['assistant']['execution.expected-config-sha256']==value['ai_configuration_sha256'] and
-         up['assistant']['baseline_policy_sha256']==value['predecessor_policy_sha256'], 'core_followup_configuration_binding')
+         (repair or up['assistant']['baseline_policy_sha256']==value['predecessor_policy_sha256']), 'core_followup_configuration_binding')
     if managed:validate_managed_vmm_configuration(config.get('vmm'))
     return value
 

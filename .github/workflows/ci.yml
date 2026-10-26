@@ -70,9 +70,9 @@ jobs:
   validate:
     name: Validate deployment configuration
     runs-on: ubuntu-latest
-    # The 626 real file/lease failure tests took 598.610s in run 40273289298.
-    # Leave bounded time for required shell/Compose checks after the tests.
-    timeout-minutes: 15
+    # The 639 tests took 860.057s in formal run 40301806631. Four additional
+    # real proof/transaction regressions need room before shell/Compose checks.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
