@@ -196,3 +196,72 @@ def render_business_controls(lifecycle, launcher):
     return RenderedControls(rendered_lifecycle, rendered_launcher,
                             sha256(rendered_lifecycle), launcher_sha)
 
+
+# Exact currently installed managed lifecycle, reproduced by the unchanged
+# vmm_lifecycle.extend_lifecycle(fixtures/lifecycle_assistant_v2.py.snapshot).
+COMMUNITY_PREDECESSOR = '0bfd456125b9a3f09b8398aade49615f9db1a1127617ea99ac748613a40be919'
+COMMUNITY_METHOD = b'''    def community_action(self, mode, lease_fd=None):
+        # Optional registration, not another daemon or a GPU/VMM dependency.
+        marker=self.root/'runtime/community/WATCHDOG.json'
+        if not marker.exists() and not marker.is_symlink():return 'DISABLED'
+        guard(marker,self.private)
+        record=json.loads(marker.read_bytes())
+        keys={'schema','plan_sha256','controller_manifest_sha256','cli_sha256','python_sha256'}
+        must(set(record)==keys and record['schema']=='ARTLIVE_COMMUNITY_WATCHDOG_V1','community_registration')
+        for key in keys-{'schema'}:must(re.fullmatch('[a-f0-9]{64}',record[key]),'community_registration_digest')
+        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']
+        guard(bundle,self.private,0o700,directory=True)
+        entry=bundle/'community_host_cli.py'
+        guard(entry,self.private,0o600,record['cli_sha256'])
+        guard(bundle/'manifest.json',self.private,0o600,record['controller_manifest_sha256'])
+        python=Path('/usr/bin/python3.10')
+        guard(python,self.private,0o755,record['python_sha256'])
+        for path in (marker,entry,bundle/'manifest.json',python):
+            must(path.stat().st_nlink==1,'community_single_link')
+        must(mode in ('tick','drain'),'community_watchdog_mode')
+        plan=self.root/'runtime/community/installations'/record['plan_sha256']/'approval.json'
+        guard(plan,self.private,0o600,record['plan_sha256'])
+        def invoke(fd):
+            # The child verifies this SAME descriptor with the original guard.
+            result=subprocess.run([str(python),'-I','-B',str(entry),'watchdog-'+mode,
+                '--plan',str(plan),'--plan-sha256',record['plan_sha256'],
+                '--bundle-manifest-sha256',record['controller_manifest_sha256'],'--lease-fd',str(fd)],
+                env={},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                pass_fds=(fd,),timeout=20)
+            if result.returncode:
+                self.diagnostics.emit('COMMUNITY_WATCHDOG_REFUSED',phase=mode,exit_status=result.returncode,
+                    diagnostic=result.stderr.decode(errors='replace')[-4096:])
+                raise Refused('community_watchdog_refused')
+            value=json.loads(result.stdout)['community']
+            self.diagnostics.emit('COMMUNITY_WATCHDOG',phase=mode,state=value)
+            if mode=='drain':must(value in ('DISABLED','NOT_STARTED','STOPPED','EXITED'),'community_drain_pending')
+            return value
+        if lease_fd is not None:return invoke(lease_fd)
+        with self.lease() as fd:return invoke(fd)
+
+'''
+COMMUNITY_WATCHDOG = b'''            try:self.community_action('tick')
+            except (Refused,Busy,OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
+                self.diagnostics.emit('COMMUNITY_WATCHDOG_FAILURE',error_type=type(error).__name__,reason=str(error))
+'''
+
+
+def render_community_lifecycle(before):
+    """One exact retained lifecycle -> optional original-watchdog hook.
+
+    No VMM code, lock, wrapper or launcher is replaced by this renderer.
+    The finite publication successor must independently bind its output.
+    """
+    if sha256(before) != COMMUNITY_PREDECESSOR:
+        raise OverlayRefused('community_lifecycle_predecessor')
+    raw=replace_once(before,b'    def watchdog_once(self):\n',
+        COMMUNITY_METHOD+b'    def watchdog_once(self):\n','community_method')
+    raw=replace_once(raw,b'            return result\n        except Busy:',
+        COMMUNITY_WATCHDOG+b'            return result\n        except Busy:','community_watchdog_tick')
+    raw=replace_once(raw,b"        with self.lease(partial=True):self.stop_role('java',19080)\n",
+        b"        with self.lease(partial=True) as fd:\n            self.community_action('drain',fd)\n            self.stop_role('java',19080)\n",'community_java_drain')
+    raw=replace_once(raw,b'            # All currently running identities are established before signals.\n',
+        b"            self.community_action('drain',fd)\n            # All currently running identities are established before signals.\n",'community_application_drain')
+    ast.parse(raw)
+    return raw
+

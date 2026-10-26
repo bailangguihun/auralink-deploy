@@ -15,10 +15,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  community-host:
+    name: Validate Community host and native database boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bailangguihun/auralink-core-api
+          ref: ced10c6b6ae5fcb6a7dbbb222e4a1a2648f076a0
+          path: .community-core-fixture
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --omit=dev --ignore-scripts
+        working-directory: .community-core-fixture/community-service
+      - name: Exercise actual Node package, native PostgreSQL and original guard
+        run: |
+          test -x /usr/lib/postgresql/16/bin/initdb
+          python -B scripts/rehearse-community-host.py \
+            --pg-bin /usr/lib/postgresql/16/bin \
+            --core-source .community-core-fixture \
+            --fixture "$RUNNER_TEMP/community-host-fixture"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: community-host-result
+          path: ${{ runner.temp }}/community-host-fixture/RESULT.json
+          if-no-files-found: error
+
+  community-runtime:
+    name: Validate Community process lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -B -m unittest discover -s r25 -p 'test_community_runtime.py' -v
+
   validate:
     name: Validate deployment configuration
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The 626 real file/lease failure tests took 598.610s in run 40273289298.
+    # Leave bounded time for required shell/Compose checks after the tests.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +81,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Verify R25 publication transaction failures
         run: python -m unittest discover -s r25 -p 'test_*.py' -v
