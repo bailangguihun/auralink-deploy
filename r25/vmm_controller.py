@@ -2008,8 +2008,25 @@ def visibility_execute(rt, ident, *, database, guard, supervise, recover=False, 
         observed=database('observe')
         must(observed in ('before','after'),'visibility_unknown_database_state')
         must(old is not None or observed=='before','visibility_fresh_preimage')
-        supervise('stop',rt.fd)
-        rt.require_watchdog_stopped()
+        if recover:
+            # The original stop-metadata loader validates Core policy. It must
+            # not be invoked against mixed controls or SQL_INTENT. An interrupted
+            # installer already stopped its owned watchdog before any mutation.
+            try:rt.require_watchdog_stopped()
+            except Refused as error:
+                must(str(error)=='watchdog_must_be_stopped_before_mixed_recovery' and
+                     phase in ('DELIST_VERIFY_INTENT','RESTORED_VERIFY_INTENT'),
+                     'visibility_recovery_requires_stopped_or_verified_receipt')
+                outcome='COMMITTED' if phase=='DELIST_VERIFY_INTENT' else 'RESTORED'
+                must(observed==('after' if outcome=='COMMITTED' else 'before'),
+                     'visibility_watchdog_receipt_data')
+                visibility_proof(rt,plan,folder,phase='after' if outcome=='COMMITTED' else 'before')
+                guard('eligible',rt.fd);supervise('status',rt.fd)
+                visibility_phase(rt,folder,ident,outcome)
+                return outcome
+        else:
+            supervise('stop',rt.fd)
+            rt.require_watchdog_stopped()
         if not old:visibility_phase(rt,folder,ident,'INSTALL_INTENT')
         for name,(path,owner,mode) in visibility_paths(rt).items():
             item=plan['files'][name];live=sha(read(path,owner,mode))

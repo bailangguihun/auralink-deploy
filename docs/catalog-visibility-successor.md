@@ -116,7 +116,11 @@ matching pg_stat_activity before any action. Partial/foreign states refuse.
 No automatic SQL retries. A lost committed receipt completes verification and
 supervision without replay. An unresolved SQL_INTENT whose exact preimage is
 confirmed and whose child is absent retires the approval as RESTORED, without
-submitting it again. A known pre-SQL interrupted two-control install can continue
+submitting it again. A lost watchdog start receipt is reconciled with the original owned status; no
+second start or restart-budget reset occurs. Mixed-control/SQL_INTENT recovery
+checks that the watchdog is already stopped; it cannot call the policy-dependent
+original stop-metadata loader against an incomplete pair. A known pre-SQL
+interrupted two-control install can continue
 only its own transaction. Foreign pointers/bytes refuse before further writes.
 
 Run `recover-visibility` promptly on the same unfinished transaction after an
@@ -140,7 +144,7 @@ private replay scripts additionally execute actual captured 429-file predecessor
 proof bytes, accepted Core record and original guard. Native PostgreSQL uses the
 exact 13 selection rows and 486 UUIDs, applies SQL, checks the actual guard data
 predicate, forks/runs/stops the original watchdog implementation, and restores
-the exact controls/selections. Repeat for lost SQL receipt and interrupted
+the exact controls/selections. Repeat for lost SQL and watchdog receipts and interrupted
 restoration; preserve a new forward-history record throughout.
 
 CPU fixture non-selection tables, media I/O and external service health are

@@ -7,7 +7,7 @@
     "application_deployments": 0
   },
   "unit_tests": {
-    "new": 11,
+    "new": 13,
     "existing_repair": 15,
     "result": "PASS"
   },
@@ -87,7 +87,6 @@
       "events": [
         "original_watchdog_stop:STOPPED",
         "installed_guard_accepted",
-        "original_watchdog_stop:STOPPED",
         "installed_guard_accepted",
         "installed_guard_accepted",
         "original_watchdog_start:RUNNING",
@@ -133,6 +132,46 @@
         "original_watchdog_status:RUNNING",
         "original_watchdog_stop:STOPPED",
         "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "installed_guard_accepted"
+      ],
+      "production_access": false,
+      "limits": [
+        "native CPU fixture data outside exact selected heads/UUIDs",
+        "media and service I/O are fixtures; real complete guard verified separately read-only"
+      ]
+    },
+    {
+      "result": "PASS",
+      "interruption": "watchdog-receipt",
+      "targets": 486,
+      "selections": 12,
+      "sql_calls": [
+        "delist",
+        "restore"
+      ],
+      "watchdog_heartbeats": 2,
+      "actual_guard_source": "64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff",
+      "actual_watchdog_source": "94e7413c31668d56ecec774f6497cc8a31d2135346d7c91d1990e27f77b471a8",
+      "controls_restored": true,
+      "old_proofs_preserved": true,
+      "forward_history_preserved": true,
+      "events": [
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
         "original_watchdog_stop:STOPPED",
         "installed_guard_accepted",
         "installed_guard_accepted",

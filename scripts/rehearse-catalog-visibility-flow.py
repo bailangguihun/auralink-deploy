@@ -17,7 +17,7 @@ v=helpers['v'];Capture=helpers['Capture'];material=helpers['material']
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for key in ('capture','manifest','heads','pg-bin','output'):p.add_argument('--'+key,type=Path,required=True)
-    p.add_argument('--interrupt',choices=['none','sql-receipt','restore-controls'],default='none')
+    p.add_argument('--interrupt',choices=['none','sql-receipt','restore-controls','watchdog-receipt'],default='none')
     a=p.parse_args();c=Capture(a.capture);D=Path(tempfile.mkdtemp(prefix='catalog-visibility-flow-'));B=a.pg_bin
     socket=D/'socket';socket.mkdir();env=dict(os.environ)
     lib=B.parents[3]/'lib/x86_64-linux-gnu'
@@ -139,7 +139,7 @@ def main():
                     try:os.waitpid(-1,os.WNOHANG)
                     except ChildProcessError:pass
                 events.append('original_watchdog_'+mode+':'+result['result'])
-            rt.require_watchdog_stopped=lambda:None if engine.watchdog_identity() is None else (_ for _ in ()).throw(AssertionError('watchdog live'))
+            rt.require_watchdog_stopped=lambda:None if engine.watchdog_identity() is None else (_ for _ in ()).throw(v.Refused('watchdog_must_be_stopped_before_mixed_recovery'))
             def database(mode):
                 if mode=='observe':
                     value=jsonsql('SELECT '+fp('catalog_batch_current_revisions'))
@@ -150,10 +150,10 @@ def main():
             # Actual native SQL, actual retained proof and original watchdog.
             with patch.object(v,'revision_stopped',lambda _:None):
                 def fault(where):
-                    if a.interrupt=='sql-receipt' and where=='after:sql':raise InterruptedError('isolated lost SQL receipt')
+                    if (a.interrupt,where) in (('sql-receipt','after:sql'),('watchdog-receipt','after:watchdog')):raise InterruptedError('isolated lost receipt')
                 try:result=v.visibility_execute(rt,ident,database=database,guard=guard,supervise=supervise,fault=fault)
                 except InterruptedError:
-                    assert a.interrupt=='sql-receipt'
+                    assert a.interrupt in ('sql-receipt','watchdog-receipt')
                     result=v.visibility_execute(rt,ident,database=database,guard=guard,supervise=supervise,recover=True)
                 assert result=='COMMITTED' and calls==['delist']
                 deadline=time.monotonic()+12

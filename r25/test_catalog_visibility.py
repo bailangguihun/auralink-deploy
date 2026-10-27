@@ -39,7 +39,7 @@ class Visibility(unittest.TestCase):
         self.patch(patch.object(v,'json_read',side_effect=json_read))
         self.patch(patch.object(v,'visibility_proof',side_effect=self.proof))
         self.patch(patch.object(v,'revision_stopped',side_effect=lambda rt:self.events.append('VMM_STOPPED')))
-        self.patch(patch.object(self.rt,'require_watchdog_stopped',side_effect=lambda:self.assertTrue(self.stopped)))
+        self.patch(patch.object(self.rt,'require_watchdog_stopped',side_effect=lambda:None if self.stopped else (_ for _ in ()).throw(v.Refused('watchdog_must_be_stopped_before_mixed_recovery'))))
 
     def patch(self,p):p.start();self.addCleanup(p.stop)
     def put(self,p,b):p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b);p.chmod(0o600)
@@ -104,6 +104,23 @@ class Visibility(unittest.TestCase):
         self.assertEqual('RESTORED',self.run_tx(recover=True));self.assertEqual(['delist','restore'],self.sql)
         path=self.rt.store/'CATALOG_VISIBILITY_ACTIVE.json';self.put(path,v.encoded({'schema':v.VISIBILITY_MARKER,'approval_sha256':'b'*64}))
         with self.assertRaises(Exception):self.run_tx(recover=True,restore=True)
+
+    def test_lost_watchdog_receipt_uses_owned_status_without_second_start(self):
+        with self.assertRaises(InterruptedError):self.run_tx(fault=self.fail('after:watchdog'))
+        starts=self.events.count('watchdog:start');stops=self.events.count('watchdog:stop')
+        self.assertEqual('COMMITTED',self.run_tx(recover=True))
+        self.assertEqual(starts,self.events.count('watchdog:start'))
+        self.assertEqual(stops,self.events.count('watchdog:stop'))
+        self.assertEqual(['delist'],self.sql)
+
+    def test_mixed_recovery_does_not_call_original_policy_dependent_stop(self):
+        with self.assertRaises(InterruptedError):self.run_tx(fault=self.fail('after:vmm_controller.py'))
+        original=self.supervise
+        def supervise(mode,fd):
+            self.assertNotEqual(mode,'stop','mixed controls must use already-stopped proof')
+            original(mode,fd)
+        self.supervise=supervise
+        self.assertEqual('COMMITTED',self.run_tx(recover=True))
 
     def test_original_lease_contention_refuses_before_actions(self):
         import fcntl
