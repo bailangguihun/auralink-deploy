@@ -2074,7 +2074,18 @@ def visibility_execute(rt, ident, *, database, guard, supervise, recover=False, 
                 if fault:fault('restore:'+name)
             guard('eligible',rt.fd)
         if fault:fault('before:watchdog')
-        supervise('start',rt.fd);supervise('status',rt.fd)
+        start_intent=folder/(outcome+'-watchdog-start-intent.json')
+        if start_intent.exists():
+            # A missing PID/exit receipt after durable start intent is UNKNOWN,
+            # not permission for another fork. Only owned status can reconcile.
+            json_read(start_intent,rt.private)
+            supervise('status',rt.fd)
+        else:
+            rt.atomic(start_intent,encoded(dict(schema=VISIBILITY_SCHEMA,approval_sha256=ident,
+                                               operation=outcome,automatic_retries=0)))
+            if fault:fault('after:watchdog-intent')
+            supervise('start',rt.fd)
+        supervise('status',rt.fd)
         if fault:fault('after:watchdog')
         visibility_phase(rt,folder,ident,outcome)
         return outcome

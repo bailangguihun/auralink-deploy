@@ -117,7 +117,9 @@ No automatic SQL retries. A lost committed receipt completes verification and
 supervision without replay. An unresolved SQL_INTENT whose exact preimage is
 confirmed and whose child is absent retires the approval as RESTORED, without
 submitting it again. A lost watchdog start receipt is reconciled with the original owned status; no
-second start or restart-budget reset occurs. Mixed-control/SQL_INTENT recovery
+second start or restart-budget reset occurs. A durable watchdog start intent
+without an owned PID/receipt is UNKNOWN: status must reconcile it or recovery
+refuses; absence is never permission for another fork. Mixed-control/SQL_INTENT recovery
 checks that the watchdog is already stopped; it cannot call the policy-dependent
 original stop-metadata loader against an incomplete pair. A known pre-SQL
 interrupted two-control install can continue

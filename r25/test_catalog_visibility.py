@@ -122,6 +122,14 @@ class Visibility(unittest.TestCase):
         self.supervise=supervise
         self.assertEqual('COMMITTED',self.run_tx(recover=True))
 
+    def test_uncertain_watchdog_start_intent_never_forks_again(self):
+        with self.assertRaises(InterruptedError):self.run_tx(fault=self.fail('after:watchdog-intent'))
+        self.assertEqual(0,self.events.count('watchdog:start'))
+        with self.assertRaises(AssertionError):self.run_tx(recover=True)
+        self.assertEqual(0,self.events.count('watchdog:start'))
+        self.assertEqual(['delist'],self.sql)
+        self.assertTrue((self.folder/'COMMITTED-watchdog-start-intent.json').exists())
+
     def test_original_lease_contention_refuses_before_actions(self):
         import fcntl
         with self.lock.open('rb') as f:
