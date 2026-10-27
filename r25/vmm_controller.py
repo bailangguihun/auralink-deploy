@@ -635,6 +635,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'CATALOG_VISIBILITY_ACTIVE.json').exists():return applied_catalog_visibility(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json').exists():return applied_publication_repair(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json').exists():return applied_publication_successor(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_ACTIVE.json').exists():return applied_core_publication(rt,value,handoff)
@@ -1721,7 +1722,7 @@ def capture_publication_repair(rt,deploy):
         'preserved':{n:sha(revision_preserved_read(rt,n,p)) for n,p in publication_repair_preserved(rt).items()}}
 
 
-def verify_publication_repair(rt,plan,phase='before',*,runtime=False):
+def verify_publication_repair(rt,plan,phase='before',*,runtime=False,historical=None):
     must(plan.get('schema')==PUBLICATION_REPAIR_SCHEMA and phase in {'before','mixed','after'},'publication_repair_schema')
     must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'publication_repair_owner')
     entries={**plan['files'],**plan['operational']};binding=plan['vmm']
@@ -1761,7 +1762,7 @@ def verify_publication_repair(rt,plan,phase='before',*,runtime=False):
         afterhand=afterhand.replace(line,(key+'='+entries[name]['after_sha256']+'\n').encode())
     must(sha(afterhand)==entries['handoff']['after_sha256'],'publication_repair_handoff_render')
     for name,(path,owner,mode) in publication_targets(rt).items():
-        raw=read(path,owner,mode);entry=entries[name]
+        raw=proof_read(historical,path,owner,mode);entry=entries[name]
         if runtime and name=='handoff':
             actual,wanted=env_values(raw),env_values(afterhand)
             must(all(actual.get(k)==wanted[k] for k in set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}),'publication_repair_runtime_handoff')
@@ -1776,7 +1777,7 @@ def verify_publication_repair(rt,plan,phase='before',*,runtime=False):
     if not runtime:revision_stopped(rt)
 
 
-def applied_publication_repair(rt,value,handoff):
+def applied_publication_repair(rt,value,handoff,*,historical=None):
     marker=json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private)
     ident=digest(marker.get('approval_sha256'))
     must(marker=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':ident},'publication_repair_marker')
@@ -1785,9 +1786,9 @@ def applied_publication_repair(rt,value,handoff):
     json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
     must(record.get('schema')==PUBLICATION_REPAIR_SCHEMA and record.get('approval_sha256')==ident and
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'publication_repair_incomplete')
-    verify_publication_repair(rt,plan,'after',runtime=True)
+    verify_publication_repair(rt,plan,'after',runtime=True,historical=historical)
     must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
-         env_values(read(rt.targets()['handoff'][0],rt.private))==handoff,'publication_repair_arguments')
+         env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private))==handoff,'publication_repair_arguments')
     must(value['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1' and
          value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'],
          'publication_repair_policy_binding')
@@ -1795,13 +1796,512 @@ def applied_publication_repair(rt,value,handoff):
     return result
 
 
+# One finite visibility successor. It changes no consumer, accepted policy,
+# database schema, VMM service, Community registration or historical proof.
+VISIBILITY_SCHEMA = 'R25_CATALOG_VISIBILITY_SUCCESSOR_V1'
+VISIBILITY_MARKER = 'R25_CATALOG_VISIBILITY_ACTIVE_V1'
+VISIBILITY_MANIFEST = 'a393ff317c50b814acbf0c684fb0f74674840df491babed5a3a6707a90fea5b1'
+VISIBILITY_POLICY = 'd1af33be9dd10650998d52c6f7f6a43a1cbb158ccdef8bce398d95598ac49679'
+VISIBILITY_PARENT = '07c09799684c1f18683dbe9d326bc4e5738c9b3091c9aa946e626109b17a9d7c'
+VISIBILITY_CORE = '96babcf2bf34e135c889d8f3a76a9bac98d908e5'
+VISIBILITY_RETENTION = 'cb78ec66b9656548a9b8554cb3dce9b8d653bb3b8982ea7066e6cbdc745511ec'
+VISIBILITY_HEADS = {
+    'before': {'rows': 13, 'md5': '084bbd9048d5259976fa671e2497ddd7'},
+    'after': {'rows': 1, 'md5': 'b7e98d78efe5a2d1ef52f5ecf20fc422'}}
+
+
+def visibility_paths(rt):
+    return {n: rt.targets()[n] for n in ('vmm_controller.py', 'handoff')}
+
+
+def visibility_handoff(before, controller_sha):
+    values = env_values(before)
+    line = ('R25_VMM_CONTROLLER_SHA256='+values['R25_VMM_CONTROLLER_SHA256']+'\n').encode()
+    must(before.count(line) == 1, 'visibility_handoff_line')
+    return before.replace(line, ('R25_VMM_CONTROLLER_SHA256='+digest(controller_sha)+'\n').encode())
+
+
+def visibility_manifest(raw):
+    must(sha(raw) == VISIBILITY_MANIFEST, 'visibility_exact_original_manifest')
+    m = json.loads(raw)
+    must(len(m['heads']) == 12 and len(m['rows']) == 486 and
+         len({x['batch_id'] for x in m['heads']}) == 12 and
+         len({x['painting_id'] for x in m['rows']}) == 486,
+         'visibility_exact_scope')
+    return m
+
+
+def visibility_retention(old):
+    must(old['schema'] == 'R25_CORE_RETAINED_DATA_V1' and
+         old['tables']['catalog_batch_current_revisions'] == VISIBILITY_HEADS['before'],
+         'visibility_retained_before_image')
+    after = copy.deepcopy(old)
+    after['tables']['catalog_batch_current_revisions'] = VISIBILITY_HEADS['after']
+    return after
+
+
+def visibility_folder(rt, ident):
+    return rt.store/'catalog-visibility'/digest(ident)
+
+
+def visibility_proof(rt, plan, folder, *, phase='after'):
+    """Validate exactly two controls, then run the entire retained proof chain.
+
+    The historical view is limited to their independently checked before-images.
+    No original record or policy is edited and no other live read is substituted.
+    """
+    must(set(plan) == {'schema','deploy','controller_deploy','review_sha256','manifest_sha256',
+        'policy_sha256','parent','current','preserved','files','retention_before','retention_after',
+        'preimages_sha256','sql_sha256','restore_sql_sha256','private_owner','host'}, 'visibility_plan_fields')
+    must(plan['schema'] == VISIBILITY_SCHEMA and plan['private_owner'] == list(rt.private) and
+         plan['manifest_sha256'] == VISIBILITY_MANIFEST and plan['policy_sha256'] == VISIBILITY_POLICY and
+         plan['parent'] == VISIBILITY_PARENT and set(plan['files']) == set(visibility_paths(rt)),
+         'visibility_supported_predecessor')
+    must(phase in ('before','mixed','after'), 'visibility_control_phase')
+    manifest = visibility_manifest(read(folder/'manifest.json', rt.private, expected=VISIBILITY_MANIFEST))
+    json_read(folder/'review.json', rt.private, digest(plan['review_sha256']))
+    before_retention = json_read(Path(plan['retention_before']['path']), rt.private, VISIBILITY_RETENTION)
+    must(plan['retention_before']['sha256'] == VISIBILITY_RETENTION and
+         plan['retention_after'] == {'path':str(rt.store/'catalog-visibility-retention'/(sha(encoded(visibility_retention(before_retention)))+'.json')),
+                                    'sha256':sha(encoded(visibility_retention(before_retention)))},
+         'visibility_retention_derivation')
+    read(Path(plan['retention_after']['path']), rt.private, expected=plan['retention_after']['sha256'])
+    pre = json_read(folder/'preimages.json', rt.private, plan['preimages_sha256'])
+    must(sha(visibility_sql(manifest, pre)) == plan['sql_sha256'] and
+         sha(visibility_sql(manifest, pre, restore=True)) == plan['restore_sql_sha256'],
+         'visibility_sql_derivation')
+    read(folder/'delist.sql', rt.private, expected=plan['sql_sha256'])
+    read(folder/'restore.sql', rt.private, expected=plan['restore_sql_sha256'])
+    oldpolicy = json_read(rt.preserved()['policy'], rt.private, VISIBILITY_POLICY)
+    must(oldpolicy['upgrade']['candidate']['commit_sha'] == VISIBILITY_CORE and
+         oldpolicy['upgrade']['compatibility'] == {
+             'retention_manifest_path':plan['retention_before']['path'],
+             'retention_manifest_sha256':VISIBILITY_RETENTION}, 'visibility_original_policy')
+    current = json_read(rt.preserved()['core-current'], rt.private)
+    must(current == plan['current'] and current['release']['commit_sha'] == VISIBILITY_CORE and
+         current['release']['artifact_sha256'] == oldpolicy['upgrade']['candidate']['artifact_sha256'],
+         'visibility_current_drift')
+    tx = current['transaction_id'];must(re.fullmatch('[a-f0-9]{32}',tx), 'visibility_core_transaction')
+    journal = json_read(rt.root/'runtime/core-publications/transactions'/tx/'journal.json',rt.private)
+    must(journal['phase'] == 'COMMITTED' and journal['candidate'] == current['release'], 'visibility_core_not_committed')
+    required = {str(rt.preserved()[n]) for n in ('policy','core-current','original-controller-active')}
+    required |= {str(rt.root/'operations/core_release_guard.py'), str(rt.root/'operations/lifecycle_adapter.py'),
+                 str(rt.root/'operations/r25-publisher/core_business.py')}
+    must(required <= set(plan['preserved']), 'visibility_preserved_inventory')
+    for path, entry in plan['preserved'].items():
+        must(set(entry) == {'sha256','owner','mode'}, 'visibility_preserved_identity')
+        read(Path(path), tuple(entry['owner']), entry['mode'], entry['sha256'])
+    _, sources = revision_bundles(rt, plan['deploy'], plan['controller_deploy'])
+    must(sources['core_release_guard.py'] == read(rt.root/'operations/core_release_guard.py',rt.scripts,0o700) and
+         sources['vmm_lifecycle.py'] == read(rt.targets()['vmm_lifecycle.py'][0],rt.private) and
+         sources['vmm_service.py'] == read(rt.targets()['vmm_service.py'][0],rt.private),
+         'visibility_consumer_changes_forbidden')
+    history = {}
+    for name,(path,owner,mode) in visibility_paths(rt).items():
+        entry=plan['files'][name]
+        must(set(entry)=={'before_sha256','after_sha256'}, 'visibility_target_fields')
+        before=read(folder/'before'/name,rt.private,expected=entry['before_sha256'])
+        after=read(folder/'after'/name,rt.private,expected=entry['after_sha256'])
+        must(after == (sources[name] if name=='vmm_controller.py' else
+                      visibility_handoff(before, plan['files']['vmm_controller.py']['after_sha256'])),
+             'visibility_exact_control_delta')
+        live=read(path,owner,mode)
+        must(sha(live) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),
+             'visibility_control_drift:'+name)
+        history[path]=(folder/'before'/name,rt.private,entry['before_sha256'])
+    marker=json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private)
+    must(marker=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':VISIBILITY_PARENT},
+         'visibility_parent_pointer')
+    effective=applied_publication_repair(rt,oldpolicy,
+        env_values(read(folder/'before/handoff',rt.private)),historical=history)
+    return effective
+
+
+def applied_catalog_visibility(rt, value, handoff):
+    marker=json_read(rt.store/'CATALOG_VISIBILITY_ACTIVE.json',rt.private)
+    ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':VISIBILITY_MARKER,'approval_sha256':ident},'visibility_marker')
+    folder=visibility_folder(rt,ident)
+    plan=json_read(folder/'approval.json',rt.private,ident)
+    state=json_read(folder/'journal.json',rt.private)
+    must(state.get('schema')==VISIBILITY_SCHEMA and state.get('approval_sha256')==ident,
+         'visibility_journal_binding')
+    phase=state.get('phase')
+    must(phase in ('CONTROLS_READY','DELIST_VERIFY_INTENT','COMMITTED','RESTORED_VERIFY_INTENT','RESTORED'),
+         'visibility_reconciliation_required')
+    effective=visibility_proof(rt,plan,folder)
+    must(value==json_read(rt.preserved()['policy'],rt.private,VISIBILITY_POLICY) and
+         handoff==env_values(read(rt.targets()['handoff'][0],rt.private)), 'visibility_overlay_arguments')
+    if phase in ('DELIST_VERIFY_INTENT','COMMITTED'):
+        effective['upgrade']['compatibility']={
+            'retention_manifest_path':plan['retention_after']['path'],
+            'retention_manifest_sha256':plan['retention_after']['sha256']}
+    return effective
+
+
+def visibility_sql(manifest, pre, *, restore=False):
+    """One transaction; only current selection rows. Never an import rollback."""
+    def lit(x): return "'"+x.replace("'","''")+"'"
+    def obj(x): return lit(json.dumps(x,separators=(',',':'),ensure_ascii=False))+'::jsonb'
+    def fp(table):
+        must(re.fullmatch('[a-z_][a-z_0-9]*',table),'visibility_table_name')
+        return "(SELECT jsonb_build_object('rows',count(*),'md5',md5(coalesce(string_agg(to_jsonb(t)::text,E'\\n' ORDER BY to_jsonb(t)::text),''))) FROM public.\""+table+'\" t)'
+    def fingerprints(tables):
+        pairs=[lit(t)+','+fp(t) for t in sorted(tables)]
+        return ' || '.join('jsonb_build_object('+','.join(pairs[i:i+20])+')' for i in range(0,len(pairs),20))
+    def check(condition,reason): return 'IF NOT ('+condition+') THEN RAISE EXCEPTION '+lit(reason)+'; END IF;\n'
+    heads=sorted(manifest['heads'],key=lambda x:x['batch_id'])
+    must(len(heads)==12 and len(manifest['rows'])==486,'visibility_sql_scope')
+    for h in heads:must(re.fullmatch('[a-f0-9-]{36}',h['batch_id']) and h['revision']==1,'visibility_head_identity')
+    bids=','.join(lit(h['batch_id'])+'::uuid' for h in heads)
+    expr="(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY batch_id),'[]'::jsonb) FROM catalog_batch_current_revisions t WHERE batch_id IN ("+bids+'))'
+    retained={k:v for k,v in pre.items() if k!='catalog_batch_current_revisions'}
+    must(len(retained)>10 and all(t in retained for t in ('catalog_paintings','catalog_source_records')),'visibility_complete_preimage')
+    body='\n'.join('PERFORM pg_advisory_xact_lock(hashtextextended('+lit('catalog-import:'+h['batch_id']+':1')+',0));' for h in heads)+'\n'
+    body+=check(expr+' = '+obj([] if restore else heads),'VISIBILITY_SELECTION_PREIMAGE_DRIFT')
+    body+=check('(SELECT jsonb_agg(public_id::text ORDER BY public_id::text) FROM catalog_paintings WHERE current_batch_id IN ('+bids+')) = '+obj(sorted(x['painting_id'] for x in manifest['rows'])),'VISIBILITY_UUID_DRIFT')
+    body+=check('(SELECT count(*) FROM catalog_source_records WHERE batch_id IN ('+bids+')) = 486','VISIBILITY_SOURCE_COUNT')
+    if not restore:body+=check('('+fingerprints(retained)+') = '+obj(retained),'VISIBILITY_RETAINED_DRIFT')
+    body+='before_retained := '+fingerprints(retained)+';\n'
+    if restore:body+='INSERT INTO catalog_batch_current_revisions(batch_id,revision,selected_at) SELECT batch_id,revision,selected_at FROM jsonb_populate_recordset(NULL::catalog_batch_current_revisions,'+obj(heads)+');\n'
+    else:body+='DELETE FROM catalog_batch_current_revisions WHERE batch_id IN ('+bids+');\n'
+    body+='GET DIAGNOSTICS changed = ROW_COUNT;\n'+check('changed = 12','VISIBILITY_ROW_COUNT')
+    body+=check(expr+' = '+obj(heads if restore else []),'VISIBILITY_POSTIMAGE')
+    body+=check('('+fingerprints(retained)+') = before_retained','VISIBILITY_UNRELATED_WRITE')
+    return ("\\set ON_ERROR_STOP on\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSET LOCAL lock_timeout='5000ms'; SET LOCAL statement_timeout='45000ms';\nLOCK TABLE catalog_batch_current_revisions IN SHARE ROW EXCLUSIVE MODE;\nDO $visibility$ DECLARE changed integer; before_retained jsonb; BEGIN\n"+body+"END $visibility$;\nCOMMIT;\n").encode()
+
+
+def visibility_phase(rt, folder, ident, phase):
+    path=folder/'journal.json'
+    old=json_read(path,rt.private) if path.exists() else {'history':[]}
+    rt.write_state(path,dict(schema=VISIBILITY_SCHEMA,approval_sha256=ident,phase=phase,
+                            history=old['history']+[phase]))
+
+
+def visibility_execute(rt, ident, *, database, guard, supervise, recover=False, restore=False, fault=None):
+    """Bound coordinator API. Callbacks are private host adapters, never CLI SQL.
+
+    database('observe') returns exact before/after or refuses partial/foreign
+    state; database('delist'/'restore') submits the plan-bound SQL ONCE. A lost
+    receipt is reconciled by observe; SQL_INTENT is never automatically replayed.
+    guard calls the installed original require_backend_eligible with this lease.
+    supervise uses the original owned-watchdog controls. No service restarts.
+    """
+    folder=visibility_folder(rt,ident);plan=json_read(folder/'approval.json',rt.private,ident)
+    with rt.lease():
+        # Verify the real original lease even in mixed recovery; this must NOT
+        # call policy()/eligibility until the two controls form a complete pair.
+        guard('lease',rt.fd)
+        journal=folder/'journal.json'
+        old=json_read(journal,rt.private) if journal.exists() else None
+        phase=old['phase'] if old else None
+        if phase in ('COMMITTED','RESTORED') and not restore:
+            visibility_proof(rt,plan,folder,phase='before' if phase=='RESTORED' else 'after')
+            must(database('observe')==('after' if phase=='COMMITTED' else 'before'),'visibility_terminal_data_drift')
+            guard('eligible',rt.fd);supervise('status',rt.fd)
+            return phase+'_VERIFIED_NOOP'
+        must(recover == bool(old) or (restore and phase=='COMMITTED'),'visibility_recover_original_transaction')
+        visibility_proof(rt,plan,folder,phase='mixed' if old else 'before')
+        active=rt.store/'CATALOG_VISIBILITY_ACTIVE.json'
+        if active.exists():must(json_read(active,rt.private)=={'schema':VISIBILITY_MARKER,'approval_sha256':ident},'visibility_foreign_active')
+        revision_stopped(rt)
+        observed=database('observe')
+        must(observed in ('before','after'),'visibility_unknown_database_state')
+        must(old is not None or observed=='before','visibility_fresh_preimage')
+        if recover:
+            # The original stop-metadata loader validates Core policy. It must
+            # not be invoked against mixed controls or SQL_INTENT. An interrupted
+            # installer already stopped its owned watchdog before any mutation.
+            try:rt.require_watchdog_stopped()
+            except Refused as error:
+                must(str(error)=='watchdog_must_be_stopped_before_mixed_recovery' and
+                     phase in ('DELIST_VERIFY_INTENT','RESTORED_VERIFY_INTENT'),
+                     'visibility_recovery_requires_stopped_or_verified_receipt')
+                outcome='COMMITTED' if phase=='DELIST_VERIFY_INTENT' else 'RESTORED'
+                must(observed==('after' if outcome=='COMMITTED' else 'before'),
+                     'visibility_watchdog_receipt_data')
+                visibility_proof(rt,plan,folder,phase='after' if outcome=='COMMITTED' else 'before')
+                guard('eligible',rt.fd);supervise('status',rt.fd)
+                visibility_phase(rt,folder,ident,outcome)
+                return outcome
+        else:
+            supervise('stop',rt.fd)
+            rt.require_watchdog_stopped()
+        if not old:visibility_phase(rt,folder,ident,'INSTALL_INTENT')
+        for name,(path,owner,mode) in visibility_paths(rt).items():
+            item=plan['files'][name];live=sha(read(path,owner,mode))
+            if live==item['before_sha256']:
+                rt.atomic(path,read(folder/'after'/name,rt.private,expected=item['after_sha256']),before=live,owner=owner,mode=mode)
+            if fault:fault('after:'+name)
+        marker=rt.store/'CATALOG_VISIBILITY_ACTIVE.json'
+        want={'schema':VISIBILITY_MARKER,'approval_sha256':ident}
+        if marker.exists():must(json_read(marker,rt.private)==want,'visibility_foreign_active')
+        else:rt.atomic(marker,encoded(want))
+        if fault:fault('after:marker')
+        if restore:
+            must(phase in ('COMMITTED','RESTORE_INTENT') or recover,'visibility_restore_state')
+            if observed=='after':
+                must(phase!='RESTORE_INTENT','visibility_uncertain_restore_no_replay')
+                visibility_phase(rt,folder,ident,'RESTORE_INTENT')
+                database('restore')
+                if fault:fault('after:restore-sql')
+                must(database('observe')=='before','visibility_restore_unknown')
+            visibility_phase(rt,folder,ident,'RESTORED_VERIFY_INTENT')
+            outcome='RESTORED'
+        elif recover and observed=='before' and phase in ('SQL_INTENT','RESTORE_INTENT','RESTORED_VERIFY_INTENT'):
+            # Receipt absent, readback unchanged: retire this approval. Never
+            # resubmit it, refund it or guess whether the remote child stopped.
+            visibility_phase(rt,folder,ident,'RESTORED_VERIFY_INTENT');outcome='RESTORED'
+        elif observed=='after':
+            must(old is not None and phase in ('SQL_INTENT','DELIST_VERIFY_INTENT','COMMITTED'),
+                 'visibility_unattributed_postimage')
+            visibility_phase(rt,folder,ident,'DELIST_VERIFY_INTENT');outcome='COMMITTED'
+        else:
+            visibility_phase(rt,folder,ident,'CONTROLS_READY');guard('eligible',rt.fd)
+            visibility_phase(rt,folder,ident,'SQL_INTENT')
+            if fault:fault('before:sql')
+            database('delist')
+            if fault:fault('after:sql')
+            must(database('observe')=='after','visibility_sql_unknown')
+            visibility_phase(rt,folder,ident,'DELIST_VERIFY_INTENT');outcome='COMMITTED'
+        visibility_proof(rt,plan,folder)
+        guard('eligible',rt.fd)
+        if outcome=='RESTORED':
+            for name,(path,owner,mode) in reversed(list(visibility_paths(rt).items())):
+                entry=plan['files'][name]
+                rt.atomic(path,read(folder/'before'/name,rt.private,expected=entry['before_sha256']),
+                          before=entry['after_sha256'],owner=owner,mode=mode)
+                if fault:fault('restore:'+name)
+            guard('eligible',rt.fd)
+        if fault:fault('before:watchdog')
+        start_intent=folder/(outcome+'-watchdog-start-intent.json')
+        if start_intent.exists():
+            # A missing PID/exit receipt after durable start intent is UNKNOWN,
+            # not permission for another fork. Only owned status can reconcile.
+            json_read(start_intent,rt.private)
+            supervise('status',rt.fd)
+        else:
+            rt.atomic(start_intent,encoded(dict(schema=VISIBILITY_SCHEMA,approval_sha256=ident,
+                                               operation=outcome,automatic_retries=0)))
+            if fault:fault('after:watchdog-intent')
+            supervise('start',rt.fd)
+        supervise('status',rt.fd)
+        if fault:fault('after:watchdog')
+        visibility_phase(rt,folder,ident,outcome)
+        return outcome
+
+
+def prepare_catalog_visibility(rt, request, *, manifest_raw, preimages_raw, review_raw):
+    """Prepare only; approval.json must arrive via the existing human channel."""
+    must(set(request)=={'schema','deploy','controller_deploy','review_sha256','host'} and
+         request['schema']=='R25_CATALOG_VISIBILITY_REQUEST_V1','visibility_request_fields')
+    must(sha(review_raw)==request['review_sha256'] and bool(json.loads(review_raw)), 'visibility_review_identity')
+    manifest=visibility_manifest(manifest_raw);pre=json.loads(preimages_raw)
+    must(pre.get('catalog_batch_current_revisions')==VISIBILITY_HEADS['before'], 'visibility_preimage')
+    with rt.lease():
+        revision_stopped(rt);revision_apps_committed(rt)
+        marker=rt.store/'CATALOG_VISIBILITY_ACTIVE.json'
+        must(not marker.exists() and not marker.is_symlink(),'visibility_already_consumed')
+        policy=json_read(rt.preserved()['policy'],rt.private,VISIBILITY_POLICY)
+        hand=read(rt.targets()['handoff'][0],rt.private)
+        applied_publication_repair(rt,policy,env_values(hand))
+        parent=json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private)
+        must(parent=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':VISIBILITY_PARENT},'visibility_supported_parent')
+        _,sources=revision_bundles(rt,request['deploy'],request['controller_deploy'])
+        before={k:read(path,owner,mode) for k,(path,owner,mode) in visibility_paths(rt).items()}
+        after={'vmm_controller.py':sources['vmm_controller.py'],
+               'handoff':visibility_handoff(hand,sha(sources['vmm_controller.py']))}
+        compat=policy['upgrade']['compatibility']
+        old=json_read(Path(compat['retention_manifest_path']),rt.private,VISIBILITY_RETENTION)
+        retention=encoded(visibility_retention(old))
+        dest=rt.store/'catalog-visibility-retention'/(sha(retention)+'.json')
+        preserved={}
+        for name in ('policy','core-current','original-controller-active'):
+            path=rt.preserved()[name]
+            preserved[str(path)]={'sha256':sha(read(path,rt.private)),'owner':list(rt.private),'mode':0o600}
+        for rel,owner,mode in [('operations/core_release_guard.py',rt.scripts,0o700),
+                              ('operations/lifecycle_adapter.py',rt.scripts,0o700),
+                              ('operations/r25-publisher/core_business.py',rt.private,0o600)]:
+            path=rt.root/rel;preserved[str(path)]={'sha256':sha(read(path,owner,mode)),'owner':list(owner),'mode':mode}
+        plan=dict(schema=VISIBILITY_SCHEMA,deploy=request['deploy'],controller_deploy=request['controller_deploy'],
+            review_sha256=request['review_sha256'],manifest_sha256=VISIBILITY_MANIFEST,policy_sha256=VISIBILITY_POLICY,
+            parent=VISIBILITY_PARENT,current=json_read(rt.preserved()['core-current'],rt.private),preserved=preserved,
+            files={k:{'before_sha256':sha(before[k]),'after_sha256':sha(after[k])} for k in before},
+            retention_before={'path':compat['retention_manifest_path'],'sha256':VISIBILITY_RETENTION},
+            retention_after={'path':str(dest),'sha256':sha(retention)},preimages_sha256=sha(preimages_raw),
+            sql_sha256=sha(visibility_sql(manifest,pre)),restore_sql_sha256=sha(visibility_sql(manifest,pre,restore=True)),
+            private_owner=list(rt.private),host=request['host'])
+        ident=sha(encoded(plan));folder=visibility_folder(rt,ident)
+        must(not folder.exists(),'visibility_prepared_identity_exists_reconcile')
+        for path in (folder,folder/'before',folder/'after',dest.parent):rt.mkdir(path)
+        if dest.exists():read(dest,rt.private,expected=sha(retention))
+        else:rt.atomic(dest,retention)
+        materials={'UNSIGNED_PLAN.json':encoded(plan),'manifest.json':manifest_raw,'preimages.json':preimages_raw,
+                   'review.json':review_raw,'delist.sql':visibility_sql(manifest,pre),
+                   'restore.sql':visibility_sql(manifest,pre,restore=True),
+                   **{'before/'+k:v for k,v in before.items()},**{'after/'+k:v for k,v in after.items()}}
+        for name,raw in materials.items():rt.atomic(folder/name,raw)
+        visibility_proof(rt,plan,folder,phase='before')
+        return dict(outcome='VISIBILITY_PREPARED_UNSIGNED_NOT_AUTHORIZED',plan_sha256=ident,plan_path=str(folder/'UNSIGNED_PLAN.json'))
+
+
+class VisibilityHost:
+    """Production adapter: original guard, original lifecycle, one bounded SQL.
+
+    The interpreter and this module come from the reviewed private bundle. No
+    callback, SQL, executable, credential or database name is accepted from CLI.
+    """
+    TARGET = ROOT/'runtime/catalog-ingestion/huaniao-72977ec5c3af/work/production-target.json'
+    GUARD_SHA = '64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff'
+    LIFECYCLE_SHA = '94e7413c31668d56ecec774f6497cc8a31d2135346d7c91d1990e27f77b471a8'
+
+    def __init__(self, rt, plan, folder):
+        import types,sys,pwd
+        must(rt.root==ROOT and rt.lock==LOCK and os.geteuid()==0,'visibility_production_host')
+        self.rt,self.plan,self.folder=rt,plan,folder
+        self.guard_module=types.ModuleType('core_release_guard');self.guard_module.__file__=str(ROOT/'operations/core_release_guard.py')
+        sys.modules['core_release_guard']=self.guard_module
+        exec(compile(read(Path(self.guard_module.__file__),rt.scripts,0o700,self.GUARD_SHA),self.guard_module.__file__,'exec',dont_inherit=True),self.guard_module.__dict__)
+        must(set(plan['host'])=={'target','psql','pgpass_file','python','lock'},'visibility_host_fields')
+        self.account=pwd.getpwnam('artlivepg25')
+        must((self.account.pw_uid,self.account.pw_gid)==(999,999),'visibility_database_os_account')
+        self.cfg=json.loads(read(self.TARGET,tuple(plan['host']['target']['owner']),plan['host']['target']['mode'],plan['host']['target']['sha256']))
+        must(self.cfg['database']=='artlive_r25_production' and self.cfg['database_user']=='artlive_r25_app' and
+             self.cfg['port']==55640 and self.cfg['psql']=='/root/autodl-tmp/artlive-r25-native-pg16/pgsql-16.15/bin/psql' and
+             self.cfg['pgpass_file']==str(ROOT/'runtime/postgres/app.pgpass'),'visibility_database_target')
+        for key in ('psql','pgpass_file'):
+            item=plan['host'][key]
+            read(Path(self.cfg[key]),tuple(item['owner']),item['mode'],item['sha256'])
+        self.backend=plan['current']['release']['artifact_sha256']
+
+    def guard(self, mode, fd):
+        observed=self.rt.lock.stat();wanted=self.plan['host']['lock']
+        must(wanted=={'device':observed.st_dev,'inode':observed.st_ino,'uid':observed.st_uid,'gid':observed.st_gid,'mode':stat.S_IMODE(observed.st_mode)},'visibility_original_lock_identity')
+        verifier=self.guard_module.BusinessGuard()
+        verifier.verify_lease(fd)  # exact retained inode/verifier, even in recovery
+        if mode=='eligible':return verifier.require_backend_eligible(self.backend,fd)
+        must(mode=='lease','visibility_guard_mode')
+
+    def pg(self, sql, *, write=False):
+        import subprocess
+        must(self.rt.fd is not None,'visibility_lease_required')
+        self.guard('lease',self.rt.fd)
+        c=self.cfg
+        # Executable and credential identities are rechecked immediately before
+        # every call. stderr remains private; public errors contain no SQL/secret.
+        for key in ('psql','pgpass_file'):
+            item=self.plan['host'][key];read(Path(c[key]),tuple(item['owner']),item['mode'],item['sha256'])
+        env=dict(PATH='/usr/bin:/bin',LANG='C.UTF-8',LC_ALL='C.UTF-8',PGPASSFILE=c['pgpass_file'],PGCONNECT_TIMEOUT='5',
+                 PGAPPNAME='artlive_visibility_'+sha(encoded(self.plan))[:20],
+                 PGOPTIONS='-c default_transaction_read_only='+('off' if write else 'on')+' -c statement_timeout=45000 -c lock_timeout=5000')
+        if c.get('pg_library_path'):env['LD_LIBRARY_PATH']=c['pg_library_path']
+        argv=[c['psql'],'-X','-qAt','-v','ON_ERROR_STOP=1','-w','-h','127.0.0.1','-p','55640','-U',c['database_user'],'-d',c['database']]
+        return subprocess.run(argv,input=sql,capture_output=True,env=env,user=999,group=999,
+             extra_groups=os.getgrouplist(self.account.pw_name,999),pass_fds=(self.rt.fd,),timeout=60)
+
+    def database(self, mode):
+        if mode in ('delist','restore'):
+            # O_EXCL intent plus the coordinator's SQL_INTENT forbids resending
+            # after timeout, receipt loss, nonzero exit, or another invocation.
+            sql=read(self.folder/('delist.sql' if mode=='delist' else 'restore.sql'),self.rt.private,
+                     expected=self.plan['sql_sha256' if mode=='delist' else 'restore_sql_sha256'])
+            intent=self.folder/(mode+'-intent.json')
+            self.rt.atomic(intent,encoded(dict(sql_sha256=sha(sql),automatic_retries=0)))
+            try:
+                p=self.pg(sql,write=True)
+                self.rt.atomic(self.folder/(mode+'.stdout'),p.stdout)
+                self.rt.atomic(self.folder/(mode+'.stderr'),p.stderr)
+                self.rt.atomic(self.folder/(mode+'-exit.json'),encoded(dict(exit_status=p.returncode)))
+            except Exception as error:
+                self.rt.atomic(self.folder/(mode+'-unknown.json'),encoded(dict(error_type=type(error).__name__,automatic_retries=0)))
+                raise Refused('visibility_sql_receipt_unknown_reconcile_no_replay') from error
+            must(p.returncode==0,'visibility_sql_nonzero_reconcile_no_replay')
+            return
+        must(mode=='observe','visibility_database_mode')
+        manifest=visibility_manifest(read(self.folder/'manifest.json',self.rt.private,expected=VISIBILITY_MANIFEST))
+        ids=','.join("'"+h['batch_id']+"'::uuid" for h in manifest['heads'])
+        # Observe head state and all original retained tables in a single MVCC
+        # snapshot; no writes or adoption of an unbound/partial catalogue.
+        b=self.guard_module.business_module(json_read(self.rt.preserved()['policy'],self.rt.private,VISIBILITY_POLICY))
+        sql=b.RETENTION_SQL.replace("SET LOCAL statement_timeout='8000ms';", "SET LOCAL statement_timeout='45000ms';")
+        sql=sql.replace("'active_work',", "'visibility_heads',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY batch_id),'[]'::jsonb) FROM catalog_batch_current_revisions t WHERE batch_id IN ("+ids+")),'visibility_sql_children',(SELECT count(*) FROM pg_stat_activity WHERE application_name='artlive_visibility_"+sha(encoded(self.plan))[:20]+"' AND pid<>pg_backend_pid()),'active_work',")
+        p=self.pg(sql.encode());must(p.returncode==0,'visibility_observation_unknown')
+        current=json.loads(p.stdout)
+        heads=current.pop('visibility_heads');must(current.pop('visibility_sql_children')==0,'visibility_sql_child_still_running')
+        must(current['active_work']==0,'visibility_work_in_flight')
+        old=json_read(Path(self.plan['retention_before']['path']),self.rt.private,VISIBILITY_RETENTION)
+        other={k:x for k,x in current['tables'].items() if k!='catalog_batch_current_revisions'}
+        must(other=={k:x for k,x in old['tables'].items() if k!='catalog_batch_current_revisions'},'visibility_unrelated_catalog_drift')
+        for side,want in [('before',sorted(manifest['heads'],key=lambda h:h['batch_id'])),('after',[])]:
+            if heads==want and current['tables']['catalog_batch_current_revisions']==VISIBILITY_HEADS[side]:return side
+        raise Refused('visibility_partial_or_foreign_data')
+
+    def supervise(self, mode, fd):
+        import subprocess
+        self.guard('lease',fd)
+        entry=ROOT/'operations/lifecycle_adapter.py'
+        read(entry,self.rt.scripts,0o700,self.LIFECYCLE_SHA)
+        # Use the installed lifecycle entry with its inherited original lease.
+        # Do not call an app stop/recover or start another supervisor.
+        hand=env_values(read(ROOT/'runtime/handoff-control.env',self.rt.private))
+        python=Path(hand['R25_PYTHON']);must(python.is_absolute(),'visibility_original_python')
+        item=self.plan['host']['python'];self.guard_module.read_file(python.resolve(),owner=tuple(item['owner']),mode=item['mode'],expected=item['sha256'],limit=64*1024*1024)
+        env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','R25_ROOT':str(ROOT),
+             'ARTLIVE_R25_HANDOFF_CONFIG':str(ROOT/'runtime/handoff-control.env'),'R25_DEPLOYMENT_LEASE_FD':'42'}
+        command={'stop':'supervisor-stop','start':'supervisor-start','status':'supervisor-status'}[mode]
+        if fd!=42:
+            try:os.fstat(42)
+            except OSError:pass
+            else:raise Refused('visibility_inherited_fd_42_already_owned')
+            os.dup2(fd,42,inheritable=False)
+        try:
+            p=subprocess.run([str(python),'-B',str(entry),command],env=env,stdin=subprocess.DEVNULL,
+                             capture_output=True,pass_fds=(42,),timeout=90)
+        finally:
+            if fd!=42:os.close(42)
+        evidence=self.folder/('watchdog-'+mode+'-'+os.urandom(8).hex()+'.json')
+        self.rt.atomic(evidence,encoded(dict(exit_status=p.returncode,stdout=p.stdout.decode(errors='replace'),stderr=p.stderr.decode(errors='replace'))))
+        must(p.returncode==0,'visibility_original_watchdog_'+mode+'_refused')
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['prepare','preflight','bind','recover','rollback','prepare-role','bind-role','recover-role',
-        'prepare-modules','prepare-module-successor','preflight-modules','bind-modules','recover-modules'])
+        'prepare-modules','prepare-module-successor','preflight-modules','bind-modules','recover-modules',
+        'prepare-visibility','preflight-visibility','apply-visibility','recover-visibility','restore-visibility'])
     parser.add_argument('--request-sha256');parser.add_argument('--approval-sha256');args=parser.parse_args()
     try:
         must(os.geteuid()==0 and sys.platform.startswith('linux'),'root_linux_required')
-        rt=Runtime();ident=args.request_sha256 if args.command in {'prepare','prepare-role','prepare-modules','prepare-module-successor'} else args.approval_sha256;digest(ident)
+        rt=Runtime();ident=args.request_sha256 if args.command in {'prepare','prepare-role','prepare-modules','prepare-module-successor','prepare-visibility'} else args.approval_sha256;digest(ident)
+        if args.command.endswith('-visibility'):
+            if args.command=='prepare-visibility':
+                inputs=rt.store/'catalog-visibility-inputs'/ident
+                request=json_read(inputs/'request.json',rt.private,ident)
+                formal,_=revision_bundles(rt,request['deploy'],request['controller_deploy'])
+                must(Path(__file__).absolute()==formal/'vmm_controller.py','formal_execution_path')
+                result=prepare_catalog_visibility(rt,request,manifest_raw=read(inputs/'manifest.json',rt.private),
+                    preimages_raw=read(inputs/'preimages.json',rt.private),review_raw=read(inputs/'review.json',rt.private))
+            else:
+                folder=visibility_folder(rt,ident)
+                plan=json_read(folder/'UNSIGNED_PLAN.json',rt.private,ident)
+                formal,_=revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
+                must(Path(__file__).absolute()==formal/'vmm_controller.py','formal_execution_path')
+                host=VisibilityHost(rt,plan,folder)
+                if args.command=='preflight-visibility':
+                    with rt.lease():
+                        host.guard('lease',rt.fd);visibility_proof(rt,plan,folder,phase='before');revision_stopped(rt)
+                        must(host.database('observe')=='before','visibility_preflight_data')
+                        host.guard('eligible',rt.fd)
+                    result={'outcome':'VISIBILITY_PREFLIGHT_PASS_NOT_APPLIED'}
+                else:
+                    approval=read(rt.store/'catalog-visibility-approvals'/(ident+'.json'),rt.private,expected=ident)
+                    must(approval==encoded(plan),'visibility_exact_approval_bytes')
+                    with rt.lease():
+                        host.guard('lease',rt.fd)
+                        if (folder/'approval.json').exists():read(folder/'approval.json',rt.private,expected=ident)
+                        else:rt.atomic(folder/'approval.json',approval)
+                    result={'outcome':visibility_execute(rt,ident,database=host.database,guard=host.guard,supervise=host.supervise,
+                        recover=args.command=='recover-visibility',restore=args.command=='restore-visibility')}
+            print(json.dumps(result));return 0
         if args.command.endswith('-modules') or args.command=='prepare-module-successor':
             if args.command=='recover-modules' and not (revision_transaction(rt,ident)/'journal.json').exists():
                 print(json.dumps({'outcome':'MODULE_NOT_STARTED'}));return 0
