@@ -1,0 +1,185 @@
+{
+  "status": "OFFLINE_VERIFIED_NOT_INSTALLED",
+  "scope": {
+    "painting_uuids": 486,
+    "batch_selections": 12,
+    "existing_control_targets": 2,
+    "application_deployments": 0
+  },
+  "unit_tests": {
+    "new": 11,
+    "existing_repair": 15,
+    "result": "PASS"
+  },
+  "private_installed_proof": {
+    "result": "PASS",
+    "cases": [
+      "actual installed predecessor full proof chain accepted",
+      "original guard policy and actual accepted Core record pass with two-control successor",
+      "wrong predecessor refused",
+      "unrelated policy digest refused",
+      "original policy drift refused",
+      "all captured historical proofs and unrelated controls byte-for-byte preserved"
+    ],
+    "captured_files": 429,
+    "source_guard_sha256": "64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff",
+    "production_writes": 0,
+    "formal_release": false,
+    "limitations": [
+      "virtual file identities from live read-only capture",
+      "no DB transaction or media/process acceptance in this proof-only phase"
+    ]
+  },
+  "native_postgres_original_watchdog": [
+    {
+      "result": "PASS",
+      "interruption": "none",
+      "targets": 486,
+      "selections": 12,
+      "sql_calls": [
+        "delist",
+        "restore"
+      ],
+      "watchdog_heartbeats": 2,
+      "actual_guard_source": "64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff",
+      "actual_watchdog_source": "94e7413c31668d56ecec774f6497cc8a31d2135346d7c91d1990e27f77b471a8",
+      "controls_restored": true,
+      "old_proofs_preserved": true,
+      "forward_history_preserved": true,
+      "events": [
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "installed_guard_accepted"
+      ],
+      "production_access": false,
+      "limits": [
+        "native CPU fixture data outside exact selected heads/UUIDs",
+        "media and service I/O are fixtures; real complete guard verified separately read-only"
+      ]
+    },
+    {
+      "result": "PASS",
+      "interruption": "sql-receipt",
+      "targets": 486,
+      "selections": 12,
+      "sql_calls": [
+        "delist",
+        "restore"
+      ],
+      "watchdog_heartbeats": 2,
+      "actual_guard_source": "64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff",
+      "actual_watchdog_source": "94e7413c31668d56ecec774f6497cc8a31d2135346d7c91d1990e27f77b471a8",
+      "controls_restored": true,
+      "old_proofs_preserved": true,
+      "forward_history_preserved": true,
+      "events": [
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "installed_guard_accepted"
+      ],
+      "production_access": false,
+      "limits": [
+        "native CPU fixture data outside exact selected heads/UUIDs",
+        "media and service I/O are fixtures; real complete guard verified separately read-only"
+      ]
+    },
+    {
+      "result": "PASS",
+      "interruption": "restore-controls",
+      "targets": 486,
+      "selections": 12,
+      "sql_calls": [
+        "delist",
+        "restore"
+      ],
+      "watchdog_heartbeats": 2,
+      "actual_guard_source": "64ee9378d03b7d46c37ce9dfd8ee8f5a0a7bdeb2bdd589ccde4fe02ecf1fe8ff",
+      "actual_watchdog_source": "94e7413c31668d56ecec774f6497cc8a31d2135346d7c91d1990e27f77b471a8",
+      "controls_restored": true,
+      "old_proofs_preserved": true,
+      "forward_history_preserved": true,
+      "events": [
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "original_watchdog_stop:STOPPED",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "installed_guard_accepted",
+        "original_watchdog_start:RUNNING",
+        "installed_guard_accepted",
+        "original_watchdog_status:RUNNING",
+        "installed_guard_accepted"
+      ],
+      "production_access": false,
+      "limits": [
+        "native CPU fixture data outside exact selected heads/UUIDs",
+        "media and service I/O are fixtures; real complete guard verified separately read-only"
+      ]
+    }
+  ],
+  "complete_guard_projected_readonly": {
+    "result": "FULL_INSTALLED_GUARD_PROJECTED_POSTIMAGE_PASS",
+    "eligibility": {
+      "schema": "R25_CORE_BUSINESS_ELIGIBILITY_V2",
+      "artifact_sha256": "6bf9d053da18a57c5a4fde86057a3a852d45c4747a03727dc7f09298cf374b16"
+    },
+    "head_delta": {
+      "before": {
+        "md5": "084bbd9048d5259976fa671e2497ddd7",
+        "rows": 13
+      },
+      "after": {
+        "md5": "b7e98d78efe5a2d1ef52f5ecf20fc422",
+        "rows": 1
+      }
+    },
+    "production_writes": 0,
+    "installed_controls_changed": 0,
+    "scope": "isolated in-memory candidate controls and read-only projected selection result; real original guard, full original JAR/media/assets and all retained proofs",
+    "formal_release": false
+  },
+  "limits": [
+    "Private captured data/credentials are not in Git.",
+    "CPU media and other services are fixtures; full installed JAR/media/assets are separately checked read-only.",
+    "Production delisting is restored and NOT_COMPLETE; current target paintings remain visible.",
+    "Historical and newly observed watchdog exits are not diagnosed by this change."
+  ],
+  "checks": {
+    "shell_syntax": "PASS",
+    "compose_base": "PASS",
+    "compose_gpu": "PASS",
+    "required_ci": "PENDING"
+  }
+}
