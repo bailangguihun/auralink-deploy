@@ -105,6 +105,42 @@ class InstalledLease:
             self.fd = None
 
 
+def knowledge_lease_binding(plan, plan_sha, manifest_sha, approval_sha):
+    """One installed Core binding can inherit this original Community lease.
+
+    The immutable Host approval, registration, service and restart state are
+    not replaced. Full Core proof verification still runs in production_lease.
+    """
+    must(re.fullmatch('[a-f0-9]{64}', str(approval_sha)) is not None,'community_knowledge_digest')
+    def private(path, expected=None):
+        item=identity(path)
+        must((item['uid'],item['gid'],item['mode'])==(0,0,0o600),'community_knowledge_private')
+        if expected:must(item['sha256']==expected,'community_knowledge_file_digest')
+        raw=Path(path).read_bytes();must(sha(raw)==item['sha256'],'community_knowledge_file_changed')
+        return strict_json(raw)
+    marker=private(ROOT/'runtime/vmm-controller/KNOWLEDGE_PUBLICATION_ACTIVE.json')
+    must(marker=={'schema':'R25_KNOWLEDGE_PUBLICATION_ACTIVE_V1','approval_sha256':approval_sha},
+         'community_knowledge_pointer')
+    folder=ROOT/'runtime/core-publications/controller-upgrades'/approval_sha
+    approval=private(folder/'approval.json',approval_sha);journal=private(folder/'journal.json')
+    must(approval['schema']=='R25_KNOWLEDGE_CORE_PUBLICATION_BINDING_V1' and
+         journal['approval_sha256']==approval_sha and journal['phase'] in ('VERIFY_INTENT','INSTALLED'),
+         'community_knowledge_not_installed')
+    bound=approval['vmm']['community']
+    must(sha(encoded(plan))==plan_sha==bound['plan_sha256'] and plan['lease']==bound['lease'] and
+         manifest_sha==bound['deploy']['manifest_sha256'],'community_knowledge_original_plan')
+    private(ROOT/'runtime/community/WATCHDOG.json',bound['registration_sha256'])
+    private(ROOT/'runtime/community/ACTIVE.json',bound['active_sha256'])
+    before=approval['operational']['guard']['before_sha256'];after=approval['operational']['guard']['after_sha256']
+    must(plan['lease']['guard']['sha256']==before,'community_knowledge_guard_predecessor')
+    match(folder/'before/guard',dict(plan['lease']['guard'],uid=0,gid=0,mode=0o600))
+    path=ROOT/'operations/core_release_guard.py';observed=identity(path)
+    must(observed['sha256']==after and
+         (observed['uid'],observed['gid'],observed['mode'])==tuple(approval['controller_owner'])+(0o700,),
+         'community_knowledge_guard_successor')
+    return dict(plan['lease'],guard=observed)
+
+
 def production_lease(binding, descriptor=None):
     path = ROOT/'operations/core_release_guard.py'
     match(path, binding['guard'])
@@ -116,7 +152,8 @@ def production_lease(binding, descriptor=None):
     module.__file__ = str(path)
     sys.modules['core_release_guard'] = module
     try:
-        exec(compile(path.read_bytes(), str(path), 'exec', dont_inherit=True), module.__dict__)
+        raw=path.read_bytes();must(sha(raw)==binding['guard']['sha256'],'community_guard_changed')
+        exec(compile(raw, str(path), 'exec', dont_inherit=True), module.__dict__)
         guard = module.production()  # verifies the actual installed successors
     except BaseException:
         del sys.modules['core_release_guard']
@@ -256,6 +293,42 @@ class Host:
         if self._role is None:
             self._role = Role(self.folder/'process', self.binding(), self.lease.require)
         return self._role
+
+    def preserve_running(self):
+        """Read-only maintenance proof; never drain, restart, or spend a retry."""
+        from community_supervision import Supervisor
+        supervisor=Supervisor(self);state=supervisor.registered();role=self.role();role.verify()
+        state_identity=identity(supervisor.state);state_raw=supervisor.state.read_bytes()
+        must(sha(state_raw)==state_identity['sha256'] and strict_json(state_raw)==state,'community_preserve_state_changed')
+        must(state['desired']=='RUNNING','community_preserve_not_running')
+        path,record=role.current()
+        must(record is not None and record['phase']=='READY' and
+             state['attempts'][-1]==record['operation_id'],'community_preserve_not_ready')
+        saved=record['process']
+        must(process(saved['pid'])==saved,'community_preserve_process_drift')
+        from community_lifecycle import listeners
+        sockets=listeners(self.plan['service']['port']);owned=set()
+        for descriptor in (Path('/proc')/str(saved['pid'])/'fd').iterdir():
+            try:target=os.readlink(descriptor)
+            except FileNotFoundError:continue
+            if target.startswith('socket:['):owned.add(target[8:-1])
+        must(bool(sockets) and sockets<=owned,'community_preserve_listener_not_owned')
+        log=role.root/('run-'+record['operation_id']+'.log')
+        logfile=identity(log)
+        must((logfile['uid'],logfile['gid'],logfile['mode'])==(*self.owner,0o600) and
+             logfile['bytes']<self.plan['service']['log_limit_bytes'],
+             'community_preserve_log_limit')
+        import http.client
+        connection=http.client.HTTPConnection('127.0.0.1',self.plan['service']['port'],timeout=2)
+        try:
+            connection.request('GET','/health');response=connection.getresponse();raw=response.read(4097)
+            must(response.status==200 and len(raw)<=4096 and
+                 strict_json(raw)=={'status':'UP','contractVersion':1},'community_preserve_health')
+        finally:connection.close()
+        must(process(saved['pid'])==saved,'community_preserve_process_changed')
+        must(identity(supervisor.state)==state_identity,'community_preserve_state_changed')
+        return {'state':'READY_PRESERVED','process':saved,'watchdog_state_sha256':state_identity['sha256'],
+                'process_record_sha256':identity(path)['sha256']}
 
     def install(self, archive, manifest, settings, node, approval, *, recover=False):
         raw, mr, m = self.material(archive, manifest, settings, node)

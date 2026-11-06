@@ -49,7 +49,8 @@ class WatchdogHook(unittest.TestCase):
         e=Mock();e.community_action.side_effect=ValueError('community_drain_pending')
         rt=core_runtime.CoreRuntime.__new__(core_runtime.CoreRuntime);rt.fd=37
         rt.engine=Mock(return_value=e);rt.verify_current=Mock()
-        with self.assertRaisesRegex(ValueError,'drain_pending'):rt.stop_owned_java(None)
+        with patch.object(core_runtime.guard,'policy',return_value={}),self.assertRaisesRegex(ValueError,'drain_pending'):
+            rt.stop_owned_java(None)
         e.community_action.assert_called_once_with('drain',37)
         e.watchdog_stop_locked.assert_not_called();e.stop_role.assert_not_called()
 
