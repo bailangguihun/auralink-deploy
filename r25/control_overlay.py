@@ -265,3 +265,42 @@ def render_community_lifecycle(before):
     ast.parse(raw)
     return raw
 
+
+
+def render_knowledge_lifecycle(before):
+    """Retain the existing Community registration, select one approved lease successor.
+
+    Explicit shutdown still drains Community. Only the Core publisher's new
+    preserve observation leaves the already running process and budget intact.
+    """
+    if before.count(COMMUNITY_METHOD)!=1:
+        raise OverlayRefused('knowledge_community_lifecycle_predecessor')
+    method=COMMUNITY_METHOD.replace(
+        b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n",
+        b'''        extra=[]
+        successor=self.root/'runtime/vmm-controller/KNOWLEDGE_PUBLICATION_ACTIVE.json'
+        if successor.exists() or successor.is_symlink():
+            guard(successor,self.private)
+            pointer=json.loads(successor.read_bytes());ident=pointer.get('approval_sha256')
+            must(re.fullmatch('[a-f0-9]{64}',str(ident)) and pointer=={'schema':'R25_KNOWLEDGE_PUBLICATION_ACTIVE_V1','approval_sha256':ident},'community_knowledge_pointer')
+            folder=self.root/'runtime/core-publications/controller-upgrades'/ident
+            approval=folder/'approval.json';guard(approval,self.private,0o600,ident)
+            approved_raw=approval.read_bytes();must(hashlib.sha256(approved_raw).hexdigest()==ident,'community_knowledge_approval_changed')
+            bound=json.loads(approved_raw)
+            journal=folder/'journal.json';guard(journal,self.private)
+            receipt=json.loads(journal.read_bytes())
+            must(bound['schema']=='R25_KNOWLEDGE_CORE_PUBLICATION_BINDING_V1' and receipt['approval_sha256']==ident and receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_knowledge_not_installed')
+            community=bound['vmm']['community']
+            guard(marker,self.private,0o600,community['registration_sha256'])
+            must(record['plan_sha256']==community['plan_sha256'],'community_knowledge_plan')
+            record=dict(record,controller_manifest_sha256=community['deploy']['manifest_sha256'],cli_sha256=community['cli_sha256'])
+            extra=['--knowledge-publication-sha256',ident]
+        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']
+''')
+    method=method.replace(b"must(mode in ('tick','drain'),'community_watchdog_mode')",
+                          b"must(mode in ('tick','drain','preserve'),'community_watchdog_mode')\n        if mode=='preserve':must(bool(extra),'community_preserve_requires_knowledge_binding')")
+    method=method.replace(b"'--bundle-manifest-sha256',record['controller_manifest_sha256'],'--lease-fd',str(fd)],",
+                          b"'--bundle-manifest-sha256',record['controller_manifest_sha256'],'--lease-fd',str(fd),*extra],")
+    raw=before.replace(COMMUNITY_METHOD,method)
+    ast.parse(raw)
+    return raw

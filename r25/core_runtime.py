@@ -434,9 +434,30 @@ class CoreRuntime:
         self.verify_current(current)
         engine = self.engine()
         if hasattr(engine, 'community_action'):
-            engine.community_action('drain', self.fd)
+            self.community_maintenance(engine)
         engine.watchdog_stop_locked()
         engine.stop_role('java', 19080)
+
+    def community_maintenance(self, engine, *, resuming=False):
+        """This no-schema-change release preserves the existing Community process.
+
+        Older contracts retain their drain behavior. The finite knowledge
+        binding keeps the exact process and lifetime retry ledger on both the
+        successful and recovery paths; an exhausted budget is never reset.
+        """
+        value=guard.policy()
+        if value.get('upgrade',{}).get('core_followup',{}).get('schema')!='R25_KNOWLEDGE_CORE_PUBLICATION_V1':
+            if not resuming:engine.community_action('drain',self.fd)
+            return
+        must(self.tx is not None,'knowledge_maintenance_transaction')
+        observed=engine.community_action('preserve',self.fd)
+        must(type(observed)is dict and observed.get('state')=='READY_PRESERVED','knowledge_community_not_preserved')
+        checkpoint=self.transaction_folder(self.tx)/'community-maintenance.json'
+        if checkpoint.exists():
+            must(self.read(checkpoint)==observed,'knowledge_community_maintenance_drift')
+        else:
+            must(not resuming,'knowledge_community_maintenance_missing')
+            self.storage.atomic_write_json(checkpoint,observed)
 
     def snapshot_document(self, plan):
         folder = self.transaction_folder(plan.transaction_id)
@@ -504,6 +525,7 @@ class CoreRuntime:
         receipt.update({'commit_sha': release.commit_sha, 'artifact_sha256': release.artifact_sha256,
                         'java_pid': process['pid'], 'java_start_ticks': process['ticks']})
         self.write(self.transaction_folder(self.tx) / 'http-acceptance.json', receipt)
+        if hasattr(engine,'community_action'):self.community_maintenance(engine,resuming=True)
         engine.watchdog_start_locked()
         must(engine.watchdog_identity() is not None, 'watchdog_start_identity')
 
@@ -548,7 +570,7 @@ class CoreRuntime:
         self.validate_recovery(plan)
         engine = self.engine(partial_recovery=True)
         if hasattr(engine, 'community_action'):
-            engine.community_action('drain', self.fd)
+            self.community_maintenance(engine)
         engine.watchdog_stop_locked()
         engine.stop_role('java', 19080)
 
