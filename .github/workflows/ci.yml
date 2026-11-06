@@ -67,27 +67,73 @@ jobs:
           node-version: '22'
       - run: python -B -m unittest discover -s r25 -p 'test_community_runtime.py' -v
 
-  validate:
-    name: Validate deployment configuration
+  r25-shards:
+    name: R25 suite shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # Runs 42158799619 and 42161168431 timed out at 20/30 minutes with
-    # every completed test passing. Allow slower runners to finish the full suite.
+    # Independent runners isolate tests that patch global state. Each shard is serial.
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Verify discovery, partitioning and failure reporting
+        run: python -B -m unittest discover -s scripts/tests -p 'test_r25_test_shards.py' -v
+      - name: Run assigned occurrences from complete R25 discovery
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          printf 'Source commit: %s\n' "$SOURCE_COMMIT"
+          python -B scripts/r25_test_shards.py run \
+            --shard '${{ matrix.shard }}' --commit "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/r25-shard-${{ matrix.shard }}/report.json"
+      - name: Retain discovery manifest and per-test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r25-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/r25-shard-${{ matrix.shard }}/report.json
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Verify R25 publication transaction failures
-        run: python -m unittest discover -s r25 -p 'test_*.py' -v
+  validate:
+    name: Validate deployment configuration
+    needs: [r25-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every matrix shard to succeed
+        env:
+          SHARDS_RESULT: ${{ needs.r25-shards.result }}
+        run: test "$SHARDS_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: r25-shard-*
+          path: ${{ runner.temp }}/r25-shard-reports
+
+      - name: Require four complete reports covering every discovered occurrence
+        run: |
+          python -B scripts/r25_test_shards.py verify-reports \
+            --directory "$RUNNER_TEMP/r25-shard-reports" --commit "$GITHUB_SHA"
 
       - name: Verify legacy start is opt-in
         shell: bash
