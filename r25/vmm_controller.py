@@ -78,13 +78,17 @@ def read(path, owner=(0, 0), mode=0o600, expected=None):
     finally: os.close(fd)
 
 
-def json_read(path, owner=(0,0), expected=None):
+def json_bytes(raw):
     def pairs(items):
         result = {}
         for key, value in items:
             must(key not in result, 'json_duplicate_key'); result[key] = value
         return result
-    return json.loads(read(path, owner, expected=expected), object_pairs_hook=pairs)
+    return json.loads(raw, object_pairs_hook=pairs)
+
+
+def json_read(path, owner=(0,0), expected=None):
+    return json_bytes(read(path, owner, expected=expected))
 
 
 class Runtime:
@@ -635,6 +639,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'KNOWLEDGE_PUBLICATION_ACTIVE.json').exists():return applied_knowledge_publication(rt,value,handoff)
     if (rt.store/'CATALOG_VISIBILITY_ACTIVE.json').exists():return applied_catalog_visibility(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json').exists():return applied_publication_repair(rt,value,handoff)
     if (rt.store/'CORE_PUBLICATION_SUCCESSOR_ACTIVE.json').exists():return applied_publication_successor(rt,value,handoff)
@@ -1770,7 +1775,7 @@ def verify_publication_repair(rt,plan,phase='before',*,runtime=False,historical=
     for name,path in publication_repair_preserved(rt).items():
         if runtime and name not in {'overlay-active','role-active','service','token','core-successor-active','module-active','publication-active','publication-successor-active'}:continue
         revision_preserved_read(rt,name,path,binding['preserved'][name])
-    current=read(rt.preserved()['original-controller-active'],rt.private)
+    current=proof_read(historical,rt.preserved()['original-controller-active'],rt.private)
     new=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
     allowed={binding['control_active_sha256']} if phase=='before' else {sha(new)} if phase=='after' else {binding['control_active_sha256'],sha(new)}
     must(sha(current) in allowed,'publication_repair_controller_pointer')
@@ -1787,7 +1792,7 @@ def applied_publication_repair(rt,value,handoff,*,historical=None):
     must(record.get('schema')==PUBLICATION_REPAIR_SCHEMA and record.get('approval_sha256')==ident and
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'publication_repair_incomplete')
     verify_publication_repair(rt,plan,'after',runtime=True,historical=historical)
-    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+    must(proof_json(historical,rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
          env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private))==handoff,'publication_repair_arguments')
     must(value['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1' and
          value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'],
@@ -1844,7 +1849,7 @@ def visibility_folder(rt, ident):
     return rt.store/'catalog-visibility'/digest(ident)
 
 
-def visibility_proof(rt, plan, folder, *, phase='after'):
+def visibility_proof(rt, plan, folder, *, phase='after', historical=None):
     """Validate exactly two controls, then run the entire retained proof chain.
 
     The historical view is limited to their independently checked before-images.
@@ -1872,12 +1877,12 @@ def visibility_proof(rt, plan, folder, *, phase='after'):
          'visibility_sql_derivation')
     read(folder/'delist.sql', rt.private, expected=plan['sql_sha256'])
     read(folder/'restore.sql', rt.private, expected=plan['restore_sql_sha256'])
-    oldpolicy = json_read(rt.preserved()['policy'], rt.private, VISIBILITY_POLICY)
+    oldpolicy = proof_json(historical,rt.preserved()['policy'], rt.private, VISIBILITY_POLICY)
     must(oldpolicy['upgrade']['candidate']['commit_sha'] == VISIBILITY_CORE and
          oldpolicy['upgrade']['compatibility'] == {
              'retention_manifest_path':plan['retention_before']['path'],
              'retention_manifest_sha256':VISIBILITY_RETENTION}, 'visibility_original_policy')
-    current = json_read(rt.preserved()['core-current'], rt.private)
+    current = proof_json(historical,rt.preserved()['core-current'], rt.private)
     must(current == plan['current'] and current['release']['commit_sha'] == VISIBILITY_CORE and
          current['release']['artifact_sha256'] == oldpolicy['upgrade']['candidate']['artifact_sha256'],
          'visibility_current_drift')
@@ -1890,13 +1895,13 @@ def visibility_proof(rt, plan, folder, *, phase='after'):
     must(required <= set(plan['preserved']), 'visibility_preserved_inventory')
     for path, entry in plan['preserved'].items():
         must(set(entry) == {'sha256','owner','mode'}, 'visibility_preserved_identity')
-        read(Path(path), tuple(entry['owner']), entry['mode'], entry['sha256'])
+        proof_read(historical,Path(path), tuple(entry['owner']), entry['mode'], entry['sha256'])
     _, sources = revision_bundles(rt, plan['deploy'], plan['controller_deploy'])
-    must(sources['core_release_guard.py'] == read(rt.root/'operations/core_release_guard.py',rt.scripts,0o700) and
+    must(sources['core_release_guard.py'] == proof_read(historical,rt.root/'operations/core_release_guard.py',rt.scripts,0o700) and
          sources['vmm_lifecycle.py'] == read(rt.targets()['vmm_lifecycle.py'][0],rt.private) and
          sources['vmm_service.py'] == read(rt.targets()['vmm_service.py'][0],rt.private),
          'visibility_consumer_changes_forbidden')
-    history = {}
+    history = dict(historical or {})
     for name,(path,owner,mode) in visibility_paths(rt).items():
         entry=plan['files'][name]
         must(set(entry)=={'before_sha256','after_sha256'}, 'visibility_target_fields')
@@ -1905,7 +1910,7 @@ def visibility_proof(rt, plan, folder, *, phase='after'):
         must(after == (sources[name] if name=='vmm_controller.py' else
                       visibility_handoff(before, plan['files']['vmm_controller.py']['after_sha256'])),
              'visibility_exact_control_delta')
-        live=read(path,owner,mode)
+        live=proof_read(historical,path,owner,mode)
         must(sha(live) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),
              'visibility_control_drift:'+name)
         history[path]=(folder/'before'/name,rt.private,entry['before_sha256'])
@@ -1917,7 +1922,7 @@ def visibility_proof(rt, plan, folder, *, phase='after'):
     return effective
 
 
-def applied_catalog_visibility(rt, value, handoff):
+def applied_catalog_visibility(rt, value, handoff, *, historical=None):
     marker=json_read(rt.store/'CATALOG_VISIBILITY_ACTIVE.json',rt.private)
     ident=digest(marker.get('approval_sha256'))
     must(marker=={'schema':VISIBILITY_MARKER,'approval_sha256':ident},'visibility_marker')
@@ -1929,14 +1934,246 @@ def applied_catalog_visibility(rt, value, handoff):
     phase=state.get('phase')
     must(phase in ('CONTROLS_READY','DELIST_VERIFY_INTENT','COMMITTED','RESTORED_VERIFY_INTENT','RESTORED'),
          'visibility_reconciliation_required')
-    effective=visibility_proof(rt,plan,folder)
-    must(value==json_read(rt.preserved()['policy'],rt.private,VISIBILITY_POLICY) and
-         handoff==env_values(read(rt.targets()['handoff'][0],rt.private)), 'visibility_overlay_arguments')
+    effective=visibility_proof(rt,plan,folder,historical=historical)
+    must(value==proof_json(historical,rt.preserved()['policy'],rt.private,VISIBILITY_POLICY) and
+         handoff==env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private)), 'visibility_overlay_arguments')
     if phase in ('DELIST_VERIFY_INTENT','COMMITTED'):
         effective['upgrade']['compatibility']={
             'retention_manifest_path':plan['retention_after']['path'],
             'retention_manifest_sha256':plan['retention_after']['sha256']}
     return effective
+
+
+# One reviewed Core-only publication after the committed repair/visibility chain.
+# The original Community registration and its lifetime restart budget are retained.
+KNOWLEDGE_SCHEMA = 'R25_KNOWLEDGE_CORE_PUBLICATION_BINDING_V1'
+KNOWLEDGE_MARKER = 'R25_KNOWLEDGE_PUBLICATION_ACTIVE_V1'
+KNOWLEDGE_MUTABLE = PUBLICATION_SUCCESSOR_MUTABLE | {'core_acceptance.py'}
+COMMUNITY_FILES = frozenset(('community_bundle.py','community_lifecycle.py','community_host.py',
+    'community_host_cli.py','community_migration.py','community_supervision.py','r25_storage.py'))
+
+
+def knowledge_community_bundle(rt, deployment, controller):
+    must(set(deployment)=={'repository','ref','commit','run_id','run_attempt','archive_sha256','manifest_sha256'},
+         'knowledge_community_deploy_fields')
+    must(all(deployment[k]==controller[k] for k in ('repository','ref','commit','run_id','run_attempt')),
+         'knowledge_community_same_release_run')
+    folder=rt.root/'operations/r25-community-candidates'/digest(deployment['commit'],40)
+    raw=read(folder/'community-controller.zip',rt.private,expected=digest(deployment['archive_sha256']))
+    mr=read(folder/'manifest.json',rt.private,expected=digest(deployment['manifest_sha256']))
+    manifest=json.loads(mr)
+    must(manifest.get('schema')=='ARTLIVE_COMMUNITY_CONTROLLER_BUNDLE_V1' and
+         all(manifest.get(k)==deployment[k] for k in ('repository','ref','commit','run_id','run_attempt','archive_sha256')),
+         'knowledge_community_manifest')
+    files=manifest.get('files');must(type(files)is list and len(files)==len(COMMUNITY_FILES) and
+        {x['path'] for x in files}==COMMUNITY_FILES,'knowledge_community_inventory')
+    bundle=rt.root/'operations/community-controller'/deployment['manifest_sha256']
+    info=bundle.lstat()
+    must(stat.S_ISDIR(info.st_mode) and not bundle.is_symlink() and
+         (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(*rt.private,0o700),'knowledge_community_bundle_private')
+    must({p.name for p in bundle.iterdir()}==COMMUNITY_FILES|{'manifest.json'},'knowledge_community_bundle_inventory')
+    must(read(bundle/'manifest.json',rt.private)==mr,'knowledge_community_extracted_manifest')
+    sources={}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        must(len(archive.infolist())==len(COMMUNITY_FILES) and set(archive.namelist())==COMMUNITY_FILES,
+             'knowledge_community_archive_inventory')
+        for item in files:
+            name=item['path'];info=archive.getinfo(name)
+            must(info.create_system==3 and info.external_attr>>16==stat.S_IFREG|0o600 and not info.flag_bits&1,
+                 'knowledge_community_archive_type')
+            value=archive.read(name)
+            must(len(value)==item['bytes'] and sha(value)==item['sha256'] and
+                 read(bundle/name,rt.private)==value,'knowledge_community_source_binding')
+            sources[name]=value
+    return bundle,sources
+
+
+def knowledge_community(rt, deployment, controller, bound=None, *, runtime=False):
+    bundle,sources=knowledge_community_bundle(rt,deployment,controller)
+    base=rt.root/'runtime/community';marker_raw=read(base/'WATCHDOG.json',rt.private);marker=json_bytes(marker_raw)
+    ident=digest(marker.get('plan_sha256'));folder=base/'installations'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident)
+    must(json_read(base/'ACTIVE.json',rt.private)=={'schema':'ARTLIVE_COMMUNITY_HOST_V1','plan_sha256':ident} and
+         json_read(folder/'journal.json',rt.private).get('phase')=='INSTALLED', 'knowledge_community_not_installed')
+    oldbundle=rt.root/'operations/community-controller'/digest(marker['controller_manifest_sha256'])
+    oldmanifest=json_read(oldbundle/'manifest.json',rt.private,marker['controller_manifest_sha256'])
+    must(marker['controller_manifest_sha256']==plan['controller_manifest_sha256'] and
+         {x['path'] for x in oldmanifest['files']}==COMMUNITY_FILES,'knowledge_community_original_bundle')
+    must(marker['schema']=='ARTLIVE_COMMUNITY_WATCHDOG_V1' and
+         marker['cli_sha256']==sha(read(oldbundle/'community_host_cli.py',rt.private)) and
+         marker['python_sha256']==plan['runtime']['python']['identity']['sha256'],
+         'knowledge_community_registration_binding')
+    for item in oldmanifest['files']:
+        before=read(oldbundle/item['path'],rt.private,expected=item['sha256'])
+        if item['path'] not in {'community_host.py','community_host_cli.py'}:
+            must(before==sources[item['path']],'knowledge_community_behavior_unchanged')
+    state_raw=read(folder/'watchdog-state.json',rt.private);state=json_bytes(state_raw)
+    must(state.get('plan_sha256')==ident and state.get('schema')=='ARTLIVE_COMMUNITY_WATCHDOG_V1' and
+         type(state.get('attempts'))is list and 1<=len(state['attempts'])<=3,'knowledge_community_state')
+    capture={'deploy':deployment,'plan_sha256':ident,'registration_sha256':sha(marker_raw),
+        'active_sha256':sha(read(base/'ACTIVE.json',rt.private)),
+        'state_sha256':sha(state_raw),'lease':plan['lease'],
+        'cli_sha256':sha(sources['community_host_cli.py'])}
+    if bound is not None:
+        must(set(bound)==set(capture),'knowledge_community_fields')
+        for key in capture:
+            if runtime and key=='state_sha256':continue
+            must(bound[key]==capture[key],'knowledge_community_identity_drift:'+key)
+    if not runtime:
+        must(state['desired']=='RUNNING','knowledge_community_must_remain_running')
+        read(rt.root/'operations/core_release_guard.py',rt.scripts,0o700,plan['lease']['guard']['sha256'])
+    return capture
+
+
+def capture_knowledge_publication(rt,deploy,community,controller):
+    marker_path=rt.store/'KNOWLEDGE_PUBLICATION_ACTIVE.json'
+    must(not marker_path.exists() and not marker_path.is_symlink(),'knowledge_already_bound')
+    must(rt.fd is not None,'lease_required');revision_stopped(rt);revision_apps_committed(rt)
+    old=json_read(rt.preserved()['policy'],rt.private)
+    must(old['upgrade']['core_followup']['schema']=='R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1',
+         'knowledge_requires_committed_repair')
+    visibility=json_read(rt.store/'CATALOG_VISIBILITY_ACTIVE.json',rt.private)
+    vid=digest(visibility.get('approval_sha256'));vf=visibility_folder(rt,vid)
+    must(json_read(vf/'journal.json',rt.private).get('phase')=='COMMITTED','knowledge_visibility_not_committed')
+    applied_catalog_visibility(rt,old,env_values(read(rt.targets()['handoff'][0],rt.private)))
+    marker=json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    must(marker=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':ident} and
+         json_read(folder/'journal.json',rt.private).get('phase')=='INSTALLED','knowledge_parent_incomplete')
+    names=publication_proof_names(rt)
+    must({p.relative_to(folder).as_posix() for p in folder.rglob('*') if not p.is_dir()}==names,'knowledge_parent_inventory')
+    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
+    must(all(current['release'][k]==old['upgrade']['candidate'][k] for k in ('commit_sha','artifact_sha256')),
+         'knowledge_requires_committed_candidate')
+    return {'deploy':deploy,'previous_repair':{'marker':marker,
+        'proof_hashes':{n:sha(read(folder/n,rt.private)) for n in sorted(names)}},
+        'visibility':{'marker':visibility,'approval_sha256':vid,'journal_sha256':sha(read(vf/'journal.json',rt.private))},
+        'core_current_sha256':sha(current_raw),
+        'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private)),
+        'community':knowledge_community(rt,community,controller)}
+
+
+def knowledge_history(rt,plan,phase):
+    history=publication_history(rt,plan,phase)
+    current=rt.preserved()['core-current']
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/sha(encoded(plan))
+    saved=folder/'before/KNOWLEDGE_CORE_CURRENT.json';wanted=plan['vmm']['core_current_sha256']
+    if saved.exists():
+        read(saved,rt.private,expected=wanted);history[current]=(saved,rt.private,wanted)
+    else:
+        must(phase=='before','knowledge_current_preimage_missing');read(current,rt.private,expected=wanted)
+    return history
+
+
+def verify_knowledge_publication(rt,plan,phase='before',*,runtime=False):
+    must(plan.get('schema')==KNOWLEDGE_SCHEMA and phase in {'before','mixed','after'},'knowledge_schema')
+    must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'knowledge_owners')
+    entries={**plan['files'],**plan['operational']};binding=plan['vmm']
+    must(set(plan['files'])==set(PUBLICATION_FILES) and set(entries)==set(publication_targets(rt)),'knowledge_inventory')
+    must(set(binding)=={'deploy','previous_repair','visibility','core_current_sha256','control_active_sha256','community'},
+         'knowledge_binding_fields')
+    previous=binding['previous_repair'];marker=previous['marker'];ident=digest(marker.get('approval_sha256'))
+    must(set(previous)=={'marker','proof_hashes'} and set(previous['proof_hashes'])==publication_proof_names(rt) and
+         marker=={'schema':PUBLICATION_REPAIR_MARKER,'approval_sha256':ident},'knowledge_parent_fields')
+    must(json_read(rt.store/'CORE_PUBLICATION_REPAIR_ACTIVE.json',rt.private)==marker,'knowledge_parent_pointer')
+    pf=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    for name,want in previous['proof_hashes'].items():read(pf/name,rt.private,expected=want)
+    parent=json_read(pf/'approval.json',rt.private,ident)
+    must(parent['schema']==PUBLICATION_REPAIR_SCHEMA and json_read(pf/'journal.json',rt.private).get('phase')=='INSTALLED' and
+         plan['installed_control']=={'approval_sha256':ident,'journal_sha256':previous['proof_hashes']['journal.json']},
+         'knowledge_control_parent')
+    visibility=binding['visibility'];vid=digest(visibility['approval_sha256']);vf=visibility_folder(rt,vid)
+    must(set(visibility)=={'marker','approval_sha256','journal_sha256'} and
+         visibility['marker']=={'schema':VISIBILITY_MARKER,'approval_sha256':vid} and
+         json_read(rt.store/'CATALOG_VISIBILITY_ACTIVE.json',rt.private)==visibility['marker'] and
+         json_read(vf/'journal.json',rt.private,visibility['journal_sha256']).get('phase')=='COMMITTED',
+         'knowledge_visibility_drift')
+    history=knowledge_history(rt,plan,phase)
+    old=proof_json(history,rt.preserved()['policy'],rt.private,entries['policy']['before_sha256'])
+    oldhand=proof_read(history,rt.targets()['handoff'][0],rt.private,expected=entries['handoff']['before_sha256'])
+    effective=applied_catalog_visibility(rt,old,env_values(oldhand),historical=history)
+    _,sources=revision_bundles(rt,binding['deploy'],plan['deploy'])
+    for name in PUBLICATION_FILES:
+        if name in MODULES:must(entries[name]['after_sha256']==sha(sources[name]),'knowledge_module_sources')
+        else:read(rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/name,
+                  rt.private,expected=entries[name]['after_sha256'])
+    for name,entry in entries.items():
+        if name not in KNOWLEDGE_MUTABLE:must(entry['before_sha256']==entry['after_sha256'],'knowledge_unrelated_change:'+name)
+    must(entries['guard']['after_sha256']==entries['core_release_guard.py']['after_sha256'],'knowledge_same_guard')
+    renderer_path=rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/'control_overlay.py'
+    controller_manifest=json_read(renderer_path.parent/'r25-controller-manifest.json',rt.private,plan['deploy']['manifest_sha256'])
+    renderer_digest=next(item['sha256'] for item in controller_manifest['files'] if item['path']=='control_overlay.py')
+    renderer_raw=read(renderer_path,rt.private,expected=renderer_digest)
+    renderer=importlib.util.module_from_spec(importlib.util.spec_from_file_location('_knowledge_lifecycle_renderer',renderer_path))
+    import sys
+    sys.modules[renderer.__name__]=renderer
+    exec(compile(renderer_raw,str(renderer_path),'exec',dont_inherit=True),renderer.__dict__)
+    before=proof_read(history,rt.targets()['lifecycle'][0],rt.scripts,0o700,entries['lifecycle']['before_sha256'])
+    must(sha(renderer.render_knowledge_lifecycle(before))==entries['lifecycle']['after_sha256'],'knowledge_lifecycle_render')
+    afterhand=oldhand;values=env_values(oldhand)
+    for key,name in (('R25_CORE_RELEASE_POLICY_SHA256','policy'),('R25_CORE_RELEASE_GUARD_SHA256','guard'),
+                     ('R25_VMM_CONTROLLER_SHA256','vmm_controller.py'),('R25_LIFECYCLE_ADAPTER_SHA256','lifecycle')):
+        line=(key+'='+values[key]+'\n').encode();must(afterhand.count(line)==1,'knowledge_handoff_line')
+        afterhand=afterhand.replace(line,(key+'='+entries[name]['after_sha256']+'\n').encode())
+    must(sha(afterhand)==entries['handoff']['after_sha256'],'knowledge_handoff_render')
+    for name,(path,owner,mode) in publication_targets(rt).items():
+        raw=read(path,owner,mode);entry=entries[name]
+        if runtime and name=='handoff':
+            actual,wanted=env_values(raw),env_values(afterhand)
+            must(all(actual.get(k)==wanted[k] for k in set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}),
+                 'knowledge_runtime_handoff')
+        else:must(sha(raw) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'knowledge_target_drift:'+name)
+    active=read(rt.preserved()['original-controller-active'],rt.private)
+    new=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
+    must(sha(active) in ({binding['control_active_sha256']} if phase=='before' else {sha(new)} if phase=='after' else
+         {binding['control_active_sha256'],sha(new)}),'knowledge_control_pointer')
+    knowledge_community(rt,binding['community']['deploy'],plan['deploy'],binding['community'],runtime=runtime or phase!='before')
+    if not runtime:revision_stopped(rt)
+    return effective
+
+
+def knowledge_current(rt,plan,value):
+    """Historical visibility proof never substitutes actual new Core identity."""
+    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
+    release=current.get('release');baseline=plan['current_release'];candidate=value['upgrade']['candidate']
+    must(current.get('schema')=='R25_CORE_CURRENT_V1' and type(release)is dict,'knowledge_current_schema')
+    record_path=rt.root/'runtime/core-publications/releases'/(digest(release['artifact_sha256'])+'-'+digest(release['commit_sha'],40))/'record.json'
+    record=json_read(record_path,rt.private,digest(release['accepted_record_sha256']))
+    if release==baseline:
+        must(record['policy_sha256']==plan['operational']['policy']['before_sha256'] and
+             all(record[k]==release[k] for k in ('commit_sha','artifact_sha256')) and
+             sha(current_raw)==plan['vmm']['core_current_sha256'],'knowledge_baseline_record')
+    else:
+        must(all(record.get(k)==v for k,v in candidate.items()) and
+             all(release.get(k)==candidate[k] for k in ('commit_sha','artifact_sha256')) and
+             record['policy_sha256']==plan['operational']['policy']['after_sha256'],'knowledge_unapproved_current')
+    tx=digest(current.get('transaction_id'),32)
+    journal=json_read(rt.root/'runtime/core-publications/transactions'/tx/'journal.json',rt.private)
+    must(journal.get('schema')=='R25_CORE_TRANSACTION_V1' and
+         journal.get('transaction_id')==journal.get('snapshot_id')==tx and
+         (release==baseline or journal.get('current')==baseline) and
+         journal.get('candidate')==release and journal.get('phase') in {
+         'CURRENT_COMMIT_INTENT','COMMITTED','RECOVERY_REQUIRED','RESTORE_STOP_INTENT','RESTORE_STOPPED','RESTORE_INTENT'},
+         'knowledge_current_transaction')
+
+
+def applied_knowledge_publication(rt,value,handoff):
+    marker=json_read(rt.store/'KNOWLEDGE_PUBLICATION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':KNOWLEDGE_MARKER,'approval_sha256':ident},'knowledge_marker')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident);record=json_read(folder/'journal.json',rt.private)
+    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    must(record.get('schema')==KNOWLEDGE_SCHEMA and record.get('approval_sha256')==ident and
+         record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'knowledge_incomplete')
+    old=verify_knowledge_publication(rt,plan,'after',runtime=True)
+    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+         env_values(read(rt.targets()['handoff'][0],rt.private))==handoff,'knowledge_arguments')
+    must(value['upgrade']['core_followup']['schema']=='R25_KNOWLEDGE_CORE_PUBLICATION_V1' and
+         value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'] and
+         value['upgrade']['compatibility']==old['upgrade']['compatibility'],'knowledge_retention_preserved')
+    knowledge_current(rt,plan,value)
+    result=copy.deepcopy(value);result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
+    return result
 
 
 def visibility_sql(manifest, pre, *, restore=False):
