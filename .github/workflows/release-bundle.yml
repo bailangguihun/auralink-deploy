@@ -16,10 +16,10 @@ jobs:
   package:
     name: Build controller installation artifact
     runs-on: ubuntu-latest
-    # Run the same full proof suite as PR CI, whose run 42158799619 exhausted
-    # 20 minutes. Include bounded room for archive verification and upload.
+    # Run the same full proof suite as PR CI; its 20/30-minute runs timed out
+    # with every completed test passing. Allow slower runners and artifact checks.
     # This remains package-only.
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Require release branch
         shell: bash

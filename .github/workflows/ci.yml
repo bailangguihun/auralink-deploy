@@ -70,9 +70,9 @@ jobs:
   validate:
     name: Validate deployment configuration
     runs-on: ubuntu-latest
-    # Run 42158799619 reached the 20-minute limit while the expanded proof
-    # suite was still passing. Leave bounded room for all tests and shell/Compose checks.
-    timeout-minutes: 30
+    # Runs 42158799619 and 42161168431 timed out at 20/30 minutes with
+    # every completed test passing. Allow slower runners to finish the full suite.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
