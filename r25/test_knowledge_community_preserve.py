@@ -117,6 +117,8 @@ class KnowledgeCommunityPreserve(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first['state'], 'READY_PRESERVED')
         self.assertEqual(first['process'], self.record['process'])
+        self.assertEqual(first['watchdog_state_sha256'], community_host.sha(self.fixture.s.state.read_bytes()))
+        self.assertNotEqual(first['watchdog_state_sha256'], community_host.sha(community_host.encoded(self.fixture.s.load())))
         self.assertEqual(self.preserved(), before)
         self.assertEqual(community_lifecycle.process(self.record['process']['pid']), self.record['process'])
 
@@ -201,6 +203,33 @@ class KnowledgeCommunityPreserve(unittest.TestCase):
             engine.watchdog_stop_locked.assert_not_called(); engine.stop_role.assert_not_called()
         self.assertEqual(len(self.fixture.s.load()['attempts']), 3)
         self.assertEqual(self.h.role().current()[1], self.record)
+
+    def test_state_whitespace_change_refuses_checkpoint_without_stopping_owned_process(self):
+        root = self.fixture.f.f.base / 'core-maintenance-whitespace'
+        root.mkdir(mode=0o700)
+        runtime = core_runtime.CoreRuntime.__new__(core_runtime.CoreRuntime)
+        runtime.fd = 37; runtime.tx = 'a' * 32
+        runtime.storage = R25Storage([str(root)], os.getuid(), os.getgid())
+        runtime.transaction_folder = Mock(return_value=root)
+        runtime.read = runtime.storage.read_private_record
+        runtime.validate_recovery = Mock()
+        engine = Mock(); engine.community_action.side_effect = lambda mode, fd: self.call()
+        runtime.engine = Mock(return_value=engine)
+        policy = {'upgrade': {'core_followup': {'schema': 'R25_KNOWLEDGE_CORE_PUBLICATION_V1'}}}
+        original = self.fixture.s.state.read_bytes()
+        with patch.object(core_runtime.guard, 'policy', return_value=policy):
+            runtime.community_maintenance(engine)
+            checkpoint = (root / 'community-maintenance.json').read_bytes()
+            with self.lease.held():
+                self.fixture.s.state.write_bytes(original + b' \n')
+            self.assertEqual(community_host.strict_json(original), self.fixture.s.load())
+            with self.assertRaisesRegex(core_runtime.Refused, 'maintenance_drift'):
+                runtime.stop_for_restore(None)
+            engine.watchdog_stop_locked.assert_not_called(); engine.stop_role.assert_not_called()
+            self.assertEqual((root / 'community-maintenance.json').read_bytes(), checkpoint)
+        self.assertEqual(len(self.fixture.s.load()['attempts']), 3)
+        self.assertEqual(self.h.role().current()[1], self.record)
+        self.assertEqual(community_lifecycle.process(self.record['process']['pid']), self.record['process'])
 
     def test_cli_successor_cannot_install_register_enable_or_rebind_old_plan(self):
         args = ['--plan', str(self.fixture.f.approval), '--plan-sha256', self.h.digest,

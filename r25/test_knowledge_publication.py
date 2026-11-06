@@ -65,7 +65,7 @@ class Knowledge(unittest.TestCase):
         record={**candidate,'schema':guard.BUSINESS_RECORD_SCHEMA,'policy_sha256':v.sha(v.encoded(policy))}
         digest=self.put(store/'releases'/(candidate['artifact_sha256']+'-'+candidate['commit_sha'])/'record.json',v.encoded(record))
         self.f.current=core_runtime.Release(candidate['commit_sha'],candidate['artifact_sha256'],digest);release=asdict(self.f.current)
-        self.put(store/'CURRENT.json',v.encoded(dict(schema='R25_CORE_CURRENT_V1',transaction_id=tx,release=release)))
+        self.put(store/'CURRENT.json',(json.dumps(dict(schema='R25_CORE_CURRENT_V1',transaction_id=tx,release=release),sort_keys=True,indent=2)+'\n').encode())
         self.put(store/'ACTIVE.json',v.encoded(dict(schema='R25_CORE_ACTIVE_V1',transaction_id=tx)))
         self.put(store/'transactions'/tx/'journal.json',v.encoded(dict(schema='R25_CORE_TRANSACTION_V1',transaction_id=tx,snapshot_id=tx,phase='COMMITTED',candidate=release,current=baseline or policy['upgrade']['baseline_release'])))
         return release
@@ -107,7 +107,7 @@ class Knowledge(unittest.TestCase):
         raw=v.encoded(plan);ident=v.sha(raw);base=self.root/'runtime/community';folder=base/'installations'/ident
         self.put(folder/'approval.json',raw);self.put(folder/'journal.json',v.encoded(dict(phase='INSTALLED')));self.put(base/'ACTIVE.json',v.encoded(dict(schema='ARTLIVE_COMMUNITY_HOST_V1',plan_sha256=ident)))
         self.put(base/'WATCHDOG.json',v.encoded(dict(schema='ARTLIVE_COMMUNITY_WATCHDOG_V1',plan_sha256=ident,controller_manifest_sha256=deployed['manifest_sha256'],python_sha256='3'*64,cli_sha256=v.sha((self.root/'operations/community-controller'/deployed['manifest_sha256']/'community_host_cli.py').read_bytes()))))
-        self.put(folder/'watchdog-state.json',v.encoded(dict(schema='ARTLIVE_COMMUNITY_WATCHDOG_V1',plan_sha256=ident,desired='RUNNING',attempts=[{'fixture':i} for i in range(3)])))
+        self.put(folder/'watchdog-state.json',(json.dumps(dict(schema='ARTLIVE_COMMUNITY_WATCHDOG_V1',plan_sha256=ident,desired='RUNNING',attempts=[{'fixture':i} for i in range(3)]),sort_keys=True,indent=2)+'\n').encode())
     def community_new(self,deployment):return self.community_package(deployment)
     def prepare(self,**kw):
         result=self.f.prepare(knowledge=True,**kw);self.plan=self.f.plan;self.ident=result['plan_sha256'];self.put(self.f.f.store/'publication-approvals'/(self.ident+'.json'),v.encoded(self.plan));self.f.ident=self.ident;return result
@@ -115,7 +115,17 @@ class Knowledge(unittest.TestCase):
     def assert_preserved(self):
         for p,raw in self.preserved.items():self.assertEqual(raw,p.read_bytes(),str(p))
     def test_complete_binding_and_committed_candidate_preserve_all_predecessors(self):
-        self.prepare();self.assertEqual('INSTALLED',self.f.install());self.effective();self.assertEqual(['preserve'],self.actions);self.assert_preserved()
+        self.prepare()
+        current=self.f.f.store/'CURRENT.json';raw=current.read_bytes()
+        self.assertNotEqual(raw,v.encoded(json.loads(raw)))
+        self.assertEqual(self.plan['vmm']['core_current_sha256'],v.sha(raw))
+        bound=self.plan['vmm']['community'];state=self.root/'runtime/community/installations'/bound['plan_sha256']/'watchdog-state.json'
+        self.assertEqual(bound['state_sha256'],v.sha(state.read_bytes()))
+        self.assertNotEqual(bound['state_sha256'],v.sha(v.encoded(json.loads(state.read_bytes()))))
+        self.assertEqual('INSTALLED',self.f.install());self.effective();self.assertEqual(['preserve'],self.actions);self.assert_preserved()
+        self.put(current,v.encoded(json.loads(raw)))
+        with self.assertRaisesRegex(Exception,'knowledge_baseline_record'):self.effective()
+        self.put(current,raw);self.effective()
         self.assertEqual('INSTALLED_VERIFIED_NOOP',self.f.install());self.assertEqual('INSTALLED_NO_RECOVERY',self.f.recover())
         self.commit_current(self.f.new,'c'*32,self.plan['current_release']);self.effective();self.assert_preserved();self.assertEqual(self.f.knowledge_compatibility,self.effective()['upgrade']['compatibility'])
     def test_partial_policy_copy_restores_exact_old_controls_without_community_restart(self):
@@ -155,6 +165,10 @@ class Knowledge(unittest.TestCase):
             raw=journal.read_bytes();value=json.loads(raw);value[key]=wrong;self.put(journal,v.encoded(value))
             with self.subTest(key=key),self.assertRaisesRegex(Exception,'knowledge_current_transaction'):self.effective()
             self.put(journal,raw)
+        current=self.f.f.store/'CURRENT.json';raw=current.read_bytes()
+        self.put(current,raw.rstrip()[:-1]+b',"schema":"R25_CORE_CURRENT_V1"}\n')
+        with self.assertRaisesRegex(Exception,'json_duplicate_key'):self.effective()
+        self.put(current,raw)
         path=self.f.f.store/'controller-upgrades'/self.parent.ident/'before/policy';raw=path.read_bytes();self.put(path,raw+b' ')
         with self.assertRaises(Exception):self.effective()
         self.put(path,raw);self.effective()

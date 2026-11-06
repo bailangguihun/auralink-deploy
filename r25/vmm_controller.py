@@ -78,13 +78,17 @@ def read(path, owner=(0, 0), mode=0o600, expected=None):
     finally: os.close(fd)
 
 
-def json_read(path, owner=(0,0), expected=None):
+def json_bytes(raw):
     def pairs(items):
         result = {}
         for key, value in items:
             must(key not in result, 'json_duplicate_key'); result[key] = value
         return result
-    return json.loads(read(path, owner, expected=expected), object_pairs_hook=pairs)
+    return json.loads(raw, object_pairs_hook=pairs)
+
+
+def json_read(path, owner=(0,0), expected=None):
+    return json_bytes(read(path, owner, expected=expected))
 
 
 class Runtime:
@@ -1986,7 +1990,7 @@ def knowledge_community_bundle(rt, deployment, controller):
 
 def knowledge_community(rt, deployment, controller, bound=None, *, runtime=False):
     bundle,sources=knowledge_community_bundle(rt,deployment,controller)
-    base=rt.root/'runtime/community';marker=json_read(base/'WATCHDOG.json',rt.private)
+    base=rt.root/'runtime/community';marker_raw=read(base/'WATCHDOG.json',rt.private);marker=json_bytes(marker_raw)
     ident=digest(marker.get('plan_sha256'));folder=base/'installations'/ident
     plan=json_read(folder/'approval.json',rt.private,ident)
     must(json_read(base/'ACTIVE.json',rt.private)=={'schema':'ARTLIVE_COMMUNITY_HOST_V1','plan_sha256':ident} and
@@ -2003,12 +2007,12 @@ def knowledge_community(rt, deployment, controller, bound=None, *, runtime=False
         before=read(oldbundle/item['path'],rt.private,expected=item['sha256'])
         if item['path'] not in {'community_host.py','community_host_cli.py'}:
             must(before==sources[item['path']],'knowledge_community_behavior_unchanged')
-    state=json_read(folder/'watchdog-state.json',rt.private)
+    state_raw=read(folder/'watchdog-state.json',rt.private);state=json_bytes(state_raw)
     must(state.get('plan_sha256')==ident and state.get('schema')=='ARTLIVE_COMMUNITY_WATCHDOG_V1' and
          type(state.get('attempts'))is list and 1<=len(state['attempts'])<=3,'knowledge_community_state')
-    capture={'deploy':deployment,'plan_sha256':ident,'registration_sha256':sha(encoded(marker)),
+    capture={'deploy':deployment,'plan_sha256':ident,'registration_sha256':sha(marker_raw),
         'active_sha256':sha(read(base/'ACTIVE.json',rt.private)),
-        'state_sha256':sha(encoded(state)),'lease':plan['lease'],
+        'state_sha256':sha(state_raw),'lease':plan['lease'],
         'cli_sha256':sha(sources['community_host_cli.py'])}
     if bound is not None:
         must(set(bound)==set(capture),'knowledge_community_fields')
@@ -2038,13 +2042,13 @@ def capture_knowledge_publication(rt,deploy,community,controller):
          json_read(folder/'journal.json',rt.private).get('phase')=='INSTALLED','knowledge_parent_incomplete')
     names=publication_proof_names(rt)
     must({p.relative_to(folder).as_posix() for p in folder.rglob('*') if not p.is_dir()}==names,'knowledge_parent_inventory')
-    current=json_read(rt.preserved()['core-current'],rt.private)
+    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
     must(all(current['release'][k]==old['upgrade']['candidate'][k] for k in ('commit_sha','artifact_sha256')),
          'knowledge_requires_committed_candidate')
     return {'deploy':deploy,'previous_repair':{'marker':marker,
         'proof_hashes':{n:sha(read(folder/n,rt.private)) for n in sorted(names)}},
         'visibility':{'marker':visibility,'approval_sha256':vid,'journal_sha256':sha(read(vf/'journal.json',rt.private))},
-        'core_current_sha256':sha(encoded(current)),
+        'core_current_sha256':sha(current_raw),
         'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private)),
         'community':knowledge_community(rt,community,controller)}
 
@@ -2130,7 +2134,7 @@ def verify_knowledge_publication(rt,plan,phase='before',*,runtime=False):
 
 def knowledge_current(rt,plan,value):
     """Historical visibility proof never substitutes actual new Core identity."""
-    current=json_read(rt.preserved()['core-current'],rt.private)
+    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
     release=current.get('release');baseline=plan['current_release'];candidate=value['upgrade']['candidate']
     must(current.get('schema')=='R25_CORE_CURRENT_V1' and type(release)is dict,'knowledge_current_schema')
     record_path=rt.root/'runtime/core-publications/releases'/(digest(release['artifact_sha256'])+'-'+digest(release['commit_sha'],40))/'record.json'
@@ -2138,7 +2142,7 @@ def knowledge_current(rt,plan,value):
     if release==baseline:
         must(record['policy_sha256']==plan['operational']['policy']['before_sha256'] and
              all(record[k]==release[k] for k in ('commit_sha','artifact_sha256')) and
-             sha(encoded(current))==plan['vmm']['core_current_sha256'],'knowledge_baseline_record')
+             sha(current_raw)==plan['vmm']['core_current_sha256'],'knowledge_baseline_record')
     else:
         must(all(record.get(k)==v for k,v in candidate.items()) and
              all(release.get(k)==candidate[k] for k in ('commit_sha','artifact_sha256')) and

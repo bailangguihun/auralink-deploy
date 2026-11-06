@@ -70,9 +70,9 @@ jobs:
   validate:
     name: Validate deployment configuration
     runs-on: ubuntu-latest
-    # The 639 tests took 860.057s in formal run 40301806631. Four additional
-    # real proof/transaction regressions need room before shell/Compose checks.
-    timeout-minutes: 20
+    # Run 42158799619 reached the 20-minute limit while the expanded proof
+    # suite was still passing. Leave bounded room for all tests and shell/Compose checks.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:

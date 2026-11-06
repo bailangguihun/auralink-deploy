@@ -16,10 +16,10 @@ jobs:
   package:
     name: Build controller installation artifact
     runs-on: ubuntu-latest
-    # Same gate as PR CI: run 40301806631 needed 860.057s for 639 tests,
-    # before four new proof regressions and archive verification/upload.
-    # This remains bounded and package-only.
-    timeout-minutes: 20
+    # Run the same full proof suite as PR CI, whose run 42158799619 exhausted
+    # 20 minutes. Include bounded room for archive verification and upload.
+    # This remains package-only.
+    timeout-minutes: 30
     steps:
       - name: Require release branch
         shell: bash

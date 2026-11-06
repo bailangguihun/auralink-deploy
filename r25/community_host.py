@@ -297,7 +297,9 @@ class Host:
     def preserve_running(self):
         """Read-only maintenance proof; never drain, restart, or spend a retry."""
         from community_supervision import Supervisor
-        state=Supervisor(self).registered();role=self.role();role.verify()
+        supervisor=Supervisor(self);state=supervisor.registered();role=self.role();role.verify()
+        state_identity=identity(supervisor.state);state_raw=supervisor.state.read_bytes()
+        must(sha(state_raw)==state_identity['sha256'] and strict_json(state_raw)==state,'community_preserve_state_changed')
         must(state['desired']=='RUNNING','community_preserve_not_running')
         path,record=role.current()
         must(record is not None and record['phase']=='READY' and
@@ -324,7 +326,8 @@ class Host:
                  strict_json(raw)=={'status':'UP','contractVersion':1},'community_preserve_health')
         finally:connection.close()
         must(process(saved['pid'])==saved,'community_preserve_process_changed')
-        return {'state':'READY_PRESERVED','process':saved,'watchdog_state_sha256':sha(encoded(state)),
+        must(identity(supervisor.state)==state_identity,'community_preserve_state_changed')
+        return {'state':'READY_PRESERVED','process':saved,'watchdog_state_sha256':state_identity['sha256'],
                 'process_record_sha256':identity(path)['sha256']}
 
     def install(self, archive, manifest, settings, node, approval, *, recover=False):
