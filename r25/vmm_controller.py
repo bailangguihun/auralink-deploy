@@ -2306,7 +2306,9 @@ def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False):
     community_upgrade_legacy(rt,plan['legacy'],before=phase=='before')
     must(set(plan['preserved'])==set(rt.preserved()),'community_upgrade_preserved_inventory')
     for name,path in rt.preserved().items():
-        if runtime and name in {'frontend','frontend-reference','java-proof','guide-proof','critic-proof'}:continue
+        # Installation pins every preimage. Afterwards the retained guards own
+        # live release/rollback and PID validation, as in require_context().
+        if runtime and name not in {'policy','original-controller-active'}:continue
         read(path,rt.private,expected=plan['preserved'][name])
     must(set(plan['files'])==set(COMMUNITY_UPGRADE_TARGETS),'community_upgrade_target_inventory')
     before={};history={}

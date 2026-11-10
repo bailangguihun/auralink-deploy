@@ -79,6 +79,15 @@ class Upgrade(unittest.TestCase):
         self.effective()
         self.assertEqual(v.install_community_supervision(self.rt,self.ident)['outcome'],'COMMUNITY_SUPERVISION_INSTALLED_VERIFIED')
         self.assertEqual(v.json_read(self.community/'supervision-v2.json',self.rt.private)['attempts'],['a'*32])
+        # A legitimate Core transaction stays subject to the retained guard,
+        # rather than being frozen to this Community installation's snapshot.
+        self.k.commit_current(self.k.f.new,'d'*32,self.k.plan['current_release'])
+        self.effective()
+        current=self.rt.preserved()['core-current'];raw=current.read_bytes()
+        value=v.json_bytes(raw);value['release']['commit_sha']='f'*40
+        self.put(current,v.encoded(value))
+        with self.assertRaises(Exception):self.effective()
+        self.put(current,raw)
 
     def test_partial_control_write_requires_explicit_forward_recovery(self):
         self.prepare()
