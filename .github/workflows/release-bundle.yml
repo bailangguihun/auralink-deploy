@@ -15,7 +15,8 @@ concurrency:
 jobs:
   package:
     name: Build controller installation artifact
-    runs-on: ubuntu-latest
+    # Match the native PostgreSQL 16 jobs in PR CI.
+    runs-on: ubuntu-24.04
     # Run the same full proof suite as PR CI; its 20/30-minute runs timed out
     # with every completed test passing. Allow slower runners and artifact checks.
     # This remains package-only.
@@ -28,6 +29,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Check PostgreSQL 16 tools before the full test suite
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for tool in initdb pg_ctl psql pg_dump pg_restore; do
+            executable="/usr/lib/postgresql/16/bin/$tool"
+            if ! test -x "$executable"; then
+              echo "::error::Required PostgreSQL 16 executable is missing: $executable" >&2
+              exit 1
+            fi
+            "$executable" --version
+          done
 
       - uses: actions/setup-python@v5
         with:
