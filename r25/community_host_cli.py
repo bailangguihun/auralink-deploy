@@ -62,12 +62,13 @@ def supervision_command(host, command, bundle, *, supervisor=None, operation_id=
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve'])
+    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover'])
     for name in ['plan','plan-sha256','bundle-manifest-sha256']:p.add_argument('--'+name,required=True)
-    for name in ['archive','manifest','settings','node','approval','operation-id']:p.add_argument('--'+name)
+    for name in ['archive','manifest','settings','node','approval','operation-id','package-plan','package-plan-sha256','review-sha256']:p.add_argument('--'+name)
     p.add_argument('--lease-fd',type=int)
     p.add_argument('--knowledge-publication-sha256')
     p.add_argument('--supervision-upgrade-sha256')
+    p.add_argument('--studio-publication-sha256')
     a=p.parse_args()
     if (a.lease_fd is not None) != a.command.startswith('watchdog-'):
         raise ValueError('community_watchdog_inherited_lease_required')
@@ -78,7 +79,15 @@ def main():
     if raw!=encoded(plan) or sha(raw)!=a.plan_sha256:raise ValueError('community_exact_plan_bytes')
     binding=plan['lease']
     legacy_sha=None
-    if a.supervision_upgrade_sha256:
+    if a.command.startswith('package-') and not a.studio_publication_sha256:
+        raise ValueError('community_package_requires_studio')
+    if a.studio_publication_sha256:
+        if not a.knowledge_publication_sha256 or not a.supervision_upgrade_sha256 or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover'):
+            raise ValueError('community_studio_scope')
+        from community_host import studio_lease_binding
+        binding,legacy_sha=studio_lease_binding(plan,a.plan_sha256,a.bundle_manifest_sha256,
+            a.knowledge_publication_sha256,a.supervision_upgrade_sha256,a.studio_publication_sha256)
+    elif a.supervision_upgrade_sha256:
         if not a.knowledge_publication_sha256 or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve'):
             raise ValueError('community_recovery_original_installation_only')
         from community_host import recovery_lease_binding
@@ -100,6 +109,25 @@ def main():
     if a.supervision_upgrade_sha256:
         from community_supervision import RecoverySupervisor
         supervisor=RecoverySupervisor(host,a.supervision_upgrade_sha256,legacy_sha)
+    if a.command.startswith('package-') or (a.studio_publication_sha256 and (host.folder/'RELEASE_ACTIVE.json').exists()):
+        from community_host import PackageUpgrade,package_context
+        with lease.held():
+            service=PackageUpgrade(host,supervisor,package_context(host,a.studio_publication_sha256))
+            if a.command=='package-prepare':
+                if not all([a.archive,a.manifest,a.review_sha256]):raise ValueError('community_package_material_required')
+                # The archive verifier checks these fields against the whole bundle.
+                manifest=json.loads(Path(a.manifest).read_bytes())
+                provenance={k:manifest[k] for k in ('commit','run_id','run_attempt')}
+                value,path=service.prepare(a.archive,a.manifest,provenance,a.review_sha256)
+                print(json.dumps(dict(community='UNSIGNED_PACKAGE_PLAN',plan_sha256=sha(encoded(value)),path=str(path))))
+                return
+            if a.command in ('package-install','package-recover'):
+                if not all([a.package_plan,a.package_plan_sha256,a.archive,a.manifest]):raise ValueError('community_package_plan_required')
+                raw=Path(a.package_plan).read_bytes();value=json.loads(raw)
+                if raw!=encoded(value) or sha(raw)!=a.package_plan_sha256:raise ValueError('community_package_exact_plan')
+                result=service.install(value,a.archive,a.manifest,recover=a.command=='package-recover')
+                print(json.dumps(dict(community=result)));return
+            host,supervisor=service.active()
     if a.command in {'check','install','recover'}:
         if not all([a.archive,a.manifest,a.settings,a.node]):raise ValueError('community_material_required')
         with lease.held():

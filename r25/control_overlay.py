@@ -331,3 +331,30 @@ def render_community_recovery_lifecycle(before):
     raw=replace_once(before,old,addition+old,'community_recovery_method')
     ast.parse(raw)
     return raw
+
+
+def render_studio_lifecycle(before):
+    """Add one source-bound Studio successor, retaining the recovery watchdog."""
+    if before.count(b"extra+=['--supervision-upgrade-sha256',upgrade]") != 1:
+        raise OverlayRefused('studio_requires_recovery_lifecycle')
+    anchor=b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+    addition=b'''        studio=self.root/'runtime/vmm-controller/STUDIO_PUBLICATION_ACTIVE.json'
+        if studio.exists() or studio.is_symlink():
+            guard(studio,self.private)
+            pointer=json.loads(studio.read_bytes());studio_id=pointer.get('approval_sha256')
+            must(re.fullmatch('[a-f0-9]{64}',str(studio_id)) and pointer=={'schema':'R25_STUDIO_PUBLICATION_ACTIVE_V1','approval_sha256':studio_id},'community_studio_pointer')
+            folder=self.root/'runtime/core-publications/controller-upgrades'/studio_id
+            approval=folder/'approval.json';guard(approval,self.private,0o600,studio_id)
+            raw=approval.read_bytes();must(hashlib.sha256(raw).hexdigest()==studio_id,'community_studio_approval_changed')
+            approved=json.loads(raw);journal=folder/'journal.json';guard(journal,self.private)
+            receipt=json.loads(journal.read_bytes())
+            must(approved['schema']=='R25_STUDIO_CORE_PUBLICATION_BINDING_V1' and receipt['approval_sha256']==studio_id and receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_studio_not_installed')
+            must(approved['vmm']['supervision']['marker']['approval_sha256']==upgrade,'community_studio_parent')
+            community=approved['vmm']['community'];guard(marker,self.private,0o600,community['registration_sha256'])
+            must(record['plan_sha256']==community['plan_sha256'],'community_studio_plan')
+            record=dict(record,controller_manifest_sha256=community['deploy']['manifest_sha256'],cli_sha256=community['cli_sha256'])
+            extra+=['--studio-publication-sha256',studio_id]
+'''
+    raw=replace_once(before,anchor,addition+anchor,'community_studio_method')
+    ast.parse(raw)
+    return raw

@@ -83,7 +83,7 @@ class ScheduledTests(unittest.TestCase):
         for target, value in ((backup, {'verify_http': lambda *a, **k: {'fixture_http': True}}),
                               (release, {'inspect_schema': lambda *a: {'versions': list(range(16))}})):
             p = patch.multiple(target, **value); p.start(); self.addCleanup(p.stop)
-        self.contract = {'backup_policy': dict(backup.POLICY), 'attachment_root': str(self.root/'attachments'), 'migrations': []}
+        self.contract = {'backup_policy': dict(backup.POLICY), 'attachment_root': str(self.root/'attachments'), 'migrations': [{'version':f'V{i:03d}'} for i in range(1,17)]}
         self.job = self.at(0)
     def at(self, day):
         return backup.ScheduledBackup(self.rt, self.contract, pg=self.pg,
