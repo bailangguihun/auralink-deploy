@@ -21,7 +21,7 @@ SCHEMA = 'R25_CORE_BUSINESS_POLICY_V2'
 RECORD_SCHEMA = 'R25_CORE_BUSINESS_RELEASE_V2'
 REPOSITORY = 'Hang-666-star/auralink-core-api'
 CURRENT_REPOSITORY = 'bailangguihun/auralink-core-api'
-MANAGED_CORE_SCHEMAS = ('R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1', 'R25_KNOWLEDGE_CORE_PUBLICATION_V1')
+MANAGED_CORE_SCHEMAS = ('R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1', 'R25_KNOWLEDGE_CORE_PUBLICATION_V1', 'R25_STUDIO_CORE_PUBLICATION_V1')
 VERIFIED_REPOSITORIES = (CURRENT_REPOSITORY, REPOSITORY)
 CONFIG_KEYS = ('snapshot-root', 'graph-sha256', 'stats-sha256', 'map-enabled', 'china-sha256')
 ASSETS = {'poetry-graph.json': 'graph-sha256', 'poetry-stats.json': 'stats-sha256',
@@ -782,7 +782,7 @@ def verify_compatibility(policy, query):
         helper=assistant_module(policy)
         ledger=strict_json(query(ASSISTANT_LEDGER_SQL))['ledger']
         entries=up['assistant']['migrations']; helper.migration_inventory(entries)
-        must(len(ledger) in helper.PREFIX_LENGTHS and ledger==[{'version':x['version'],'sha256':x['sha256']} for x in entries[:len(ledger)]],'assistant_live_schema_binding')
+        must(len(ledger) in helper.schema_prefixes(entries) and ledger==[{'version':x['version'],'sha256':x['sha256']} for x in entries[:len(ledger)]],'assistant_live_schema_binding')
         must(current['versions']==[x['version'] for x in ledger],'assistant_schema_observation')
     comparison=('database','port','major','tables') if up['capability']=='assistant-v1' else ('database','port','major','versions','tables')
     must(all(current[key] == manifest[key] for key in comparison),

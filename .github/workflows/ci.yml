@@ -15,6 +15,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  studio-migration:
+    name: Validate Studio V017 against native PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bailangguihun/auralink-core-api
+          ref: 130493f4b91c3a7cf3dedb43ec1260c01ddac91e
+          path: .studio-core-fixture
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -B scripts/rehearse-studio-migration.py --pg-bin /usr/lib/postgresql/16/bin --core-source .studio-core-fixture --fixture "$RUNNER_TEMP/studio-migration"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-migration-result
+          path: ${{ runner.temp }}/studio-migration/RESULT.json
+          if-no-files-found: error
+
   community-host:
     name: Validate Community host and native database boundary
     runs-on: ubuntu-24.04
@@ -107,7 +132,7 @@ jobs:
 
   validate:
     name: Validate deployment configuration
-    needs: [r25-shards]
+    needs: [r25-shards, studio-migration]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -115,7 +140,10 @@ jobs:
       - name: Require every matrix shard to succeed
         env:
           SHARDS_RESULT: ${{ needs.r25-shards.result }}
-        run: test "$SHARDS_RESULT" = success
+          MIGRATION_RESULT: ${{ needs.studio-migration.result }}
+        run: |
+          test "$SHARDS_RESULT" = success
+          test "$MIGRATION_RESULT" = success
       - uses: actions/checkout@v4
         with:
           persist-credentials: false

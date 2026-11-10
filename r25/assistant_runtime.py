@@ -53,7 +53,7 @@ def before_install(rt,current,candidate,snapshot_id):
         old=rt.read(logpath)
         # Deliberate recover/reconcile only, no blind migration or provider replay.
         release.must(old.get('phase')=='SCHEMA_READY','assistant_existing_schema_transaction_requires_recovery')
-        release.must(len(release.inspect_schema(pg,contract['migrations'])['versions'])==16,'assistant_schema_ready_drift')
+        release.must(len(release.inspect_schema(pg,contract['migrations'])['versions'])==len(contract['migrations']),'assistant_schema_ready_drift')
         return
     def quiescent():
         rt.require_lease(); rt.require_no_active_work()

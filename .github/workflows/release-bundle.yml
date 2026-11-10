@@ -40,6 +40,23 @@ jobs:
       - name: Verify complete R25 test suite
         run: python -B -m unittest discover -s r25 -p 'test_*.py' -v
 
+      - uses: actions/checkout@v4
+        with:
+          repository: bailangguihun/auralink-core-api
+          ref: 130493f4b91c3a7cf3dedb43ec1260c01ddac91e
+          path: .studio-core-fixture
+          persist-credentials: false
+
+      - name: Verify actual V017 migration and lost-reply recovery
+        run: python -B scripts/rehearse-studio-migration.py --pg-bin /usr/lib/postgresql/16/bin --core-source .studio-core-fixture --fixture "$RUNNER_TEMP/studio-migration"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-migration-result
+          path: ${{ runner.temp }}/studio-migration/RESULT.json
+          if-no-files-found: error
+
       - name: Package and verify fixed controller allowlist
         shell: bash
         run: |

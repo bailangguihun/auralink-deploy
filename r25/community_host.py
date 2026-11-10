@@ -167,6 +167,41 @@ def recovery_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_
     return binding,approved['legacy']['state_sha256']
 
 
+
+def studio_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sha, studio_sha):
+    """An exact installed finite successor selects the new guard and CLI only."""
+    def private(path, expected=None):
+        item=identity(path)
+        must((item['uid'],item['gid'],item['mode'])==(0,0,0o600),'community_studio_private')
+        if expected:must(item['sha256']==expected,'community_studio_digest')
+        raw=Path(path).read_bytes();must(sha(raw)==item['sha256'],'community_studio_changed')
+        return strict_json(raw)
+    must(re.fullmatch('[a-f0-9]{64}',str(studio_sha)) is not None,'community_studio_digest')
+    marker=private(ROOT/'runtime/vmm-controller/STUDIO_PUBLICATION_ACTIVE.json')
+    must(marker=={'schema':'R25_STUDIO_PUBLICATION_ACTIVE_V1','approval_sha256':studio_sha},'community_studio_pointer')
+    folder=ROOT/'runtime/core-publications/controller-upgrades'/studio_sha
+    approved=private(folder/'approval.json',studio_sha);receipt=private(folder/'journal.json')
+    bound=approved['vmm']['community']
+    must(approved['schema']=='R25_STUDIO_CORE_PUBLICATION_BINDING_V1' and receipt['approval_sha256']==studio_sha
+         and receipt['phase'] in ('VERIFY_INTENT','INSTALLED') and
+         approved['vmm']['supervision']['marker']=={'schema':'R25_COMMUNITY_SUPERVISION_UPGRADE_V1','approval_sha256':upgrade_sha}
+         and manifest_sha==bound['deploy']['manifest_sha256'] and plan_sha==bound['plan_sha256']==sha(encoded(plan)),
+         'community_studio_binding')
+    private(ROOT/'runtime/community/WATCHDOG.json',bound['registration_sha256'])
+    parent_folder=ROOT/'runtime/vmm-controller/community-supervision'/upgrade_sha
+    parent=private(parent_folder/'approval.json',upgrade_sha)
+    must(parent['knowledge_approval_sha256']==knowledge_sha and parent['legacy']['plan_sha256']==plan_sha,
+         'community_studio_predecessor')
+    private(parent_folder/'journal.json',approved['vmm']['supervision']['journal_sha256'])
+    private(ROOT/'runtime/community/installations'/plan_sha/'watchdog-state.json',parent['legacy']['state_sha256'])
+    path=ROOT/'operations/core_release_guard.py';observed=identity(path)
+    must(observed['sha256']==approved['operational']['guard']['after_sha256'] and
+         (observed['uid'],observed['gid'],observed['mode'])==tuple(approved['controller_owner'])+(0o700,),
+         'community_studio_guard')
+    # production_lease next verifies the full historical chain and actual CURRENT.
+    return dict(plan['lease'],guard=observed),parent['legacy']['state_sha256']
+
+
 def production_lease(binding, descriptor=None):
     path = ROOT/'operations/core_release_guard.py'
     match(path, binding['guard'])
@@ -478,3 +513,237 @@ def supervise(host, stop_requested, *, interval=2):
             continue
         if state in ('NOT_STARTED','STOPPED','EXITED','UNKNOWN'): return state
         time.sleep(interval)
+
+
+PACKAGE_SCHEMA = 'ARTLIVE_COMMUNITY_PACKAGE_UPGRADE_V1'
+
+
+def package_context(host, studio_sha):
+    """Actual committed Core identity, checked under the retained production lease."""
+    host.lease.require()
+    must(re.fullmatch('[a-f0-9]{64}',str(studio_sha)) is not None,'community_package_studio_digest')
+    def read(path, expected=None):
+        i=identity(path)
+        must((i['uid'],i['gid'],i['mode'])==(*host.owner,0o600),'community_package_context_private')
+        raw=path.read_bytes()
+        must(sha(raw)==i['sha256'] and (expected is None or sha(raw)==expected),'community_package_context_drift')
+        return strict_json(raw),i['sha256']
+    base=ROOT/'runtime/core-publications';folder=base/'controller-upgrades'/studio_sha
+    approved,_=read(folder/'approval.json',studio_sha);installed,_=read(folder/'journal.json')
+    must(approved['schema']==installed['schema']=='R25_STUDIO_CORE_PUBLICATION_BINDING_V1' and
+         installed['approval_sha256']==studio_sha and installed['phase']=='INSTALLED',
+         'community_package_studio_not_installed')
+    policy,_=read(base/'POLICY.json',approved['operational']['policy']['after_sha256'])
+    current,current_sha=read(base/'CURRENT.json');candidate=policy['upgrade']['candidate'];release=current['release']
+    must(all(release[k]==candidate[k] for k in ('commit_sha','artifact_sha256')),'community_package_new_core_required')
+    tx=current['transaction_id'];must(re.fullmatch('[a-f0-9]{32}',str(tx)) is not None,'community_package_core_transaction')
+    receipt,receipt_sha=read(base/'transactions'/tx/'journal.json')
+    must(receipt['phase']=='COMMITTED' and receipt['candidate']==release and receipt['transaction_id']==tx,
+         'community_package_core_not_committed')
+    return dict(studio_approval_sha256=studio_sha,core_commit=release['commit_sha'],
+                core_current_sha256=current_sha,core_transaction_sha256=receipt_sha)
+
+
+class ReleaseHost(Host):
+    """Use a separately verified immutable package; retain the original Host plan."""
+    def __init__(self, original, release):
+        super().__init__(original.root, original.plan, original.lease)
+        self.release = release
+
+    def binding(self):
+        return dict(super().binding(),release_root=str(self.release/'release'),
+                    manifest_sha256=self.package_plan['manifest']['sha256'],
+                    provenance=self.package_plan['provenance'])
+
+    def role(self):
+        if self._role is None:
+            self._role=Role(self.release/'process',self.binding(),self.lease.require)
+        return self._role
+
+
+class PackageUpgrade:
+    """One package replacement after Studio Core, under the original lease.
+
+    No SQL, config edits, process adoption, missing-receipt retry, or data restore.
+    The original watchdog shares the lease. Durable STOPPED/activation records
+    prevent it replaying an interrupted package operation after lease release.
+    """
+    def __init__(self, host, supervisor, context):
+        self.host,self.supervisor,self.context=host,supervisor,context
+        self.root=host.folder/'package-upgrades'
+        self.marker=host.folder/'RELEASE_ACTIVE.json'
+        self.candidates={}
+
+    def prepare(self, archive, manifest, provenance, review_sha256):
+        h=self.host;h.lease.require();h.validate(installing=False)
+        must(not self.marker.exists() and not self.marker.is_symlink(),'community_package_already_upgraded')
+        must(provenance.get('commit')==self.context['core_commit'],'community_package_core_release')
+        must(re.fullmatch('[a-f0-9]{64}',review_sha256) is not None,'community_package_review')
+        for p in (archive,manifest):
+            i=identity(p);must((i['uid'],i['gid'],i['mode'])==(*h.owner,0o600),'community_package_private')
+        raw=Path(archive).read_bytes();mr=Path(manifest).read_bytes()
+        verify_archive(raw,mr,provenance)
+        before=h.preserve_running(self.supervisor)
+        plan=dict(schema=PACKAGE_SCHEMA,context=self.context,original_plan_sha256=h.digest,
+                  archive=identity(archive),manifest=identity(manifest),provenance=provenance,
+                  review_sha256=review_sha256,before=before,
+                  binding_sha256=sha(encoded(h.binding())))
+        ident=sha(encoded(plan));folder=self.root/ident
+        h.storage.mkdir_private(self.root);h.storage.mkdir_private(folder)
+        path=folder/'UNSIGNED_PLAN.json'
+        if path.exists():must(path.read_bytes()==encoded(plan),'community_package_plan_conflict')
+        else:h.storage.atomic_write_bytes(path,encoded(plan))
+        return plan,path
+
+    def verify(self, plan):
+        h=self.host;h.lease.require();h.validate(installing=False)
+        must(set(plan)=={'schema','context','original_plan_sha256','archive','manifest','provenance',
+                         'review_sha256','before','binding_sha256'} and plan['schema']==PACKAGE_SCHEMA,
+             'community_package_plan')
+        must(plan['context']==self.context and plan['original_plan_sha256']==h.digest and
+             plan['binding_sha256']==sha(encoded(h.binding())),'community_package_context')
+        must(plan['provenance']['commit']==self.context['core_commit'],'community_package_core_release')
+        ident=sha(encoded(plan));folder=self.root/ident
+        approval=folder/'approval.json';match(approval,dict(identity(approval),sha256=ident))
+        must((identity(approval)['uid'],identity(approval)['gid'],identity(approval)['mode'])==(*h.owner,0o600),
+             'community_package_approval_private')
+        must(approval.read_bytes()==encoded(plan),'community_package_exact_approval')
+        return ident,folder
+
+    def candidate(self,plan):
+        release=self.host.folder/'package-releases'/plan['manifest']['sha256']
+        if release not in self.candidates:
+            host=ReleaseHost(self.host,release);host.package_plan=plan;self.candidates[release]=host
+        return self.candidates[release]
+
+    def materialize(self,plan,archive,manifest):
+        h=self.host;match(archive,plan['archive']);match(manifest,plan['manifest'])
+        raw=Path(archive).read_bytes();mr=Path(manifest).read_bytes()
+        must(sha(raw)==plan['archive']['sha256'] and sha(mr)==plan['manifest']['sha256'],'community_package_material_changed')
+        m=verify_archive(raw,mr,plan['provenance']);candidate=self.candidate(plan)
+        def put(path,data):
+            for parent in reversed([path.parent,*path.parent.parents]):
+                if parent==h.folder or h.folder in parent.parents:h.storage.mkdir_private(parent)
+            if path.exists():h.storage.file_identity(path,expected_sha256=sha(data),expected_bytes=len(data))
+            else:
+                must(len(data)<=32*1024*1024,'community_package_file_limit')
+                def write(fd):h.storage._write(fd,data);return dict(sha256=sha(data),bytes=len(data))
+                h.storage._atomic(path,write)
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            for item in m['files']:put(candidate.release/'release'/item['path'],z.read(item['path']))
+        put(candidate.release/'release/manifest.json',mr)
+        h.storage.mkdir_private(candidate.release/'process');candidate.role().verify()
+        return candidate
+
+    def install(self,plan,archive,manifest,*,recover=False,fault=None):
+        h=self.host;ident,folder=self.verify(plan);journal=folder/'journal.json'
+        record=h.read(journal) if journal.exists() else None
+        if record:
+            must(record.get('schema')==PACKAGE_SCHEMA and record.get('plan_sha256')==ident,'community_package_journal')
+            if record['phase']=='COMMITTED':
+                active=self.active();active[0].preserve_running(active[1]);return 'COMMITTED_VERIFIED_NOOP'
+            must(recover and record['phase'] not in ('RESTORED',),'community_package_explicit_recovery_required')
+        else:
+            must(not recover,'community_package_not_started')
+            must(h.preserve_running(self.supervisor)==plan['before'],'community_package_preimage_drift')
+            candidate=self.materialize(plan,archive,manifest)
+            import uuid
+            record=dict(schema=PACKAGE_SCHEMA,plan_sha256=ident,phase='PREPARED',operation_id=uuid.uuid4().hex,
+                        resume_operation_id=uuid.uuid4().hex,history=['PREPARED'])
+            h.write(journal,record)
+        def phase(value):
+            record['phase']=value;record['history'].append(value);h.write(journal,record)
+            if fault:fault(value)
+        candidate=self.candidate(plan)
+        if recover:
+            return self.recover(plan,record,phase,candidate)
+        # The only normal start decision is persisted before Role.start().
+        phase('DRAIN_INTENT')
+        self.supervisor.tick(drain=True)
+        self.drain(h.role())
+        from community_lifecycle import listeners
+        must(not listeners(h.plan['service']['port']),'community_package_foreign_listener')
+        phase('DRAINED')
+        legacy=identity(self.supervisor.state)['sha256']
+        record['drained_state_sha256']=legacy
+        from community_supervision import PackageSupervisor
+        supervisor=PackageSupervisor(candidate,ident,legacy,self.supervisor.state)
+        state=dict(schema='ARTLIVE_COMMUNITY_SUPERVISION_V2',plan_sha256=h.digest,upgrade_sha256=ident,
+                   legacy_state_sha256=legacy,desired='RUNNING',attempts=[record['operation_id']],budget_start=0,
+                   unhealthy=None,stable=None,reason='PACKAGE_START_DECISION',resumptions=[])
+        h.write(supervisor.state,state);phase('START_INTENT')
+        candidate.role().start(record['operation_id'])
+        phase('STARTED')
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            status=candidate.control('observe')
+            if status=='READY':break
+            must(status=='STARTING','community_package_start_failed')
+            time.sleep(.05)
+        must(status=='READY','community_package_health_timeout')
+        candidate.preserve_running(supervisor)
+        phase('ACTIVATE_INTENT')
+        h.storage.atomic_write_json(self.marker,dict(schema=PACKAGE_SCHEMA,plan_sha256=ident))
+        phase('COMMITTED')
+        return 'COMMITTED'
+
+    def recover(self,plan,record,phase,candidate):
+        """Reconcile the original attempt; never replay an uncertain spawn."""
+        h=self.host;ident=sha(encoded(plan))
+        if self.marker.exists():
+            must(h.read(self.marker)==dict(schema=PACKAGE_SCHEMA,plan_sha256=ident),'community_package_foreign_active')
+            from community_supervision import PackageSupervisor
+            supervisor=PackageSupervisor(candidate,ident,record['drained_state_sha256'],self.supervisor.state)
+            candidate.preserve_running(supervisor)
+            phase('COMMITTED');return 'COMMITTED_RECONCILED'
+        phase_before=record['phase']
+        if phase_before=='RESTORE_INTENT':
+            return self.resume_original(record,phase)
+        if phase_before=='PREPARED':
+            must(h.preserve_running(self.supervisor)==plan['before'],'community_package_preimage_drift')
+            phase('RESTORED');return 'RESTORED_NOT_STARTED'
+        if phase_before in ('DRAIN_INTENT','DRAINED'):
+            # DRAIN_INTENT might have signalled already: observe owned exit only.
+            self.drain(h.role())
+        else:
+            path,current=candidate.role().current()
+            must(current is not None,'community_package_unknown_start_receipt')
+            must(current['operation_id']==record['operation_id'],'community_package_operation_drift')
+            self.drain(candidate.role())
+        from community_lifecycle import listeners
+        must(not listeners(h.plan['service']['port']),'community_package_foreign_listener')
+        phase('RESTORE_INTENT')
+        return self.resume_original(record,phase)
+
+    def drain(self,role):
+        status=role.stop(0);deadline=time.monotonic()+15
+        while status not in ('STOPPED','EXITED') and time.monotonic()<deadline:
+            must(status in ('STOP_INTENT','STOPPING'),'community_package_drain_unknown')
+            time.sleep(.05);status=role.observe(check_health=False)
+        must(status in ('STOPPED','EXITED'),'community_package_drain_pending')
+
+    def resume_original(self,record,phase):
+        h=self.host
+        self.supervisor.enable(record['resume_operation_id'])
+        self.supervisor.tick()
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            status=self.supervisor.tick()
+            if status=='READY':break
+            must(status=='STARTING','community_package_restore_failed')
+            time.sleep(.05)
+        must(status=='READY','community_package_restore_timeout')
+        h.preserve_running(self.supervisor);phase('RESTORED')
+        return 'RESTORED'
+
+    def active(self):
+        h=self.host;h.lease.require()
+        marker=h.read(self.marker);ident=marker.get('plan_sha256')
+        must(marker==dict(schema=PACKAGE_SCHEMA,plan_sha256=ident) and
+             re.fullmatch('[a-f0-9]{64}',str(ident)) is not None,'community_package_active')
+        folder=self.root/ident;plan=h.read(folder/'approval.json')
+        self.verify(plan);record=h.read(folder/'journal.json')
+        must(record['plan_sha256']==ident and record['phase']=='COMMITTED','community_package_not_committed')
+        from community_supervision import PackageSupervisor
+        candidate=self.candidate(plan)
+        return candidate,PackageSupervisor(candidate,ident,record['drained_state_sha256'],self.supervisor.state)
