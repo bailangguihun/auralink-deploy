@@ -94,11 +94,53 @@ class Package(unittest.TestCase):
         self.assertFalse(self.service.marker.exists())
         self.assertEqual(self.h.read(self.folder/'journal.json')['phase'],'START_INTENT');self.preserved()
 
+    def test_activation_reply_loss_then_recorded_exit_uses_normal_v2_recovery(self):
+        original=self.h.storage.atomic_write_json
+        def fail(path,*a,**kw):
+            result=original(path,*a,**kw)
+            if Path(path)==self.service.marker:raise InterruptedError('lost activation reply')
+            return result
+        with patch.object(self.h.storage,'atomic_write_json',side_effect=fail),self.assertRaises(InterruptedError):self.install()
+        candidate=self.service.candidate(self.plan);role=candidate.role()
+        pid=role.current()[1]['process']['pid'];child=role.children[pid]
+        child.terminate();child.wait(timeout=5)
+        self.assertEqual(self.install(recover=True),'COMMITTED_RECONCILED_RESTART_PENDING')
+        with self.f.f.lease.held():
+            h,s=self.service.active()
+            self.assertEqual(s.tick(),'STARTING')
+            self.assertEqual(len(s.load()['attempts']),2)
+        self.preserved()
+
     def test_foreign_archive_or_preimage_is_rejected_before_drain(self):
         self.archive.write_bytes(self.archive.read_bytes()+b'foreign')
         with self.assertRaisesRegex(Exception,'identity_drift'):self.install()
         with self.f.f.lease.held():self.h.preserve_running(self.f.supervisor())
         self.assertFalse((self.folder/'journal.json').exists());self.preserved()
+
+    def test_interruption_before_drain_stops_restart_decisions_then_restores(self):
+        def fail(phase):
+            if phase=='DRAIN_INTENT':raise InterruptedError('before old supervision drain')
+        with self.assertRaises(InterruptedError):self.install(fault=fail)
+        with self.f.f.lease.held(),self.assertRaisesRegex(Exception,'unfinished_predecessor'):
+            self.service.prepare(self.archive,self.manifest,self.provenance,'e'*64)
+        self.assertEqual(self.install(recover=True),'RESTORED')
+        with self.f.f.lease.held():self.h.preserve_running(self.f.supervisor())
+        self.preserved()
+
+    def test_new_approved_attempt_retains_failed_package_process_and_budget(self):
+        def fail(phase):
+            if phase=='STARTED':raise InterruptedError('isolated first package failure')
+        with self.assertRaises(InterruptedError):self.install(fault=fail)
+        self.assertEqual(self.install(recover=True),'RESTORED')
+        previous=self.service.candidate(self.plan)
+        retained={p:p.read_bytes() for p in previous.release.rglob('*') if p.is_file()}
+        with self.f.f.lease.held():
+            plan,path=self.service.prepare(self.archive,self.manifest,self.provenance,'e'*64)
+            self.h.storage.atomic_write_bytes(path.parent/'approval.json',encoded(plan))
+            self.assertNotEqual(previous.release,self.service.candidate(plan).release)
+            self.assertEqual(self.service.install(plan,self.archive,self.manifest),'COMMITTED')
+        for p,raw in retained.items():self.assertEqual(raw,p.read_bytes(),str(p))
+        self.preserved()
 
 
 class CoreContext(unittest.TestCase):

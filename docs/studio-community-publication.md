@@ -54,6 +54,8 @@ recovery reads the actual ledger/schema and never resends SQL or restores the li
 database. Application recovery preserves the forward schema and deletion marks.
 
 Community replacement creates a separate immutable release and process history.
+The release directory is keyed by the exact package plan, so a fresh approved
+attempt of the same archive cannot overwrite a prior failed attempt's V2 ledger.
 It reuses the original Node executable, private settings and database. The
 original V2 restart algorithm is preserved byte for byte; a separate V2 ledger
 tracks the new release. While the shared lease is held, the watchdog cannot make
@@ -64,6 +66,10 @@ An interrupted installation requires explicit `package-recover` with the same
 plan. An existing activation is verified and reconciled. An owned failed candidate
 is drained and the old package receives one recorded explicit resumption, without
 erasing history. A missing spawn receipt is UNKNOWN and cannot be replayed.
+If activation succeeded and its recorded process subsequently exited, recovery
+commits the verified activation receipt; the original watchdog then uses the
+normal bounded V2 restart policy. Recovery itself does not replay that spawn.
+An unfinished earlier package transaction blocks preparation of a fresh attempt.
 Neither recovery path executes DDL, restores data, signals a foreign process,
 deletes a lock or starts Java/Next outside their original owners.
 

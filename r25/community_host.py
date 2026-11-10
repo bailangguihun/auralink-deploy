@@ -577,6 +577,7 @@ class PackageUpgrade:
     def prepare(self, archive, manifest, provenance, review_sha256):
         h=self.host;h.lease.require();h.validate(installing=False)
         must(not self.marker.exists() and not self.marker.is_symlink(),'community_package_already_upgraded')
+        self.require_terminal_predecessors()
         must(provenance.get('commit')==self.context['core_commit'],'community_package_core_release')
         must(re.fullmatch('[a-f0-9]{64}',review_sha256) is not None,'community_package_review')
         for p in (archive,manifest):
@@ -595,6 +596,12 @@ class PackageUpgrade:
         else:h.storage.atomic_write_bytes(path,encoded(plan))
         return plan,path
 
+    def require_terminal_predecessors(self):
+        for path in self.root.glob('*/journal.json'):
+            record=self.host.read(path)
+            must(record.get('schema')==PACKAGE_SCHEMA and record.get('plan_sha256')==path.parent.name and
+                 record.get('phase')=='RESTORED','community_package_unfinished_predecessor')
+
     def verify(self, plan):
         h=self.host;h.lease.require();h.validate(installing=False)
         must(set(plan)=={'schema','context','original_plan_sha256','archive','manifest','provenance',
@@ -611,7 +618,8 @@ class PackageUpgrade:
         return ident,folder
 
     def candidate(self,plan):
-        release=self.host.folder/'package-releases'/plan['manifest']['sha256']
+        # A later approved attempt uses a new history even for the same archive.
+        release=self.host.folder/'package-releases'/sha(encoded(plan))
         if release not in self.candidates:
             host=ReleaseHost(self.host,release);host.package_plan=plan;self.candidates[release]=host
         return self.candidates[release]
@@ -645,6 +653,7 @@ class PackageUpgrade:
             must(recover and record['phase'] not in ('RESTORED',),'community_package_explicit_recovery_required')
         else:
             must(not recover,'community_package_not_started')
+            self.require_terminal_predecessors()
             must(h.preserve_running(self.supervisor)==plan['before'],'community_package_preimage_drift')
             candidate=self.materialize(plan,archive,manifest)
             import uuid
@@ -692,10 +701,24 @@ class PackageUpgrade:
         h=self.host;ident=sha(encoded(plan))
         if self.marker.exists():
             must(h.read(self.marker)==dict(schema=PACKAGE_SCHEMA,plan_sha256=ident),'community_package_foreign_active')
+            must(record['phase']=='ACTIVATE_INTENT','community_package_activation_phase')
             from community_supervision import PackageSupervisor
             supervisor=PackageSupervisor(candidate,ident,record['drained_state_sha256'],self.supervisor.state)
-            candidate.preserve_running(supervisor)
-            phase('COMMITTED');return 'COMMITTED_RECONCILED'
+            state=supervisor.registered()
+            _,current=candidate.role().current()
+            must(current is not None and current['operation_id']==record['operation_id'] and
+                 state['desired']=='RUNNING' and state['attempts']==[record['operation_id']],
+                 'community_package_activation_receipt')
+            status=candidate.control('observe')
+            if status=='READY':candidate.preserve_running(supervisor)
+            else:
+                # Health was verified before ACTIVATE_INTENT. A later recorded
+                # exit belongs to normal V2 supervision, not an uncertain spawn.
+                must(status=='EXITED','community_package_activation_not_reconciled')
+                from community_lifecycle import listeners
+                must(not listeners(h.plan['service']['port']),'community_package_foreign_listener')
+            phase('COMMITTED')
+            return 'COMMITTED_RECONCILED' if status=='READY' else 'COMMITTED_RECONCILED_RESTART_PENDING'
         phase_before=record['phase']
         if phase_before=='RESTORE_INTENT':
             return self.resume_original(record,phase)
@@ -704,6 +727,7 @@ class PackageUpgrade:
             phase('RESTORED');return 'RESTORED_NOT_STARTED'
         if phase_before in ('DRAIN_INTENT','DRAINED'):
             # DRAIN_INTENT might have signalled already: observe owned exit only.
+            self.supervisor.tick(drain=True)
             self.drain(h.role())
         else:
             path,current=candidate.role().current()
