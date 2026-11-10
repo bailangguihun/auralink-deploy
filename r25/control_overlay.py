@@ -304,3 +304,30 @@ def render_knowledge_lifecycle(before):
     raw=before.replace(COMMUNITY_METHOD,method)
     ast.parse(raw)
     return raw
+
+
+def render_community_recovery_lifecycle(before):
+    """Select only the exact installed Community successor through the same watchdog."""
+    if before.count(b"extra=['--knowledge-publication-sha256',ident]") != 1:
+        raise OverlayRefused('community_recovery_requires_knowledge_lifecycle')
+    old=b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+    addition=b'''        recovery=self.root/'runtime/vmm-controller/COMMUNITY_SUPERVISION_ACTIVE.json'
+        if recovery.exists() or recovery.is_symlink():
+            guard(recovery,self.private)
+            pointer=json.loads(recovery.read_bytes());upgrade=pointer.get('approval_sha256')
+            must(re.fullmatch('[a-f0-9]{64}',str(upgrade)) and pointer=={'schema':'R25_COMMUNITY_SUPERVISION_UPGRADE_V1','approval_sha256':upgrade},'community_recovery_pointer')
+            folder=self.root/'runtime/vmm-controller/community-supervision'/upgrade
+            approval=folder/'approval.json';guard(approval,self.private,0o600,upgrade)
+            raw=approval.read_bytes();must(hashlib.sha256(raw).hexdigest()==upgrade,'community_recovery_approval_changed')
+            approved=json.loads(raw)
+            journal=folder/'journal.json';guard(journal,self.private)
+            receipt=json.loads(journal.read_bytes())
+            must(approved['schema']=='R25_COMMUNITY_SUPERVISION_UPGRADE_V1' and receipt=={'schema':approved['schema'],'approval_sha256':upgrade,'phase':'INSTALLED'},'community_recovery_not_installed')
+            must(extra==['--knowledge-publication-sha256',approved['knowledge_approval_sha256']] and record['plan_sha256']==approved['legacy']['plan_sha256'],'community_recovery_parent')
+            guard(marker,self.private,0o600,approved['legacy']['registration_sha256'])
+            record=dict(record,controller_manifest_sha256=approved['community_deploy']['manifest_sha256'],cli_sha256=approved['community_cli_sha256'])
+            extra+=['--supervision-upgrade-sha256',upgrade]
+'''
+    raw=replace_once(before,old,addition+old,'community_recovery_method')
+    ast.parse(raw)
+    return raw

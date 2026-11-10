@@ -47,13 +47,14 @@ def bootstrap(digest):
     sys.path.insert(0,str(root))
 
 
-def supervision_command(host, command, bundle):
+def supervision_command(host, command, bundle, *, supervisor=None, operation_id=None):
     """Shared production CLI dispatch, also exercised across fixture processes."""
     from community_supervision import Supervisor
-    supervisor=Supervisor(host)
+    supervisor=supervisor or Supervisor(host)
     with host.lease.held():
         if command=='register':return supervisor.register(bundle)
-        if command=='enable':return supervisor.enable()
+        if command=='enable':
+            return supervisor.enable() if type(supervisor) is Supervisor else supervisor.enable(operation_id)
         if command in {'disable','watchdog-tick','watchdog-drain'}:
             return supervisor.tick(drain=command in {'disable','watchdog-drain'})
         raise ValueError('community_supervision_command')
@@ -66,6 +67,7 @@ def main():
     for name in ['archive','manifest','settings','node','approval','operation-id']:p.add_argument('--'+name)
     p.add_argument('--lease-fd',type=int)
     p.add_argument('--knowledge-publication-sha256')
+    p.add_argument('--supervision-upgrade-sha256')
     a=p.parse_args()
     if (a.lease_fd is not None) != a.command.startswith('watchdog-'):
         raise ValueError('community_watchdog_inherited_lease_required')
@@ -75,7 +77,14 @@ def main():
     raw=Path(a.plan).read_bytes();plan=json.loads(raw)
     if raw!=encoded(plan) or sha(raw)!=a.plan_sha256:raise ValueError('community_exact_plan_bytes')
     binding=plan['lease']
-    if a.knowledge_publication_sha256:
+    legacy_sha=None
+    if a.supervision_upgrade_sha256:
+        if not a.knowledge_publication_sha256 or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve'):
+            raise ValueError('community_recovery_original_installation_only')
+        from community_host import recovery_lease_binding
+        binding,legacy_sha=recovery_lease_binding(plan,a.plan_sha256,a.bundle_manifest_sha256,
+            a.knowledge_publication_sha256,a.supervision_upgrade_sha256)
+    elif a.knowledge_publication_sha256:
         if a.command not in ('observe','stop','watchdog-tick','watchdog-drain','watchdog-preserve'):
             raise ValueError('community_knowledge_original_installation_only')
         from community_host import knowledge_lease_binding
@@ -87,6 +96,10 @@ def main():
     i=identity(a.plan)
     if (i['uid'],i['gid'],i['mode'])!=(0,0,0o600):raise ValueError('community_private_plan')
     lease=production_lease(binding,a.lease_fd);host=Host(ROOT/'runtime/community',plan,lease)
+    supervisor=None
+    if a.supervision_upgrade_sha256:
+        from community_supervision import RecoverySupervisor
+        supervisor=RecoverySupervisor(host,a.supervision_upgrade_sha256,legacy_sha)
     if a.command in {'check','install','recover'}:
         if not all([a.archive,a.manifest,a.settings,a.node]):raise ValueError('community_material_required')
         with lease.held():
@@ -95,7 +108,7 @@ def main():
                 if not a.approval:raise ValueError('community_explicit_approval_required')
                 result=host.install(a.archive,a.manifest,a.settings,a.node,a.approval,recover=a.command=='recover')
     elif a.command=='watchdog-preserve':
-        with lease.held():result=host.preserve_running()
+        with lease.held():result=host.preserve_running(supervisor)
     elif a.command=='supervise':
         if plan['service']['restart_budget']!=0 or (host.root/'WATCHDOG.json').exists():
             raise ValueError('community_foreground_requires_unregistered_zero_restart_plan')
@@ -111,11 +124,11 @@ def main():
         from community_host import supervise
         result=supervise(host,lambda:closing)
     elif a.command in {'register','enable','disable','watchdog-tick','watchdog-drain'}:
-        result=supervision_command(host,a.command,Path(__file__).parent)
+        result=supervision_command(host,a.command,Path(__file__).parent,supervisor=supervisor,operation_id=a.operation_id)
     elif a.command=='bind-web':
         with lease.held():result=host.bind_web()
     elif a.command=='stop' and (host.root/'WATCHDOG.json').exists():
-        result=supervision_command(host,'disable',Path(__file__).parent)
+        result=supervision_command(host,'disable',Path(__file__).parent,supervisor=supervisor)
     else:
         with lease.held():result=host.control(a.command)
     print(json.dumps(dict(community=result)))
