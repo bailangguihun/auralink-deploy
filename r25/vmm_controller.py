@@ -639,6 +639,7 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if (rt.store/'STUDIO_PUBLICATION_ACTIVE.json').exists():return applied_studio_publication(rt,value,handoff)
     if (rt.store/'COMMUNITY_SUPERVISION_ACTIVE.json').exists():return applied_community_supervision(rt,value,handoff)
     if (rt.store/'KNOWLEDGE_PUBLICATION_ACTIVE.json').exists():return applied_knowledge_publication(rt,value,handoff)
     if (rt.store/'CATALOG_VISIBILITY_ACTIVE.json').exists():return applied_catalog_visibility(rt,value,handoff)
@@ -2124,7 +2125,7 @@ def verify_knowledge_publication(rt,plan,phase='before',*,runtime=False,historic
             must(all(actual.get(k)==wanted[k] for k in set(control_handoff_values(afterhand))|{'R25_CORE_RELEASE_POLICY_SHA256'}),
                  'knowledge_runtime_handoff')
         else:must(sha(raw) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),'knowledge_target_drift:'+name)
-    active=read(rt.preserved()['original-controller-active'],rt.private)
+    active=proof_read(historical,rt.preserved()['original-controller-active'],rt.private)
     new=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
     must(sha(active) in ({binding['control_active_sha256']} if phase=='before' else {sha(new)} if phase=='after' else
          {binding['control_active_sha256'],sha(new)}),'knowledge_control_pointer')
@@ -2133,9 +2134,9 @@ def verify_knowledge_publication(rt,plan,phase='before',*,runtime=False,historic
     return effective
 
 
-def knowledge_current(rt,plan,value):
+def knowledge_current(rt,plan,value,*,historical=None):
     """Historical visibility proof never substitutes actual new Core identity."""
-    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
+    current_raw=proof_read(historical,rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
     release=current.get('release');baseline=plan['current_release'];candidate=value['upgrade']['candidate']
     must(current.get('schema')=='R25_CORE_CURRENT_V1' and type(release)is dict,'knowledge_current_schema')
     record_path=rt.root/'runtime/core-publications/releases'/(digest(release['artifact_sha256'])+'-'+digest(release['commit_sha'],40))/'record.json'
@@ -2167,11 +2168,148 @@ def applied_knowledge_publication(rt,value,handoff,*,historical=None):
     must(record.get('schema')==KNOWLEDGE_SCHEMA and record.get('approval_sha256')==ident and
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'knowledge_incomplete')
     old=verify_knowledge_publication(rt,plan,'after',runtime=True,historical=historical)
-    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+    must(proof_json(historical,rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
          env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private))==handoff,'knowledge_arguments')
     must(value['upgrade']['core_followup']['schema']=='R25_KNOWLEDGE_CORE_PUBLICATION_V1' and
          value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'] and
          value['upgrade']['compatibility']==old['upgrade']['compatibility'],'knowledge_retention_preserved')
+    knowledge_current(rt,plan,value,historical=historical)
+    result=copy.deepcopy(value);result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
+    return result
+
+
+STUDIO_SCHEMA = 'R25_STUDIO_CORE_PUBLICATION_BINDING_V1'
+STUDIO_MARKER = 'R25_STUDIO_PUBLICATION_ACTIVE_V1'
+STUDIO_MUTABLE = KNOWLEDGE_MUTABLE | {'assistant_release.py','assistant_runtime.py','assistant_backup.py'}
+
+
+def studio_community(rt, deployment, controller, parent):
+    _,sources=knowledge_community_bundle(rt,deployment,controller)
+    previous,_=knowledge_community_bundle(rt,parent['community_deploy'],parent['controller_deploy'])
+    for name in COMMUNITY_FILES-{'community_host.py','community_host_cli.py','community_supervision.py'}:
+        must(read(previous/name,rt.private)==sources[name],'studio_unrelated_community_module')
+    # Existing supervision policy remains exact; the release successor is additive.
+    before=read(previous/'community_supervision.py',rt.private)
+    must(sources['community_supervision.py']==before or
+         sources['community_supervision.py'].split(b'\n\nRELEASE_SCHEMA =',1)[0].rstrip()==before.rstrip(),
+         'studio_supervision_policy_changed')
+    return {'deploy':deployment,'cli_sha256':sha(sources['community_host_cli.py']),
+            'plan_sha256':parent['legacy']['plan_sha256'],
+            'registration_sha256':parent['legacy']['registration_sha256']}
+
+
+def capture_studio_publication(rt,deploy,community,controller):
+    marker=rt.store/'STUDIO_PUBLICATION_ACTIVE.json'
+    must(not marker.exists() and not marker.is_symlink(),'studio_already_bound')
+    old=json_read(rt.preserved()['policy'],rt.private)
+    applied_community_supervision(rt,old,env_values(read(rt.targets()['handoff'][0],rt.private)))
+    current_raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(current_raw)
+    must(all(current['release'][k]==old['upgrade']['candidate'][k] for k in ('commit_sha','artifact_sha256')),
+         'studio_requires_committed_knowledge_core')
+    tx=digest(current['transaction_id'],32)
+    must(json_read(rt.root/'runtime/core-publications/transactions'/tx/'journal.json',rt.private)['phase']=='COMMITTED',
+         'studio_core_not_committed')
+    marker=json_read(rt.store/'COMMUNITY_SUPERVISION_ACTIVE.json',rt.private)
+    ident=digest(marker['approval_sha256']);folder=community_upgrade_folder(rt,ident)
+    parent=json_read(folder/'approval.json',rt.private,ident)
+    return {'deploy':deploy,'supervision':{'marker':marker,'journal_sha256':sha(read(folder/'journal.json',rt.private))},
+            'community':studio_community(rt,community,controller,parent),
+            'core_current_sha256':sha(current_raw),
+            'control_active_sha256':sha(read(rt.preserved()['original-controller-active'],rt.private))}
+
+
+def verify_studio_publication(rt,plan,phase='before',*,runtime=False):
+    must(plan.get('schema')==STUDIO_SCHEMA and phase in {'before','mixed','after'},'studio_schema')
+    must(plan['private_owner']==list(rt.private) and plan['controller_owner']==list(rt.scripts),'studio_owners')
+    entries={**plan['files'],**plan['operational']};binding=plan['vmm'];targets=publication_targets(rt)
+    must(set(plan['files'])==set(PUBLICATION_FILES) and set(entries)==set(targets),'studio_inventory')
+    must(set(binding)=={'deploy','supervision','community','core_current_sha256','control_active_sha256'},'studio_binding_fields')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/sha(encoded(plan))
+    supervision=binding['supervision'];marker=supervision['marker'];parent_id=digest(marker.get('approval_sha256'))
+    must(set(supervision)=={'marker','journal_sha256'} and
+         marker=={'schema':COMMUNITY_UPGRADE_SCHEMA,'approval_sha256':parent_id} and
+         json_read(rt.store/'COMMUNITY_SUPERVISION_ACTIVE.json',rt.private)==marker,'studio_supervision_pointer')
+    parent_folder=community_upgrade_folder(rt,parent_id)
+    parent=json_read(parent_folder/'approval.json',rt.private,parent_id)
+    must(json_read(parent_folder/'journal.json',rt.private,supervision['journal_sha256'])==dict(marker,phase='INSTALLED'),
+         'studio_supervision_incomplete')
+    must(studio_community(rt,binding['community']['deploy'],plan['deploy'],parent)==binding['community'],
+         'studio_community_binding')
+    _,sources=revision_bundles(rt,binding['deploy'],plan['deploy'])
+    for name in PUBLICATION_FILES:
+        if name in MODULES:must(entries[name]['after_sha256']==sha(sources[name]),'studio_module_sources')
+        else:read(rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/name,rt.private,
+                  expected=entries[name]['after_sha256'])
+    for name,entry in entries.items():
+        must(set(entry)=={'before_sha256','after_sha256'},'studio_entry_fields')
+        for value in entry.values():digest(value)
+        if name not in STUDIO_MUTABLE:must(entry['before_sha256']==entry['after_sha256'],'studio_unrelated_change:'+name)
+    history={};before={}
+    for name,(path,owner,mode) in targets.items():
+        saved=folder/'before'/name;entry=entries[name]
+        if saved.exists():
+            before[name]=read(saved,rt.private,expected=entry['before_sha256'])
+            history[path]=(saved,rt.private,entry['before_sha256'])
+        else:
+            must(phase=='before','studio_missing_preimage')
+            before[name]=read(path,owner,mode,entry['before_sha256'])
+        actual=read(path,owner,mode)
+        if runtime and name=='handoff':
+            # Web can advance selection fields; all control hashes remain bound.
+            actual_env=env_values(actual)
+            expected_env=env_values(studio_handoff(before['handoff'],entries))
+            must(control_handoff_values(actual)==control_handoff_values(studio_handoff(before['handoff'],entries)) and
+                 actual_env.get('R25_CORE_RELEASE_POLICY_SHA256')==expected_env.get('R25_CORE_RELEASE_POLICY_SHA256'),
+                 'studio_runtime_handoff')
+        else:must(sha(actual) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}), 'studio_target_drift:'+name)
+    for name,key,filename in [('core-current','core_current_sha256','STUDIO_CORE_CURRENT.json'),
+                              ('original-controller-active','control_active_sha256','CONTROL_UPGRADE_ACTIVE.json')]:
+        path=rt.preserved()[name];saved=folder/'before'/filename;expected=binding[key]
+        if saved.exists():
+            read(saved,rt.private,expected=expected);history[path]=(saved,rt.private,expected)
+        else:must(phase=='before','studio_missing_parent_current');read(path,rt.private,expected=expected)
+    effective=applied_community_supervision(rt,json_bytes(before['policy']),env_values(before['handoff']),historical=history)
+    must(effective['upgrade']['core_followup']['schema']=='R25_KNOWLEDGE_CORE_PUBLICATION_V1','studio_parent_schema')
+    renderer_path=rt.root/'operations/r25-controller-candidates'/plan['deploy']['commit']/'control_overlay.py'
+    manifest=json_read(renderer_path.parent/'r25-controller-manifest.json',rt.private,plan['deploy']['manifest_sha256'])
+    wanted=next(i['sha256'] for i in manifest['files'] if i['path']=='control_overlay.py')
+    raw=read(renderer_path,rt.private,expected=wanted)
+    renderer=importlib.util.module_from_spec(importlib.util.spec_from_file_location('_studio_renderer',renderer_path))
+    sys.modules[renderer.__name__]=renderer;exec(compile(raw,str(renderer_path),'exec',dont_inherit=True),renderer.__dict__)
+    must(sha(renderer.render_studio_lifecycle(before['lifecycle']))==entries['lifecycle']['after_sha256'],'studio_lifecycle_render')
+    must(sha(studio_handoff(before['handoff'],entries))==entries['handoff']['after_sha256'],'studio_handoff_render')
+    must(entries['guard']['after_sha256']==entries['core_release_guard.py']['after_sha256'],'studio_same_guard')
+    active=read(rt.preserved()['original-controller-active'],rt.private)
+    next_active=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
+    must(sha(active) in ({binding['control_active_sha256']} if phase=='before' else {sha(next_active)} if phase=='after'
+                         else {binding['control_active_sha256'],sha(next_active)}),'studio_control_pointer')
+    if not runtime:revision_stopped(rt)
+    return effective
+
+
+def studio_handoff(before,entries):
+    after=before;values=env_values(before)
+    for key,name in [('R25_CORE_RELEASE_POLICY_SHA256','policy'),('R25_CORE_RELEASE_GUARD_SHA256','guard'),
+                     ('R25_LIFECYCLE_ADAPTER_SHA256','lifecycle'),('R25_VMM_CONTROLLER_SHA256','vmm_controller.py')]:
+        line=(key+'='+values[key]+'\n').encode();must(after.count(line)==1,'studio_handoff_line')
+        after=after.replace(line,(key+'='+entries[name]['after_sha256']+'\n').encode())
+    return after
+
+
+def applied_studio_publication(rt,value,handoff):
+    marker=json_read(rt.store/'STUDIO_PUBLICATION_ACTIVE.json',rt.private);ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':STUDIO_MARKER,'approval_sha256':ident},'studio_marker')
+    folder=rt.root/'runtime/core-publications/controller-upgrades'/ident
+    plan=json_read(folder/'approval.json',rt.private,ident);record=json_read(folder/'journal.json',rt.private)
+    json_read(folder/'review.json',rt.private,plan['review_evidence_sha256'])
+    must(record.get('schema')==STUDIO_SCHEMA and record.get('approval_sha256')==ident and
+         record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'studio_incomplete')
+    previous=verify_studio_publication(rt,plan,'after',runtime=True)
+    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256'])==value and
+         env_values(read(rt.targets()['handoff'][0],rt.private))==handoff,'studio_arguments')
+    must(value['upgrade']['core_followup']['schema']=='R25_STUDIO_CORE_PUBLICATION_V1' and
+         value['upgrade']['core_followup']['predecessor_policy_sha256']==plan['operational']['policy']['before_sha256'] and
+         value['upgrade']['compatibility']==previous['upgrade']['compatibility'],'studio_retention_preserved')
     knowledge_current(rt,plan,value)
     result=copy.deepcopy(value);result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
     return result
@@ -2250,7 +2388,7 @@ def community_upgrade_legacy(rt, expected=None, *, before=False):
     return observed
 
 
-def community_upgrade_sources(rt, plan):
+def community_upgrade_sources(rt, plan, *, historical=None):
     formal,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
     _,community=knowledge_community_bundle(rt,plan['community_deploy'],plan['controller_deploy'])
     parent=json_read(rt.root/'runtime/core-publications/controller-upgrades'/plan['knowledge_approval_sha256']/'approval.json',
@@ -2259,7 +2397,7 @@ def community_upgrade_sources(rt, plan):
     for name in MODULES:
         if name!='vmm_controller.py':
             target=rt.targets()['publisher-guard' if name=='core_release_guard.py' else name]
-            must(read(target[0],target[1],target[2])==sources[name],'community_upgrade_unrelated_vmm_change')
+            must(proof_read(historical,target[0],target[1],target[2])==sources[name],'community_upgrade_unrelated_vmm_change')
     _,previous=knowledge_community_bundle(rt,parent['vmm']['community']['deploy'],parent['deploy'])
     for name in COMMUNITY_FILES-{'community_supervision.py','community_host.py','community_host_cli.py'}:
         must(previous[name]==community[name],'community_upgrade_unrelated_community_change')
@@ -2277,8 +2415,8 @@ def community_upgrade_sources(rt, plan):
     return formal,sources,renderer
 
 
-def community_upgrade_render(rt, plan, before):
-    _,sources,renderer=community_upgrade_sources(rt,plan)
+def community_upgrade_render(rt, plan, before, *, historical=None):
+    _,sources,renderer=community_upgrade_sources(rt,plan,historical=historical)
     after={'vmm_controller.py':sources['vmm_controller.py'],
            'lifecycle':renderer.render_community_recovery_lifecycle(before['lifecycle'])}
     handoff=before['handoff'];values=env_values(handoff)
@@ -2290,7 +2428,7 @@ def community_upgrade_render(rt, plan, before):
     return after
 
 
-def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False):
+def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False, historical=None):
     must(set(plan)=={'schema','deploy','controller_deploy','community_deploy','community_cli_sha256',
          'knowledge_approval_sha256','review_evidence_sha256','legacy','preserved','files','lease'}
          and plan['schema']==COMMUNITY_UPGRADE_SCHEMA and phase in ('before','mixed','after'),
@@ -2309,9 +2447,9 @@ def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False):
         # Installation pins every preimage. Afterwards the retained guards own
         # live release/rollback and PID validation, as in require_context().
         if runtime and name not in {'policy','original-controller-active'}:continue
-        read(path,rt.private,expected=plan['preserved'][name])
+        proof_read(historical,path,rt.private,expected=plan['preserved'][name])
     must(set(plan['files'])==set(COMMUNITY_UPGRADE_TARGETS),'community_upgrade_target_inventory')
-    before={};history={}
+    before={};history=dict(historical or {})
     for name in COMMUNITY_UPGRADE_TARGETS:
         entry=plan['files'][name]
         must(set(entry)=={'before_sha256','after_sha256'},'community_upgrade_target_fields')
@@ -2324,7 +2462,7 @@ def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False):
         else:
             must(phase=='before','community_upgrade_missing_preimage')
             before[name]=read(path,owner,mode,entry['before_sha256'])
-        actual=read(path,owner,mode)
+        actual=proof_read(historical,path,owner,mode)
         if runtime and name=='handoff':
             # Web selection fields may legitimately advance after this upgrade.
             expected=read(folder/'after/handoff',rt.private,expected=entry['after_sha256'])
@@ -2334,13 +2472,13 @@ def community_upgrade_verify(rt, plan, folder, phase, *, runtime=False):
         else:
             permitted=set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}
             must(sha(actual) in permitted,'community_upgrade_target_drift:'+name)
-    after=community_upgrade_render(rt,plan,before)
+    after=community_upgrade_render(rt,plan,before,historical=historical)
     must(all(sha(after[n])==plan['files'][n]['after_sha256'] for n in after),'community_upgrade_render_binding')
     for name,raw in after.items():
         saved=folder/'after'/name
         if saved.exists():must(read(saved,rt.private)==raw,'community_upgrade_after_image')
         else:must(phase=='before','community_upgrade_after_image_missing')
-    effective=applied_knowledge_publication(rt,json_read(rt.preserved()['policy'],rt.private),
+    effective=applied_knowledge_publication(rt,proof_json(historical,rt.preserved()['policy'],rt.private),
                                           env_values(before['handoff']),historical=history)
     if not runtime:revision_stopped(rt);revision_apps_committed(rt)
     return effective,after
@@ -2456,16 +2594,16 @@ def install_community_supervision(rt, ident, *, recover=False, fault=None):
     return {'outcome':'COMMUNITY_SUPERVISION_INSTALLED','approval_sha256':ident}
 
 
-def applied_community_supervision(rt, value, handoff):
+def applied_community_supervision(rt, value, handoff, *, historical=None):
     marker=json_read(rt.store/'COMMUNITY_SUPERVISION_ACTIVE.json',rt.private)
     ident=digest(marker.get('approval_sha256'))
     must(marker=={'schema':COMMUNITY_UPGRADE_SCHEMA,'approval_sha256':ident},'community_upgrade_active_pointer')
     plan,folder=community_upgrade_load(rt,ident)
     must(json_read(folder/'journal.json',rt.private)=={'schema':COMMUNITY_UPGRADE_SCHEMA,
          'approval_sha256':ident,'phase':'INSTALLED'},'community_upgrade_not_committed')
-    effective,_=community_upgrade_verify(rt,plan,folder,'after',runtime=True)
-    must(value==json_read(rt.preserved()['policy'],rt.private)
-         and handoff==env_values(read(rt.targets()['handoff'][0],rt.private)),'community_upgrade_arguments')
+    effective,_=community_upgrade_verify(rt,plan,folder,'after',runtime=True,historical=historical)
+    must(value==proof_json(historical,rt.preserved()['policy'],rt.private)
+         and handoff==env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private)),'community_upgrade_arguments')
     state_path,_=community_upgrade_state(rt,plan,ident)
     state=json_read(state_path,rt.private)
     must(state.get('schema')=='ARTLIVE_COMMUNITY_SUPERVISION_V2'

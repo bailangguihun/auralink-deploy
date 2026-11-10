@@ -278,3 +278,25 @@ class RecoverySupervisor(Supervisor):
                 return h.control('stop')
         if encoded(s) != before: h.write(self.state,s)
         return status
+
+
+RELEASE_SCHEMA = 'ARTLIVE_COMMUNITY_PACKAGE_UPGRADE_V1'
+
+
+class PackageSupervisor(RecoverySupervisor):
+    """Retain V2 restart rules in a new package's independent process history."""
+    def __init__(self,host,approval_sha256,legacy_sha256,legacy_state):
+        super().__init__(host,approval_sha256,legacy_sha256)
+        self.legacy_state=Path(legacy_state)
+        self.state=host.release/'supervision-v2.json'
+
+    def registered(self):
+        # The immutable Host registration remains in force. Package approval,
+        # source and CURRENT are checked before constructing this supervisor.
+        self.installed()
+        marker=self.host.read(self.marker)
+        must(marker['schema']==SCHEMA and marker['plan_sha256']==self.host.digest and
+             marker['controller_manifest_sha256']==self.host.plan['controller_manifest_sha256'],
+             'community_package_registration_drift')
+        must(identity(self.legacy_state)['sha256']==self.legacy_sha256,'community_package_legacy_state_drift')
+        return self.load()

@@ -122,7 +122,7 @@ class ScheduledBackup:
         self.rt.require_compatible(current)
         self.health()
         self.rt.require_no_active_work()
-        must(len(release.inspect_schema(self.pg, self.contract['migrations'])['versions']) == 16,
+        must(len(release.inspect_schema(self.pg, self.contract['migrations'])['versions']) == len(self.contract['migrations']),
              'assistant_backup_final_schema_required')
         release.file_inventory(self.contract['attachment_root'])
         self.check_root(create=True)

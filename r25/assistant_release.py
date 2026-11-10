@@ -1,7 +1,7 @@
 """Reviewed Assistant extension to the existing Core Publisher, not a launcher.
 
 The caller is the installed, approval-bound adapter holding the R25/c5ea lease.
-Only exact V001--V016 inventories are accepted; candidate-provided commands,
+Only exact V001--V016 or the reviewed V017 extension is accepted; candidate-provided commands,
 SQL outside the pinned migration set, schema downgrades and live DB restore
 are deliberately absent. OS/process quiescence remains the existing lifecycle's
 responsibility. These helpers never infer approval from successful tests.
@@ -37,6 +37,14 @@ NEW_MIGRATIONS = ('V014__assistant_records.sql', 'V015__assistant_execution.sql'
 # Fixed reviewed source bytes, not caller-rebound hashes. V016 is this local
 # S4 candidate; changing it requires a new reviewed controller source.
 MIGRATION_SHA256 = {'V001__catalog_contract.sql': '59f7f788f17fe68da8aa8b92c88de0cd71eaed3304116435752855cfe90dbe53', 'V002__catalog_users_and_favorites.sql': '6ac1175601354059cf385e1054af3d99ae6bacd6013013539054e42c738800cc', 'V003__private_assets_and_critic_tasks.sql': '2d9a8e37bdfbb8b949e18d8e31b2b622f0ce459b479b930b929465dc73673ce2', 'V004__painting_guides.sql': 'fc52fab82583bedd99ba03710bad675be511c491aa7a5d375b0e3070513169b7', 'V005__guide_attempt_history_retry_policy.sql': '9e04d4e74f74603b2d8671b3cfae752654ea52f193e4f66ac3e153bce725de5e', 'V006__creation_workflows_and_jpa_compatibility.sql': '9808de1458c9b4b788e2b110a90a68f0e1198c96c49d233c47d79484ecc7a05d', 'V007__creation_legacy_asset_provenance.sql': '14c8b21cccd3bb64965c8591ff8c27036cb3bc43cd11b80f6b02713b45423d4e', 'V008__creation_catalog_input_snapshots.sql': 'a19c6e4c2bd577c9058fca6838d74fbf7a2a7551045ec7c46c95c043eca47646', 'V009__unified_rehearsal_import_state.sql': '57264d52a9849c031a714177e23911d773113af94c65faff9e8df1d8ebd10cc6', 'V010__allow_audited_unified_noop_reruns.sql': 'c8635cff75eefa65d402c41f8a4b790a1ebafb10e6503c6af7182a6eb9a27f1a', 'V011__r24_legacy_media_provenance.sql': 'b08ef32fac1a434f16b56c897e57a1d635c3acadd79ed66b1deac388243e1ab2', 'V012__annotation_value_hash_index.sql': '38c3e10cef383e723c390d73ac97df00670711fe9cedfa39299c4b98e1bf853d', 'V013__r24_legacy_catalog_import_history.sql': '5b9213b6c58bdfb2fa1592ed19dc32a98fba1d94238b1e7c6270338819cb3e5d', 'V014__assistant_records.sql': '7f073ba6c5504e2aeb60b210474c27be81733ff34617ba81b82bfed4eb9b5bcd', 'V015__assistant_execution.sql': 'f4f53364d20a6e62c97de9978755944e238dd24600f7da0904b822bea4ba9685', 'V016__assistant_storage_controls.sql': '095aac0e5ff5f8187992d9fdf31c5b16507633a213653fc5d64537c9db60ebd8'}
+STUDIO_MIGRATION = ('V017__creation_history_deletion.sql', 'f6ef87fbc9d4e8dcb6c6c93b249d58976f5fd5b68d27f3edfccb4b0a13d540ee')
+
+
+def schema_prefixes(entries):
+    # A Studio contract admits only the already-installed V016 prefix.
+    return (16, 17) if len(entries) == 17 else PREFIX_LENGTHS
+
+
 LEDGER_SQL = "SELECT coalesce(json_agg(json_build_object('version',version,'sha256',checksum) ORDER BY version),'[]'::json)::text FROM prototype_schema_migrations;"
 # Exact tables, including deletion/request tombstones, survive backup/recovery.
 ASSISTANT_TABLES = ('assistant_sessions','assistant_branches','assistant_messages',
@@ -77,15 +85,15 @@ def regular(path, expected=None):
 
 
 def migration_inventory(entries):
-    must(type(entries) is list and len(entries) == 16, 'assistant_migration_inventory')
-    must([x.get('version') for x in entries] == list(VERSIONS), 'assistant_migration_versions')
+    must(type(entries) is list and len(entries) in (16, 17), 'assistant_migration_inventory')
+    must([x.get('version') for x in entries] == list(VERSIONS) + (['V017'] if len(entries) == 17 else []), 'assistant_migration_versions')
     for entry in entries:
         must(set(entry) == {'version','name','sha256','path'}, 'assistant_migration_fields')
         must(re.fullmatch(entry['version'] + r'__[A-Za-z0-9_]+\.sql', entry['name']), 'assistant_migration_name')
         must(Path(entry['path']).name == entry['name'], 'assistant_migration_path')
-        must(MIGRATION_SHA256.get(entry['name']) == entry['sha256'], 'assistant_unreviewed_migration_bytes')
+        must(dict(MIGRATION_SHA256, **{STUDIO_MIGRATION[0]: STUDIO_MIGRATION[1]}).get(entry['name']) == entry['sha256'], 'assistant_unreviewed_migration_bytes')
         regular(entry['path'], entry['sha256'])
-    must(tuple(x['name'] for x in entries[13:]) == NEW_MIGRATIONS, 'assistant_fixed_migrations')
+    must(tuple(x['name'] for x in entries[13:]) == NEW_MIGRATIONS + ((STUDIO_MIGRATION[0],) if len(entries) == 17 else ()), 'assistant_fixed_migrations')
     return entries
 
 
@@ -191,22 +199,35 @@ class PostgresControl:
 def inspect_schema(pg, entries):
     migration_inventory(entries)
     ledger = pg.ledger()
-    must(len(ledger) in PREFIX_LENGTHS, 'assistant_unsupported_schema')
+    must(len(ledger) in schema_prefixes(entries), 'assistant_unsupported_schema')
     expected = [{'version':x['version'],'sha256':x['sha256']} for x in entries[:len(ledger)]]
     must(ledger == expected, 'assistant_migration_checksum_conflict')
+    if len(entries) == 17:
+        studio = json.loads(pg.query("""SELECT json_build_object(
+          'columns', (SELECT coalesce(json_agg(json_build_object('type',data_type,'nullable',is_nullable,'default',column_default)),'[]'::json)
+            FROM information_schema.columns WHERE table_schema='public' AND table_name='creations' AND column_name='history_deleted_at'),
+          'indexes', (SELECT coalesce(json_agg(json_build_object('definition',pg_get_indexdef(i.indexrelid),'valid',i.indisvalid,'ready',i.indisready)),'[]'::json)
+            FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname='public' AND c.relname='idx_creations_visible_history'))::text;"""))
+        expected_studio = {'columns':[], 'indexes':[]}
+        if len(ledger) == 17:
+            expected_studio = {'columns':[{'type':'timestamp without time zone','nullable':'YES','default':None}],
+                'indexes':[{'definition':'CREATE INDEX idx_creations_visible_history ON public.creations USING btree (user_id, created_at DESC, public_id DESC) WHERE (history_deleted_at IS NULL)',
+                            'valid':True,'ready':True}]}
+        must(studio == expected_studio, 'studio_physical_schema_conflict')
     return {'versions':[x['version'] for x in ledger], 'sha256':sha(json.dumps(ledger,sort_keys=True).encode())}
 
 
 def migrate(pg, entries, *, require_quiescent, journal):
     """One atomic fixed additive transaction. Lost reply reconciles, never resends.
 
-    A new invocation may proceed only from a fully verified 13/15 prefix. A
+    A new invocation may proceed only from its fully verified allowed prefix. A
     committed final ledger is a verified no-op. An exception leaves SQL_RESULT
     UNKNOWN in the durable caller journal; recover checks the actual ledger.
     """
     require_quiescent()
     before = inspect_schema(pg, entries)
-    if len(before['versions']) == 16:
+    if len(before['versions']) == len(entries):
         return {'outcome':'SCHEMA_CURRENT_VERIFIED','schema':before}
     pending = entries[len(before['versions']):]
     sql = ["BEGIN; SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='120s'; SELECT pg_advisory_xact_lock(1732584193, 16);"]
@@ -220,21 +241,21 @@ def migrate(pg, entries, *, require_quiescent, journal):
         sql.append(text)
         sql.append("INSERT INTO prototype_schema_migrations(version,checksum) VALUES ('"+item['version']+"','"+item['sha256']+"');")
     sql.append('COMMIT;')
-    journal('MIGRATION_INTENT',before=before,after_versions=list(VERSIONS))
+    journal('MIGRATION_INTENT',before=before,after_versions=[x['version'] for x in entries])
     try:
         pg.query('\n'.join(sql))
     except BaseException:
         journal('MIGRATION_RESULT_UNKNOWN')
         raise
     after = inspect_schema(pg,entries)
-    must(len(after['versions']) == 16, 'assistant_migration_incomplete')
+    must(len(after['versions']) == len(entries), 'assistant_migration_incomplete')
     journal('MIGRATION_COMMITTED',after=after)
     return {'outcome':'SCHEMA_FORWARD_COMMITTED','schema':after}
 
 
 def reconcile_migration(pg, entries):
     state = inspect_schema(pg,entries)
-    return {'outcome':'FORWARD_SCHEMA_PRESERVED' if len(state['versions']) == 16 else 'MIGRATION_NOT_COMMITTED', 'schema':state,
+    return {'outcome':'FORWARD_SCHEMA_PRESERVED' if len(state['versions']) == len(entries) else 'MIGRATION_NOT_COMMITTED', 'schema':state,
             'automatic_replay':False,'database_restore':False}
 
 
