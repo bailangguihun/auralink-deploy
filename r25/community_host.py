@@ -141,6 +141,32 @@ def knowledge_lease_binding(plan, plan_sha, manifest_sha, approval_sha):
     return dict(plan['lease'],guard=observed)
 
 
+def recovery_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sha):
+    """Retain the old Host approval and lease through one exact installed successor."""
+    def private(path, expected=None):
+        item=identity(path)
+        must((item['uid'],item['gid'],item['mode'])==(0,0,0o600),'community_recovery_private')
+        if expected:must(item['sha256']==expected,'community_recovery_digest')
+        raw=Path(path).read_bytes();must(sha(raw)==item['sha256'],'community_recovery_changed')
+        return strict_json(raw)
+    must(re.fullmatch('[a-f0-9]{64}',str(upgrade_sha)) is not None,'community_recovery_upgrade_digest')
+    marker=private(ROOT/'runtime/vmm-controller/COMMUNITY_SUPERVISION_ACTIVE.json')
+    must(marker=={'schema':'R25_COMMUNITY_SUPERVISION_UPGRADE_V1','approval_sha256':upgrade_sha},
+         'community_recovery_pointer')
+    folder=ROOT/'runtime/vmm-controller/community-supervision'/upgrade_sha
+    approved=private(folder/'approval.json',upgrade_sha)
+    must(approved['schema']=='R25_COMMUNITY_SUPERVISION_UPGRADE_V1'
+         and private(folder/'journal.json')==dict(marker,phase='INSTALLED')
+         and approved['knowledge_approval_sha256']==knowledge_sha
+         and approved['legacy']['plan_sha256']==plan_sha==sha(encoded(plan))
+         and approved['community_deploy']['manifest_sha256']==manifest_sha,
+         'community_recovery_binding')
+    private(ROOT/'runtime/community/installations'/plan_sha/'watchdog-state.json',approved['legacy']['state_sha256'])
+    parent=private(ROOT/'runtime/core-publications/controller-upgrades'/knowledge_sha/'approval.json',knowledge_sha)
+    binding=knowledge_lease_binding(plan,plan_sha,parent['vmm']['community']['deploy']['manifest_sha256'],knowledge_sha)
+    return binding,approved['legacy']['state_sha256']
+
+
 def production_lease(binding, descriptor=None):
     path = ROOT/'operations/core_release_guard.py'
     match(path, binding['guard'])
@@ -294,10 +320,10 @@ class Host:
             self._role = Role(self.folder/'process', self.binding(), self.lease.require)
         return self._role
 
-    def preserve_running(self):
+    def preserve_running(self, supervisor=None):
         """Read-only maintenance proof; never drain, restart, or spend a retry."""
         from community_supervision import Supervisor
-        supervisor=Supervisor(self);state=supervisor.registered();role=self.role();role.verify()
+        supervisor=supervisor or Supervisor(self);state=supervisor.registered();role=self.role();role.verify()
         state_identity=identity(supervisor.state);state_raw=supervisor.state.read_bytes()
         must(sha(state_raw)==state_identity['sha256'] and strict_json(state_raw)==state,'community_preserve_state_changed')
         must(state['desired']=='RUNNING','community_preserve_not_running')
