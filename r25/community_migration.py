@@ -12,6 +12,7 @@ DATABASE = 'artlive_community'
 MIGRATOR = 'artlive_community_migrator'
 RUNTIME = 'artlive_community_runtime'
 FOUNDATION_SHA = '04b59866146d82548d59baba3282e0cca11e99d7df48a472ed9a3f58cb39f2e8'
+LEARNING_SHA = '5a1521f851773af9bd045499a6243220c3d3805b433d96b3db70e7d670489670'
 
 
 def provision_sql(scram_verifier):
@@ -63,5 +64,47 @@ SELECT has_database_privilege('artlive_community_runtime',current_database(),'CR
 SELECT nspname FROM pg_namespace WHERE has_schema_privilege('artlive_community_runtime',oid,'CREATE');
 SELECT table_name,privilege_type FROM information_schema.role_table_grants
 WHERE grantee='artlive_community_runtime' ORDER BY table_name,privilege_type;
+COMMIT;
+"""
+
+
+def learning_schema_sql(migration, operation):
+    """Render a finite schema-1 to schema-2 successor, never execute it.
+
+    The operator must hold the original shared lease and drain Community before
+    execution. A lost commit reply requires receipt inspection, never re-POST.
+    No existing business row, role, database or media file is removed.
+    """
+    must(sha(migration) == LEARNING_SHA, 'community_reviewed_learning_migration_digest')
+    must(re.fullmatch('[a-f0-9]{32}', operation) is not None, 'community_learning_operation')
+    raw = migration.decode()
+    must(raw.count('BEGIN;') == raw.count('COMMIT;') == 1, 'community_learning_transaction')
+    body = raw.split('BEGIN;\n', 1)[1].rsplit('COMMIT;', 1)[0]
+    return ("BEGIN;\nSET LOCAL lock_timeout='5s';\nSET LOCAL statement_timeout='30s';\n"
+            f'SET LOCAL ROLE {MIGRATOR};\n'
+            "DO $guard$ BEGIN\n"
+            f"IF current_database()<>'{DATABASE}' OR "
+            "(SELECT array_agg(version ORDER BY version) FROM community.schema_version) IS DISTINCT FROM ARRAY[1] "
+            "THEN RAISE EXCEPTION 'Community learning upgrade requires the original schema 1 database'; END IF;\n"
+            "END $guard$;\n" + body +
+            'CREATE TABLE community.learning_publication_receipt(operation_id char(32) PRIMARY KEY, migration_sha256 char(64) NOT NULL, schema_version integer NOT NULL CHECK(schema_version=2));\n'
+            f"INSERT INTO community.learning_publication_receipt VALUES('{operation}','{LEARNING_SHA}',2);\n" +
+            f'GRANT SELECT ON ALL TABLES IN SCHEMA community TO {RUNTIME};\n'
+            f'GRANT INSERT ON community.media_assets,community.post_images,community.artwork_revisions,community.artwork_tasks,community.notifications,community.knowledge_cases TO {RUNTIME};\n'
+            f'GRANT UPDATE(adopted) ON community.comments TO {RUNTIME};\n'
+            f'GRANT UPDATE(review_status) ON community.artwork_revisions TO {RUNTIME};\n'
+            f'GRANT UPDATE(status) ON community.artwork_tasks TO {RUNTIME};\n'
+            f'GRANT UPDATE(read_at) ON community.notifications TO {RUNTIME};\n'
+            f'GRANT UPDATE(title,summary,status,updated_at,published_at) ON community.knowledge_cases TO {RUNTIME};\n'
+            'COMMIT;\n').encode()
+
+
+LEARNING_VERIFY_SQL = """BEGIN READ ONLY;
+SELECT current_database();
+SELECT version FROM community.schema_version ORDER BY version;
+SELECT operation_id,migration_sha256,schema_version FROM community.learning_publication_receipt;
+SELECT tablename,tableowner FROM pg_tables WHERE schemaname='community' ORDER BY tablename;
+SELECT has_table_privilege('artlive_community_runtime','community.operations','DELETE') AS can_delete_receipts,
+       has_schema_privilege('artlive_community_runtime','community','CREATE') AS can_create;
 COMMIT;
 """
