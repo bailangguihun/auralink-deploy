@@ -110,7 +110,7 @@ COMMIT;
 """
 
 
-REFERENCE_SHA = '35aa201028886c85a335b3c6ebf58d8a79ccb3c7d6cd4e7e4261e879faa35a9f'
+REFERENCE_SHA = 'f6dc7b8b7abfcb872f38fd396abb860e4c6e90c9e44e761dee190baa92b88c54'
 REFERENCE_TABLES = ('users', 'posts', 'tags', 'post_tags', 'post_likes', 'favorites', 'comments', 'comment_likes', 'coin_wallets', 'coin_ledger', 'post_coin_contributions', 'notifications', 'ai_agents', 'ai_messages', 'ai_settings', 'rooms', 'room_members', 'artwork_assets', 'artwork_sessions', 'annotations', 'drawing_groups', 'room_messages', 'artwork_ai_contexts', 'ai_annotation_drafts', 'ownership_transfers', 'room_moderation_actions', 'room_entry_payments', 'room_share_requests', 'room_view_shares', 'room_income_debts', 'operations', 'uploads')
 
 def reference_schema_sql(migration, operation):

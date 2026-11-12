@@ -25,7 +25,7 @@ Core 的显式 `003_reference_community.sql` 以当前 `[1,2]` schema 为前驱�
 
 迁移还明确支持纯媒体帖及有标识的 AI 展示身份。这不是替换 Core 账号体系；原版密码列不保留，平台角色由 Core 的认证身份接口提供。原版 `server.js`/`room-feature.js` 的安全漏检修正属于服务合同校验，不改变页面布局。
 
-[community_migration.py](../r25/community_migration.py) 已增加 `reference_schema_sql` 和 `REFERENCE_VERIFY_SQL`。最终 003 SHA-256 固定为 `35aa201028886c85a335b3c6ebf58d8a79ccb3c7d6cd4e7e4261e879faa35a9f`。渲染器要求数据库为 `artlive_community`、前驱恰为 `[1,2]`、操作 ID 合法，使用迁移角色、单事务、5 秒锁超时和 60 秒语句超时；添加 `reference_publication_receipt` 和最小运行权限。操作账本不授予 DELETE，墨币流水只增不改。丢失提交回包后通过验证 SQL 读取原操作回执、schema 和权限，不盲目重跑。
+[community_migration.py](../r25/community_migration.py) 已增加 `reference_schema_sql` 和 `REFERENCE_VERIFY_SQL`。最终 003 SHA-256 固定为 `f6dc7b8b7abfcb872f38fd396abb860e4c6e90c9e44e761dee190baa92b88c54`。渲染器要求数据库为 `artlive_community`、前驱恰为 `[1,2]`、操作 ID 合法，使用迁移角色、单事务、5 秒锁超时和 60 秒语句超时；添加 `reference_publication_receipt` 和最小运行权限。操作账本不授予 DELETE，墨币流水只增不改。丢失提交回包后通过验证 SQL 读取原操作回执、schema 和权限，不盲目重跑。
 
 渲染器只返回 SQL 字节，不执行迁移、不切换进程或激活标记。原生 PostgreSQL 最小角色测试已经完成，但当前没有绑定已安装生产链的 schema 3 有限迁移执行器。不能复用只处理 002 的 `learning_schema_sql`，也不能因 renderer 和包校验存在就直接上线。
 
