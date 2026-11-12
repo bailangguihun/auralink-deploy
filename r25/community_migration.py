@@ -108,3 +108,51 @@ SELECT has_table_privilege('artlive_community_runtime','community.operations','D
        has_schema_privilege('artlive_community_runtime','community','CREATE') AS can_create;
 COMMIT;
 """
+
+
+REFERENCE_SHA = '35aa201028886c85a335b3c6ebf58d8a79ccb3c7d6cd4e7e4261e879faa35a9f'
+REFERENCE_TABLES = ('users', 'posts', 'tags', 'post_tags', 'post_likes', 'favorites', 'comments', 'comment_likes', 'coin_wallets', 'coin_ledger', 'post_coin_contributions', 'notifications', 'ai_agents', 'ai_messages', 'ai_settings', 'rooms', 'room_members', 'artwork_assets', 'artwork_sessions', 'annotations', 'drawing_groups', 'room_messages', 'artwork_ai_contexts', 'ai_annotation_drafts', 'ownership_transfers', 'room_moderation_actions', 'room_entry_payments', 'room_share_requests', 'room_view_shares', 'room_income_debts', 'operations', 'uploads')
+
+def reference_schema_sql(migration, operation):
+    """Render the pinned schema-2 to schema-3 transition; caller owns execution.
+
+    Requires a drained managed process, original shared lease and the preceding
+    schema-2 receipt. Never performs SQL, changes active markers or replays a
+    missing commit reply. Read REFERENCE_VERIFY_SQL before recovery decisions.
+    """
+    must(sha(migration) == REFERENCE_SHA, 'community_reviewed_reference_migration_digest')
+    must(re.fullmatch('[a-f0-9]{32}',operation) is not None, 'community_reference_operation')
+    raw=migration.decode()
+    must(raw.count('BEGIN;') == raw.count('COMMIT;') == 1, 'community_reference_transaction')
+    body=raw.split('BEGIN;\n',1)[1].rsplit('COMMIT;',1)[0]
+    grants=f'GRANT SELECT ON ALL TABLES IN SCHEMA community TO {RUNTIME};\n'
+    for table in REFERENCE_TABLES:
+        privileges='INSERT' if table in ('coin_ledger','room_moderation_actions','uploads','tags') else 'INSERT,UPDATE' if table in ('users','operations','notifications') else 'INSERT,UPDATE,DELETE'
+        grants+=f'GRANT {privileges} ON community.v2_{table} TO {RUNTIME};\n'
+    grants+=f'GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA community TO {RUNTIME};\n'
+    grants+=f'GRANT UPDATE(content,reference_deleted) ON community.comments TO {RUNTIME};\n'
+    grants+=f'GRANT DELETE ON community.post_images TO {RUNTIME};\n'
+    return ("BEGIN;\nSET LOCAL lock_timeout='5s';\nSET LOCAL statement_timeout='60s';\n"
+        f'SET LOCAL ROLE {MIGRATOR};\n'
+        "DO $guard$ BEGIN\n"
+        f"IF current_database()<>'{DATABASE}' OR "
+        "(SELECT array_agg(version ORDER BY version) FROM community.schema_version) IS DISTINCT FROM ARRAY[1,2] "
+        "THEN RAISE EXCEPTION 'Community reference upgrade requires the original schema 2 database'; END IF;\n"
+        "END $guard$;\n"+body+
+        'CREATE TABLE community.reference_publication_receipt(operation_id char(32) PRIMARY KEY, migration_sha256 char(64) NOT NULL, schema_version integer NOT NULL CHECK(schema_version=3));\n'
+        f"INSERT INTO community.reference_publication_receipt VALUES('{operation}','{REFERENCE_SHA}',3);\n"+
+        grants+'COMMIT;\n').encode()
+
+
+REFERENCE_VERIFY_SQL = """BEGIN READ ONLY;
+SELECT current_database();
+SELECT version FROM community.schema_version ORDER BY version;
+SELECT operation_id,migration_sha256,schema_version FROM community.reference_publication_receipt;
+SELECT has_table_privilege('artlive_community_runtime','community.v2_operations','DELETE') AS can_delete_receipts,
+       has_table_privilege('artlive_community_runtime','community.v2_coin_ledger','UPDATE') AS can_update_ledger,
+       has_table_privilege('artlive_community_runtime','community.v2_coin_ledger','DELETE') AS can_delete_ledger,
+       has_schema_privilege('artlive_community_runtime','community','CREATE') AS can_create;
+SELECT (SELECT count(*) FROM community.posts) AS canonical_posts,
+       (SELECT count(*) FROM community.v2_posts WHERE legacy_id IS NOT NULL) AS projected_posts;
+COMMIT;
+"""

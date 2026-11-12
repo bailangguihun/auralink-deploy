@@ -12,6 +12,8 @@ REQUIRED = {'package.json', 'package-lock.json', 'db/001_foundation.sql',
             'src/core.mjs', 'src/errors.mjs', 'src/media.mjs'}
 LEARNING_FILES = {'db/002_learning_community.sql', 'src/learning-contract.mjs',
                   'src/learning-store.mjs', 'src/learning-routes.mjs', 'src/learning-media.mjs'}
+REFERENCE_FILES = {'db/003_reference_community.sql','src/v2/database.mjs','src/v2/tables.mjs',
+                   'src/v2/posts.mjs','src/v2/rooms.mjs','src/v2/gateway.mjs'}
 
 
 def manifest(raw, expected):
@@ -27,13 +29,15 @@ def manifest(raw, expected):
     must(value.get('contract_version') == value.get('database_schema_version') == 1,
          'community_contract_version')
     learning = value.get('learning_schema_version')
+    reference = value.get('reference_schema_version')
+    must(reference in (None,3) and (reference is None or learning == 2), 'community_reference_schema_version')
     must(learning in (None, 2), 'community_learning_schema_version')
-    allowed = REQUIRED | (LEARNING_FILES if learning == 2 else set())
+    allowed = REQUIRED | (LEARNING_FILES if learning == 2 else set()) | (REFERENCE_FILES if reference == 3 else set())
     if learning == 2:
         target = value.get('runtime_platform')
         must(type(target) is dict and set(target) == {'os','arch','libc','sharp'} and
              target['os'] == 'linux' and target['arch'] in ('x64','arm64') and
-             target['libc'] in ('glibc','musl') and target['sharp'] == '0.34.3', 'community_native_image_target')
+             target['libc'] in ('glibc','musl') and target['sharp'] == ('0.35.5' if reference == 3 else '0.34.3'), 'community_native_image_target')
     must(value.get('runtime_node_min') == '22.13.0', 'community_runtime_contract')
     files = value.get('files')
     must(type(files) is list and 10 <= len(files) <= 5000, 'community_file_inventory')
