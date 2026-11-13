@@ -71,6 +71,23 @@ jobs:
           path: ${{ runner.temp }}/studio-migration/RESULT.json
           if-no-files-found: error
 
+      - uses: actions/checkout@v4
+        with:
+          repository: bailangguihun/auralink-core-api
+          ref: 76910cb9df32c0e9d4c7a711f279a19135fddcc3
+          path: .reference-core-fixture
+          persist-credentials: false
+
+      - name: Verify exact Community migrations and lost commit replies
+        run: python -B scripts/rehearse-community-reference.py --pg-bin /usr/lib/postgresql/16/bin --core-source .reference-core-fixture --fixture "$RUNNER_TEMP/community-reference"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: community-reference-result
+          path: ${{ runner.temp }}/community-reference/RESULT.json
+          if-no-files-found: error
+
       - name: Package and verify fixed controller allowlist
         shell: bash
         run: |

@@ -156,3 +156,39 @@ SELECT (SELECT count(*) FROM community.posts) AS canonical_posts,
        (SELECT count(*) FROM community.v2_posts WHERE legacy_id IS NOT NULL) AS projected_posts;
 COMMIT;
 """
+
+
+def reference_transition_sql(learning, reference, operation, versions):
+    """One exact forward transaction from the observed schema 1 or schema 2.
+
+    The compatible new service must be drained by its lifecycle owner first.
+    Both immutable migrations are bound even when schema 2 is already present.
+    A lost commit reply is reconciled from the original operation receipts;
+    this renderer neither executes SQL nor authorizes another attempt.
+    """
+    must(type(versions) is list and all(type(v) is int for v in versions)
+         and versions in ([1], [1, 2]),
+         'community_reference_exact_predecessor')
+    must(sha(learning) == LEARNING_SHA, 'community_reviewed_learning_migration_digest')
+    must(sha(reference) == REFERENCE_SHA, 'community_reviewed_reference_migration_digest')
+    must(type(operation) is str and re.fullmatch('[a-f0-9]{32}', operation) is not None,
+         'community_reference_operation')
+
+    def body(raw):
+        text = raw.decode('utf-8')
+        must(text.count('BEGIN;') == text.count('COMMIT;') == 1,
+             'community_reference_single_transaction')
+        return text.split('BEGIN;\n', 1)[1].rsplit('COMMIT;', 1)[0]
+
+    expected = ','.join(str(v) for v in versions)
+    guard = ("DO $predecessor$ BEGIN\n"
+             f"IF current_database()<>'{DATABASE}' OR "
+             "(SELECT array_agg(version ORDER BY version) FROM community.schema_version) "
+             f"IS DISTINCT FROM ARRAY[{expected}] THEN "
+             "RAISE EXCEPTION 'Community reference predecessor changed'; END IF;\n"
+             "END $predecessor$;\n")
+    intermediate = body(learning_schema_sql(learning, operation)) if versions == [1] else ''
+    final = body(reference_schema_sql(reference, operation))
+    return ("BEGIN;\nSET LOCAL lock_timeout='5s';\n"
+            "SET LOCAL statement_timeout='60s';\n" + guard + intermediate + final +
+            "COMMIT;\n").encode('utf-8')

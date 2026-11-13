@@ -202,6 +202,45 @@ def studio_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sh
     return dict(plan['lease'],guard=observed),parent['legacy']['state_sha256']
 
 
+def reference_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sha, studio_sha, reference_sha):
+    """One exact Reference successor; the original guard verifies its full chain."""
+    def private(path, expected=None):
+        item=identity(path)
+        must((item['uid'],item['gid'],item['mode']) == (0,0,0o600),'community_reference_private')
+        raw=Path(path).read_bytes()
+        must(sha(raw) == item['sha256'] and (expected is None or sha(raw) == expected),
+             'community_reference_digest')
+        return strict_json(raw)
+    must(re.fullmatch('[a-f0-9]{64}',str(reference_sha)) is not None,'community_reference_digest')
+    marker=private(ROOT/'runtime/vmm-controller/REFERENCE_PUBLICATION_ACTIVE.json')
+    must(marker == {'schema':'R25_REFERENCE_PUBLICATION_ACTIVE_V1','approval_sha256':reference_sha},
+         'community_reference_pointer')
+    folder=ROOT/'runtime/core-publications/controller-upgrades'/reference_sha
+    approved=private(folder/'approval.json',reference_sha)
+    receipt=private(folder/'journal.json')
+    must(approved['schema'] == receipt['schema'] == 'R25_REFERENCE_CORE_PUBLICATION_BINDING_V1'
+         and receipt['approval_sha256'] == reference_sha and receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),
+         'community_reference_not_installed')
+    must(approved['vmm']['studio']['marker'] ==
+         {'schema':'R25_STUDIO_PUBLICATION_ACTIVE_V1','approval_sha256':studio_sha},
+         'community_reference_studio_parent')
+    parent=private(ROOT/'runtime/core-publications/controller-upgrades'/studio_sha/'approval.json',studio_sha)
+    must(parent['vmm']['supervision']['marker'] ==
+         {'schema':'R25_COMMUNITY_SUPERVISION_UPGRADE_V1','approval_sha256':upgrade_sha},
+         'community_reference_supervision_parent')
+    recovery=private(ROOT/'runtime/vmm-controller/community-supervision'/upgrade_sha/'approval.json',upgrade_sha)
+    must(recovery['knowledge_approval_sha256'] == knowledge_sha,'community_reference_knowledge_parent')
+    bound=approved['vmm']['community']
+    must(bound['plan_sha256'] == plan_sha == sha(encoded(plan)) and
+         bound['deploy']['manifest_sha256'] == manifest_sha,'community_reference_original_plan')
+    private(ROOT/'runtime/community/WATCHDOG.json',bound['registration_sha256'])
+    observed=identity(ROOT/'operations/core_release_guard.py')
+    must(observed['sha256'] == approved['operational']['guard']['after_sha256'] and
+         (observed['uid'],observed['gid'],observed['mode']) == tuple(approved['controller_owner'])+(0o700,),
+         'community_reference_guard')
+    return dict(plan['lease'],guard=observed),recovery['legacy']['state_sha256']
+
+
 def production_lease(binding, descriptor=None):
     path = ROOT/'operations/core_release_guard.py'
     match(path, binding['guard'])
@@ -561,6 +600,243 @@ class ReleaseHost(Host):
         return self._role
 
 
+def reference_core_record(host, path, expected=None):
+    """Read retained Core proofs without widening Community write roots."""
+    storage=R25Storage([str(ROOT/'runtime/core-publications')],*host.owner)
+    return storage.read_private_record(path,expected_sha256=expected)
+
+
+def reference_package_context(host, reference_sha):
+    """Keep the old package's immutable context across the Core-only switch."""
+    host.lease.require()
+    base=ROOT/'runtime/core-publications'
+    folder=base/'controller-upgrades'/reference_sha
+    approved=reference_core_record(host,folder/'approval.json',reference_sha)
+    must(sha(encoded(approved)) == reference_sha and
+         approved['schema'] == 'R25_REFERENCE_CORE_PUBLICATION_BINDING_V1',
+         'community_reference_context_approval')
+    receipt=reference_core_record(host,folder/'journal.json')
+    must(receipt['approval_sha256'] == reference_sha and
+         receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_reference_context_not_installed')
+    bound=approved['vmm']['community'];previous=bound['package']
+    must(bound['plan_sha256'] == host.digest,'community_reference_context_plan')
+    match(host.folder/'RELEASE_ACTIVE.json',dict(identity(host.folder/'RELEASE_ACTIVE.json'),
+                                               sha256=previous['marker_sha256']))
+    oldfolder=host.folder/'package-upgrades'/previous['plan_sha256']
+    old=host.read(oldfolder/'approval.json')
+    must(sha(encoded(old)) == previous['plan_sha256'],'community_reference_package_approval')
+    match(oldfolder/'journal.json',dict(identity(oldfolder/'journal.json'),
+                                       sha256=previous['journal_sha256']))
+    must(host.read(oldfolder/'journal.json')['phase'] == 'COMMITTED',
+         'community_reference_package_not_committed')
+    current=reference_core_record(host,base/'CURRENT.json')
+    policy=reference_core_record(host,base/'POLICY.json')
+    must(sha(encoded(policy)) == approved['operational']['policy']['after_sha256'],
+         'community_reference_context_policy')
+    candidate=policy['upgrade']['candidate']
+    must(current['release'] == approved['current_release'] or
+         all(current['release'].get(k) == candidate[k] for k in ('commit_sha','artifact_sha256')),
+         'community_reference_context_current')
+    return {'reference_sha256':reference_sha,'core_commit':candidate['commit_sha'],
+            'candidate':candidate,'predecessor':previous,'previous_context':old['context']}
+
+
+class ReferenceDatabase:
+    """The existing native backup principal, confined to reviewed forward SQL.
+
+    A private plan binds the same native profile, account/groups, credential and
+    binaries that the original Community installer used. No credential bytes
+    enter the plan or journal. Business processes inherit no deployment FD.
+    """
+    def __init__(self, host, plan):
+        self.host,self.plan=host,plan
+        must(set(plan) == {'schema','versions','operation_id','postgres','snapshot'} and
+             plan['schema'] == 'ARTLIVE_COMMUNITY_REFERENCE_DATABASE_V1',
+             'community_reference_database_plan')
+        must(type(plan['versions']) is list and all(type(v) is int for v in plan['versions']) and
+             plan['versions'] in ([1],[1,2]) and
+             re.fullmatch('[a-f0-9]{32}',str(plan['operation_id'])) is not None,
+             'community_reference_database_predecessor')
+        p=plan['postgres'];self.pg=p
+        must(set(p) == {'binary_dir','binaries','host','port','user','passfile','credential',
+                        'library_dir','library_identity'},
+             'community_reference_postgres_fields')
+        import pwd
+        principal=p['credential'];account=pwd.getpwnam(principal['account'])
+        must(set(principal) == {'account','uid','gid','groups'} and
+             (account.pw_uid,account.pw_gid) == (principal['uid'],principal['gid']) and
+             sorted(set(os.getgrouplist(account.pw_name,account.pw_gid))) == principal['groups'],
+             'community_reference_database_account')
+        self.exec_identity={}
+        if os.geteuid() != account.pw_uid:
+            must(os.geteuid() == 0,'community_reference_database_identity')
+            self.exec_identity={'user':account.pw_uid,'group':account.pw_gid,
+                                'extra_groups':principal['groups']}
+        must(set(p['passfile']) == {'path','identity'},'community_reference_passfile_binding')
+        match(p['passfile']['path'],p['passfile']['identity'])
+        must((p['passfile']['identity']['uid'],p['passfile']['identity']['gid'],
+              p['passfile']['identity']['mode']) == (account.pw_uid,account.pw_gid,0o600),
+             'community_reference_passfile_identity')
+        must(set(p['binaries']) == {'psql','pg_dump','pg_restore'},'community_reference_pg_tools')
+        for name,want in p['binaries'].items():match(Path(p['binary_dir'])/name,want)
+        must(p['host'] == '127.0.0.1' or (p['host'].startswith('/') and
+             str(Path(p['host']).resolve(strict=True)) == p['host']),'community_reference_pg_loopback')
+        must(type(p['port']) is int and 1024 <= p['port'] <= 65535 and
+             re.fullmatch('[a-z_][a-z0-9_]{0,62}',p['user']), 'community_reference_pg_target')
+        if host.root == ROOT/'runtime/community':
+            def envfile(path):
+                return dict(l.split('=',1) for l in path.read_text().splitlines()
+                            if '=' in l and not l.startswith('#'))
+            native=envfile(ROOT/'runtime/native-control.env')
+            profile=envfile(ROOT/'runtime/postgres/ops.env')
+            must(p['binary_dir'] == native['R25_NATIVE_PG_BIN'] and
+                 p['library_dir'] == native.get('R25_NATIVE_PG_LIB','') and
+                 p['host'] == profile['ARTLIVE_PG_SOCKET_DIR'] and p['port'] == 55640 and
+                 p['user'] == profile['ARTLIVE_PG_BACKUP_USER'] and
+                 p['passfile']['path'] == profile['ARTLIVE_PG_BACKUP_PASSFILE'] and
+                 principal['account'] == native['R25_NATIVE_SERVICE_USER'],
+                 'community_reference_original_database_principal')
+        self.env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8',
+                  'PGPASSFILE':p['passfile']['path'],'PGCONNECT_TIMEOUT':'5',
+                  'PGOPTIONS':'-c statement_timeout=60000 -c lock_timeout=5000',
+                  'PGAPPNAME':'artlive-reference-'+plan['operation_id']}
+        self.verify_libraries()
+        if p['library_dir']:self.env['LD_LIBRARY_PATH']=p['library_dir']
+        self.connection=['-h',p['host'],'-p',str(p['port']),'-U',p['user'],'-d','artlive_community']
+
+    def verify_libraries(self):
+        p=self.pg;directory=p['library_dir'];files=p['library_identity']
+        must(type(directory) is str and type(files) is dict,'community_reference_library_profile')
+        if not directory:
+            must(files == {},'community_reference_library_profile');return
+        path=Path(directory)
+        must(path.is_absolute() and path.is_dir() and not path.is_symlink() and
+             str(path.resolve(strict=True)) == directory and files,
+             'community_reference_library_directory')
+        actual={}
+        for item in path.iterdir():
+            target=item.resolve(strict=True)
+            must(target.parent == path and target.is_file(),
+                 'community_reference_library_target')
+            actual[item.name]={'target':target.name,'identity':identity(target)}
+        must(actual == files,'community_reference_library_drift')
+
+    def run(self, name, args, *, raw=None, timeout=80, stdout=None):
+        self.host.lease.require()
+        self.verify_libraries()
+        match(Path(self.pg['binary_dir'])/name,self.pg['binaries'][name])
+        match(self.pg['passfile']['path'],self.pg['passfile']['identity'])
+        result=subprocess.run([str(Path(self.pg['binary_dir'])/name),*args],input=raw,
+            stdout=stdout if stdout is not None else subprocess.PIPE,stderr=subprocess.PIPE,
+            env=self.env,timeout=timeout,close_fds=True,**self.exec_identity)
+        must(result.returncode == 0,'community_reference_database_'+name+'_failed')
+        if stdout is None:
+            must(len(result.stdout) <= 16*1024*1024,'community_reference_database_result_limit')
+            return result.stdout
+
+    def query(self, sql):
+        return self.run('psql',[*self.connection,'-X','-w','-qAt','-v','ON_ERROR_STOP=1'],
+                        raw=sql.encode()).decode().strip()
+
+    def read(self, sql):
+        result=self.query('BEGIN READ ONLY;\n'+sql+'\nCOMMIT;\n')
+        return strict_json(('{"value":'+result+'}').encode())['value']
+
+    def snapshot(self):
+        metadata=self.read("SELECT json_build_object('versions',"
+            "(SELECT json_agg(version ORDER BY version) FROM community.schema_version),"
+            "'can_migrate',pg_has_role(current_user,'artlive_community_migrator','MEMBER'),"
+            "'database',current_database());")
+        must(metadata['database'] == 'artlive_community' and metadata['can_migrate'] is True,
+             'community_reference_database_authority')
+        data=self.read("""SELECT jsonb_build_object(
+          'profiles',(SELECT coalesce(jsonb_agg(jsonb_build_array(user_id,display_name) ORDER BY user_id),'[]'::jsonb) FROM community.profiles WHERE user_id>0),
+          'posts',(SELECT coalesce(jsonb_agg(jsonb_build_array(id,author_id,content,gallery_artwork_id,status,created_at) ORDER BY id),'[]'::jsonb) FROM community.posts),
+          'comments',(SELECT coalesce(jsonb_agg(jsonb_build_array(id,post_id,author_id,content,created_at) ORDER BY id),'[]'::jsonb) FROM community.comments),
+          'reactions',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY post_id,user_id,kind),'[]'::jsonb) FROM community.reactions t),
+          'operations',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY user_id,request_id),'[]'::jsonb) FROM community.operations t));""")
+        preserved={k:{'rows':len(v),'sha256':sha(encoded(v))} for k,v in data.items()}
+        receipts={}
+        for name in ('learning','reference'):
+            table=name+'_publication_receipt'
+            found=self.read("SELECT to_json(to_regclass('community."+table+"') IS NOT NULL);")
+            receipts[name]=self.read('SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY operation_id),'+
+                "'[]'::jsonb) FROM community."+table+' t;') if found else []
+        safety=self.read("""SELECT jsonb_build_object(
+          'superuser',rolsuper,'createdb',rolcreatedb,'createrole',rolcreaterole,
+          'inherit',rolinherit,'replication',rolreplication,'bypassrls',rolbypassrls,
+          'schema_create',has_schema_privilege('artlive_community_runtime','community','CREATE'),
+          'delete_operations',has_table_privilege('artlive_community_runtime','community.operations','DELETE'))
+          FROM pg_roles WHERE rolname='artlive_community_runtime';""")
+        must(type(safety) is dict and all(v is False for v in safety.values()),
+             'community_reference_runtime_privilege_drift')
+        reference=None
+        if metadata['versions'] == [1,2,3]:
+            reference=self.read("""SELECT jsonb_build_object(
+              'delete_receipts',has_table_privilege('artlive_community_runtime','community.v2_operations','DELETE'),
+              'update_ledger',has_table_privilege('artlive_community_runtime','community.v2_coin_ledger','UPDATE'),
+              'delete_ledger',has_table_privilege('artlive_community_runtime','community.v2_coin_ledger','DELETE'),
+              'missing_legacy_posts',(SELECT count(*) FROM community.posts p
+                WHERE NOT EXISTS(SELECT 1 FROM community.v2_posts v WHERE v.legacy_id=p.id)),
+              'missing_legacy_comments',(SELECT count(*) FROM community.comments c
+                WHERE NOT EXISTS(SELECT 1 FROM community.v2_comments v WHERE v.legacy_id=c.id)));""")
+        return {'versions':metadata['versions'],'preserved':preserved,'receipts':receipts,
+                'runtime_safety':safety,'reference':reference}
+
+    def backup(self, target):
+        must(not Path(target).exists(),'community_reference_backup_exists')
+        fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as out:
+            self.run('pg_dump',[*self.connection,'--format=custom','--no-owner','--no-acl'],
+                     stdout=out,timeout=120)
+            out.flush();os.fsync(out.fileno())
+        # The controller reads the private dump; no account/permission changes.
+        restore=Path(self.pg['binary_dir'])/'pg_restore'
+        match(restore,self.pg['binaries']['pg_restore'])
+        p=subprocess.run([str(restore),'--list',str(target)],capture_output=True,env=self.env,timeout=20)
+        must(p.returncode == 0,'community_reference_backup_invalid')
+        return identity(target)
+
+    def status(self, *, preserved=True):
+        current=self.snapshot();before=self.plan['snapshot']
+        if preserved:
+            must(current['preserved'] == before['preserved'],'community_reference_legacy_data_drift')
+        if current == before or (not preserved and current['versions'] == before['versions'] and
+                                current['receipts'] == before['receipts']):
+            return 'NOT_APPLIED'
+        if current['versions'] != [1,2,3]:
+            return 'UNKNOWN'
+        if current['reference'] != {'delete_receipts':False,'update_ledger':False,'delete_ledger':False,
+                                    'missing_legacy_posts':0,'missing_legacy_comments':0}:
+            return 'UNKNOWN'
+        from community_migration import LEARNING_SHA,REFERENCE_SHA
+        operation=self.plan['operation_id']
+        expected={'operation_id':operation,'migration_sha256':REFERENCE_SHA,'schema_version':3}
+        if current['receipts']['reference'] != [expected]:return 'UNKNOWN'
+        learning=({'operation_id':operation,'migration_sha256':LEARNING_SHA,'schema_version':2}
+                  if self.plan['versions'] == [1] else None)
+        if (current['receipts']['learning'] != [learning] if learning else
+            current['receipts']['learning'] != before['receipts']['learning']):return 'UNKNOWN'
+        return 'COMMITTED'
+
+    def migrate(self, learning, reference):
+        must(self.snapshot() == self.plan['snapshot'],'community_reference_database_preimage_drift')
+        from community_migration import reference_transition_sql
+        raw=reference_transition_sql(learning,reference,self.plan['operation_id'],self.plan['versions'])
+        self.query(raw.decode())
+        must(self.status() == 'COMMITTED','community_reference_migration_receipt')
+
+
+class ReferenceHost(ReleaseHost):
+    def __init__(self, original, release, package_plan, settings):
+        super().__init__(original,release)
+        self.package_plan,self.settings=package_plan,settings
+
+    def binding(self):
+        return dict(super().binding(),config_path=str(self.settings['path']),
+                    config_sha256=self.settings['sha256'],release_root=str(self.source_release))
+
+
 class PackageUpgrade:
     """One package replacement after Studio Core, under the original lease.
 
@@ -771,3 +1047,405 @@ class PackageUpgrade:
         from community_supervision import PackageSupervisor
         candidate=self.candidate(plan)
         return candidate,PackageSupervisor(candidate,ident,record['drained_state_sha256'],self.supervisor.state)
+
+
+REFERENCE_PACKAGE_SCHEMA='ARTLIVE_COMMUNITY_REFERENCE_UPGRADE_V1'
+
+
+class ReferencePackageUpgrade(PackageUpgrade):
+    """One successor of the committed Studio package, with a compatible bridge.
+
+    The new immutable package first proves that it serves the original schema.
+    Its independent final process then starts after the exact forward SQL. The
+    old package, approval, activation and every restart attempt remain intact.
+    Uncertain spawns are observed, never repeated. A committed schema is never
+    undone and recovery never starts the incompatible original package.
+    """
+    def __init__(self,host,supervisor,context,*,database_factory=None):
+        super().__init__(host,supervisor,context)
+        must(set(context) == {'reference_sha256','core_commit','candidate','predecessor','previous_context'},
+             'community_reference_context_fields')
+        must(database_factory is None or host.root != ROOT/'runtime/community',
+             'community_reference_fixture_database_forbidden')
+        self.database_factory=database_factory or ReferenceDatabase
+        self.previous=PackageUpgrade(host,supervisor,context['previous_context'])
+        self.root=host.folder/'reference-upgrades'
+        self.marker=host.folder/'REFERENCE_ACTIVE.json'
+
+    def database(self,plan):
+        return self.database_factory(self.host,plan['database'])
+
+    def require_core(self):
+        if self.host.root != ROOT/'runtime/community':return
+        current=reference_core_record(self.host,ROOT/'runtime/core-publications/CURRENT.json')
+        candidate=self.context['candidate']
+        must(all(current['release'].get(k) == candidate[k] for k in ('commit_sha','artifact_sha256')),
+             'community_reference_new_core_required')
+        tx=current['transaction_id']
+        must(re.fullmatch('[a-f0-9]{32}',str(tx)),'community_reference_core_transaction')
+        receipt=reference_core_record(self.host,ROOT/'runtime/core-publications/transactions'/tx/'journal.json')
+        must(receipt['phase'] == 'COMMITTED' and receipt['transaction_id'] == tx and
+             receipt['candidate'] == current['release'],'community_reference_core_not_committed')
+
+    def prepare(self,archive,manifest,provenance,review_sha256,database_plan):
+        h=self.host;h.lease.require();h.validate(installing=False);self.require_core()
+        must(not self.marker.is_symlink(),'community_reference_active_symlink')
+        if self.marker.exists():
+            marker=h.read(self.marker)
+            must(marker['schema'] == REFERENCE_PACKAGE_SCHEMA and marker['channel'] == 'previous' and
+                 h.read(self.root/marker['plan_sha256']/'journal.json')['phase'] == 'RESTORED',
+                 'community_reference_already_active')
+        must(re.fullmatch('[a-f0-9]{64}',str(review_sha256)),'community_reference_review')
+        must(provenance.get('commit') == self.context['core_commit'],'community_reference_core_release')
+        for path in (archive,manifest,database_plan):
+            item=identity(path)
+            must((item['uid'],item['gid'],item['mode']) == (*h.owner,0o600),
+                 'community_reference_material_private')
+        raw=Path(archive).read_bytes();mr=Path(manifest).read_bytes()
+        m=verify_archive(raw,mr,provenance)
+        must(m.get('reference_schema_version') == 3 and m.get('learning_schema_version') == 2,
+             'community_reference_schema3_bundle')
+        dbplan=strict_json(Path(database_plan).read_bytes())
+        db=self.database_factory(h,dbplan)
+        must(dbplan['versions'] == dbplan['snapshot']['versions'] and
+             db.snapshot() == dbplan['snapshot'],'community_reference_database_preimage')
+        previous,supervisor=self.previous.active()
+        before=previous.preserve_running(supervisor)
+        old_settings=Path(h.binding()['config_path'])
+        match(old_settings,h.plan['settings'])
+        settings=strict_json(old_settings.read_bytes())
+        required={'COMMUNITY_DATABASE_URL','COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_PORT'}
+        must(set(settings) == required,'community_reference_original_settings')
+        operation=dbplan['operation_id']
+        material=h.folder/'reference-material'/operation
+        h.storage.mkdir_private(material.parent);h.storage.mkdir_private(material)
+        media=material/'media';h.storage.mkdir_private(media);h.storage.mkdir_private(media/'reference')
+        settings=dict(settings,COMMUNITY_MEDIA_ROOT=str(media))
+        target=material/'settings.json';configuration=encoded(settings)
+        if target.exists():match(target,dict(identity(target),sha256=sha(configuration)))
+        else:h.storage.atomic_write_bytes(target,configuration)
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            from community_migration import reference_transition_sql
+            reference_transition_sql(z.read('db/002_learning_community.sql'),
+                z.read('db/003_reference_community.sql'),operation,dbplan['versions'])
+        plan={'schema':REFERENCE_PACKAGE_SCHEMA,'context':self.context,'original_plan_sha256':h.digest,
+              'archive':identity(archive),'manifest':identity(manifest),'provenance':provenance,
+              'review_sha256':review_sha256,'before':before,'binding_sha256':sha(encoded(h.binding())),
+              'database':dbplan,'settings':dict(path=str(target),**identity(target))}
+        ident=sha(encoded(plan));folder=self.root/ident
+        h.storage.mkdir_private(self.root);h.storage.mkdir_private(folder)
+        for path in self.root.glob('*/journal.json'):
+            must(h.read(path)['phase'] == 'RESTORED','community_reference_unfinished_attempt')
+        unsigned=folder/'UNSIGNED_PLAN.json'
+        if unsigned.exists():must(unsigned.read_bytes() == encoded(plan),'community_reference_plan_conflict')
+        else:h.storage.atomic_write_bytes(unsigned,encoded(plan))
+        return plan,unsigned
+
+    def verify(self,plan):
+        h=self.host;h.lease.require();h.validate(installing=False);self.require_core()
+        must(set(plan) == {'schema','context','original_plan_sha256','archive','manifest','provenance',
+             'review_sha256','before','binding_sha256','database','settings'} and
+             plan['schema'] == REFERENCE_PACKAGE_SCHEMA,'community_reference_plan')
+        must(plan['context'] == self.context and plan['original_plan_sha256'] == h.digest and
+             plan['binding_sha256'] == sha(encoded(h.binding())) and
+             plan['provenance']['commit'] == self.context['core_commit'],'community_reference_context')
+        ident=sha(encoded(plan));folder=self.root/ident
+        approval=folder/'approval.json'
+        match(approval,dict(identity(approval),sha256=ident))
+        must((identity(approval)['uid'],identity(approval)['gid'],identity(approval)['mode']) ==
+             (*h.owner,0o600) and approval.read_bytes() == encoded(plan),'community_reference_exact_approval')
+        settings=plan['settings'];wanted=dict(settings);wanted.pop('path')
+        expected=h.folder/'reference-material'/plan['database']['operation_id']/'settings.json'
+        must(settings['path'] == str(expected),'community_reference_settings_path')
+        match(expected,wanted)
+        old=Path(h.binding()['config_path']);match(old,h.plan['settings'])
+        original=strict_json(old.read_bytes())
+        must(set(original) == {'COMMUNITY_DATABASE_URL','COMMUNITY_CORE_ORIGIN',
+             'COMMUNITY_WEB_ORIGIN','COMMUNITY_PORT'},'community_reference_original_settings')
+        media=expected.parent/'media'
+        must(strict_json(expected.read_bytes()) == dict(original,COMMUNITY_MEDIA_ROOT=str(media)),
+             'community_reference_settings_values')
+        for path in (expected.parent,media,media/'reference'):
+            h.storage.validate_target(path,exists=True,directory=True,
+                                      expected_owner=h.owner,expected_mode=0o700)
+        return ident,folder
+
+    def candidate(self,plan,channel='bridge'):
+        must(channel in ('bridge','final'),'community_reference_channel')
+        ident=sha(encoded(plan));base=self.host.folder/'reference-releases'/ident
+        key=(ident,channel)
+        if key not in self.candidates:
+            candidate=ReferenceHost(self.host,base/channel,plan,plan['settings'])
+            candidate.source_release=base/'release'
+            self.candidates[key]=candidate
+        return self.candidates[key]
+
+    def materialize(self,plan,archive,manifest):
+        h=self.host;match(archive,plan['archive']);match(manifest,plan['manifest'])
+        raw=Path(archive).read_bytes();mr=Path(manifest).read_bytes()
+        m=verify_archive(raw,mr,plan['provenance'])
+        must(m.get('reference_schema_version') == 3,'community_reference_manifest')
+        release=self.candidate(plan).source_release
+        def put(path,data):
+            for parent in reversed([path.parent,*path.parent.parents]):
+                if parent == h.folder or h.folder in parent.parents:h.storage.mkdir_private(parent)
+            if path.exists():h.storage.file_identity(path,expected_sha256=sha(data),expected_bytes=len(data))
+            else:
+                must(len(data) <= 32*1024*1024,'community_reference_file_limit')
+                def write(fd):h.storage._write(fd,data);return {'sha256':sha(data),'bytes':len(data)}
+                h.storage._atomic(path,write)
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            for item in m['files']:put(release/item['path'],z.read(item['path']))
+        put(release/'manifest.json',mr)
+        for channel in ('bridge','final'):
+            candidate=self.candidate(plan,channel)
+            h.storage.mkdir_private(candidate.release);h.storage.mkdir_private(candidate.release/'process')
+            candidate.role().verify()
+
+    def supervisor_for(self,plan,record,channel):
+        from community_supervision import PackageSupervisor
+        if channel == 'bridge':
+            _,prior=self.previous.active()
+            return PackageSupervisor(self.candidate(plan,channel),sha(encoded(plan)),
+                                     record['predecessor_state_sha256'],prior.state)
+        prior=self.supervisor_for(plan,record,'bridge')
+        return PackageSupervisor(self.candidate(plan,channel),sha(encoded(plan)),
+                                 record['bridge_state_sha256'],prior.state)
+
+    def start(self,plan,record,channel):
+        h=self.host;supervisor=self.supervisor_for(plan,record,channel)
+        operation=record[channel+'_operation_id']
+        must(not supervisor.state.exists(),'community_reference_supervision_already_exists')
+        state={'schema':'ARTLIVE_COMMUNITY_SUPERVISION_V2','plan_sha256':h.digest,
+               'upgrade_sha256':sha(encoded(plan)),'legacy_state_sha256':supervisor.legacy_sha256,
+               'desired':'RUNNING','attempts':[operation],'budget_start':0,'unhealthy':None,
+               'stable':None,'reason':'REFERENCE_'+channel.upper()+'_START_DECISION','resumptions':[]}
+        h.write(supervisor.state,state)
+        self.candidate(plan,channel).role().start(operation)
+
+    def ready(self,plan,record,channel):
+        candidate=self.candidate(plan,channel);supervisor=self.supervisor_for(plan,record,channel)
+        deadline=time.monotonic()+15
+        while True:
+            status=candidate.control('observe')
+            if status == 'READY':break
+            must(status == 'STARTING' and time.monotonic() < deadline,
+                 'community_reference_'+channel+'_not_ready')
+            time.sleep(.05)
+        candidate.preserve_running(supervisor)
+
+    def activate(self,plan,channel):
+        must(channel in ('bridge','final','previous'),'community_reference_activation_channel')
+        ident=sha(encoded(plan));value={'schema':REFERENCE_PACKAGE_SCHEMA,'plan_sha256':ident,'channel':channel}
+        before=identity(self.marker)['sha256'] if self.marker.exists() else None
+        if before is not None:
+            current=self.host.read(self.marker)
+            restored=(current['channel'] == 'previous' and
+                      self.host.read(self.root/current['plan_sha256']/'journal.json')['phase'] == 'RESTORED')
+            must(current['schema'] == REFERENCE_PACKAGE_SCHEMA and
+                 ((current['plan_sha256'] == ident and current['channel'] in ('bridge','final','previous'))
+                  or restored),'community_reference_foreign_active')
+        self.host.storage.atomic_write_json(self.marker,value,replace=before is not None,
+                                           expected_existing_sha256=before)
+
+    def install(self,plan,archive,manifest,*,recover=False,fault=None):
+        h=self.host;ident,folder=self.verify(plan);journal=folder/'journal.json'
+        record=h.read(journal) if journal.exists() else None
+        def phase(value):
+            record['phase']=value;record['history'].append(value);h.write(journal,record)
+            if fault:fault(value)
+        if record is not None:
+            must(record['schema'] == REFERENCE_PACKAGE_SCHEMA and record['plan_sha256'] == ident,
+                 'community_reference_journal')
+            if record['phase'] == 'COMMITTED':
+                active,supervisor=self.active();active.preserve_running(supervisor)
+                return 'COMMITTED_VERIFIED_NOOP'
+            must(recover,'community_reference_explicit_recovery_required')
+            return self.recover(plan,record,phase)
+        must(not recover,'community_reference_not_started')
+        previous,supervisor=self.previous.active()
+        must(previous.preserve_running(supervisor) == plan['before'],
+             'community_reference_process_preimage_drift')
+        db=self.database(plan)
+        must(db.snapshot() == plan['database']['snapshot'],'community_reference_database_preimage_drift')
+        self.materialize(plan,archive,manifest)
+        import uuid
+        record={'schema':REFERENCE_PACKAGE_SCHEMA,'plan_sha256':ident,'phase':'PREPARED',
+                'history':['PREPARED'],**{key:uuid.uuid4().hex for key in
+                ('bridge_operation_id','final_operation_id','resume_previous_operation_id','resume_bridge_operation_id')}}
+        h.write(journal,record)
+        phase('DRAIN_PREVIOUS_INTENT');supervisor.tick(drain=True);self.drain(previous.role())
+        from community_lifecycle import listeners
+        must(not listeners(h.plan['service']['port']),'community_reference_foreign_listener')
+        record['predecessor_state_sha256']=identity(supervisor.state)['sha256'];phase('PREVIOUS_DRAINED')
+        phase('BRIDGE_START_INTENT');self.start(plan,record,'bridge');phase('BRIDGE_STARTED')
+        self.ready(plan,record,'bridge');phase('BRIDGE_ACTIVATE_INTENT');self.activate(plan,'bridge')
+        phase('BRIDGE_READY')
+        phase('DRAIN_BRIDGE_INTENT')
+        bridge=self.candidate(plan,'bridge');bs=self.supervisor_for(plan,record,'bridge')
+        bs.tick(drain=True);self.drain(bridge.role())
+        must(not listeners(h.plan['service']['port']),'community_reference_foreign_listener')
+        record['bridge_state_sha256']=identity(bs.state)['sha256'];phase('BRIDGE_DRAINED')
+        must(db.snapshot() == plan['database']['snapshot'],'community_reference_database_changed')
+        record['backup']=db.backup(folder/'before-reference.dump');phase('BACKUP_VERIFIED')
+        phase('MIGRATION_COMMIT_INTENT')
+        source=bridge.source_release
+        db.migrate((source/'db/002_learning_community.sql').read_bytes(),
+                   (source/'db/003_reference_community.sql').read_bytes())
+        phase('MIGRATED')
+        return self.finish_final(plan,record,phase)
+
+    def finish_final(self,plan,record,phase):
+        must(self.database(plan).status() == 'COMMITTED','community_reference_commit_required')
+        phase('FINAL_START_INTENT');self.start(plan,record,'final');phase('FINAL_STARTED')
+        self.ready(plan,record,'final');phase('FINAL_ACTIVATE_INTENT');self.activate(plan,'final')
+        phase('COMMITTED');return 'COMMITTED'
+
+    def owned_bridge(self,plan,record):
+        bridge=self.candidate(plan,'bridge');supervisor=self.supervisor_for(plan,record,'bridge')
+        must(supervisor.state.exists() and not supervisor.state.is_symlink(),
+             'community_reference_unknown_bridge_start')
+        ledger=supervisor.registered()
+        _,saved=bridge.role().current()
+        attempts=ledger['attempts']
+        must(saved is not None and attempts and attempts[0] == record['bridge_operation_id'] and
+             saved['operation_id'] == attempts[-1],'community_reference_unknown_bridge_start')
+        budget=record.get('bridge_resume_budget_start');resumptions=ledger['resumptions']
+        if resumptions:
+            must(type(budget) is int and budget >= 1 and resumptions ==
+                 [{'operation_id':record['resume_bridge_operation_id'],'budget_start':budget}] and
+                 ledger['budget_start'] >= budget,'community_reference_bridge_resume_ledger')
+        elif budget is not None:
+            must(type(budget) is int and budget == len(attempts) and ledger['desired'] == 'STOPPED',
+                 'community_reference_bridge_resume_ledger')
+        return bridge,supervisor
+
+    def resume_bridge(self,plan,record,phase):
+        bridge,supervisor=self.owned_bridge(plan,record)
+        must(self.database(plan).status(preserved=False) in ('NOT_APPLIED','COMMITTED'),
+             'community_reference_unknown_migration')
+        ledger=supervisor.registered()
+        if not ledger['resumptions'] and ledger['desired'] == 'STOPPED' and 'bridge_resume_budget_start' not in record:
+            record['bridge_resume_budget_start']=len(ledger['attempts']);phase('BRIDGE_RESUME_INTENT')
+        self.resume_owned(bridge,supervisor,record['resume_bridge_operation_id'])
+        bridge.preserve_running(supervisor)
+        self.activate(plan,'bridge');phase('FORWARD_READY')
+        return 'COMPATIBLE_BRIDGE_READY_FORWARD_SCHEMA_RETAINED'
+
+    def resume_owned(self,host,supervisor,operation):
+        """Reconcile an authorized resume; a STARTING receipt is not a retry."""
+        ledger=supervisor.registered();_,saved=host.role().current()
+        must(saved is not None and ledger['attempts'] and
+             saved['operation_id'] == ledger['attempts'][-1],
+             'community_reference_unknown_resume_start')
+        status=host.control('observe')
+        resumed=any(r['operation_id'] == operation for r in ledger['resumptions'])
+        if status in ('READY','STARTING') and ledger['desired'] == 'STOPPED':
+            must(not resumed,'community_reference_resume_already_drained')
+            supervisor.tick(drain=True);self.drain(host.role());status=host.control('observe')
+        if status in ('STOP_INTENT','STOPPING'):
+            self.drain(host.role());status=host.control('observe')
+        if status in ('STOPPED','EXITED'):
+            if not resumed:supervisor.enable(operation)
+            else:must(ledger['desired'] == 'RUNNING','community_reference_resume_already_drained')
+            supervisor.tick()
+        else:
+            must(status in ('READY','STARTING') and ledger['desired'] == 'RUNNING',
+                 'community_reference_resume_not_running')
+            must(status != 'STARTING' or resumed,'community_reference_unknown_resume_start')
+        deadline=time.monotonic()+15
+        while True:
+            status=host.control('observe')
+            if status == 'READY':break
+            must(status == 'STARTING' and time.monotonic() < deadline,
+                 'community_reference_resume_not_ready')
+            time.sleep(.05)
+        host.preserve_running(supervisor)
+
+    def restore_previous(self,plan,record,phase):
+        must(self.database(plan).status(preserved=False) == 'NOT_APPLIED',
+             'community_reference_forward_schema_no_old_restore')
+        bridge=self.candidate(plan,'bridge');bridge_state=bridge.release/'supervision-v2.json'
+        if record['phase'] != 'RESTORE_PREVIOUS_INTENT':
+            record['restore_bridge']=None
+            if 'predecessor_state_sha256' in record and bridge_state.exists():
+                bridge,bs=self.owned_bridge(plan,record)
+                bs.tick(drain=True);self.drain(bridge.role())
+                receipt,saved=bridge.role().current()
+                must(saved['phase'] in ('STOPPED','EXITED'),'community_reference_bridge_not_drained')
+                record['restore_bridge']={'state_sha256':identity(bridge_state)['sha256'],
+                    'receipt_path':str(receipt),'receipt_sha256':identity(receipt)['sha256']}
+            phase('RESTORE_PREVIOUS_INTENT')
+        else:
+            # The old package's state may now have advanced. Recheck the frozen
+            # stopped bridge directly, without reusing its old legacy hash.
+            frozen=record['restore_bridge']
+            if frozen is None:
+                must(not bridge_state.exists(),'community_reference_unexpected_bridge_ledger')
+            else:
+                receipt,saved=bridge.role().current()
+                must(str(receipt) == frozen['receipt_path'] and saved['phase'] in ('STOPPED','EXITED') and
+                     identity(receipt)['sha256'] == frozen['receipt_sha256'] and
+                     identity(bridge_state)['sha256'] == frozen['state_sha256'],
+                     'community_reference_restored_bridge_drift')
+        previous,supervisor=self.previous.active()
+        self.resume_owned(previous,supervisor,record['resume_previous_operation_id'])
+        self.activate(plan,'previous');phase('RESTORED');return 'RESTORED'
+
+    def recover(self,plan,record,phase):
+        """Continue known boundaries; never execute SQL or replay a spawn."""
+        h=self.host;state=record['phase']
+        if state == 'PREPARED':
+            previous,supervisor=self.previous.active()
+            must(previous.preserve_running(supervisor) == plan['before'],'community_reference_preimage_drift')
+            phase('RESTORED');return 'RESTORED_NOT_STARTED'
+        if state == 'RESTORED':
+            must(self.database(plan).status(preserved=False) == 'NOT_APPLIED',
+                 'community_reference_forward_schema_no_old_restore')
+            previous,supervisor=self.previous.active();previous.preserve_running(supervisor)
+            return 'RESTORED_VERIFIED_NOOP'
+        if state in ('DRAIN_PREVIOUS_INTENT','PREVIOUS_DRAINED','RESTORE_PREVIOUS_INTENT'):
+            return self.restore_previous(plan,record,phase)
+        if state == 'MIGRATION_COMMIT_INTENT':
+            outcome=self.database(plan).status()
+            must(outcome in ('NOT_APPLIED','COMMITTED'),'community_reference_unknown_migration')
+            if outcome == 'COMMITTED':phase('MIGRATED');return self.finish_final(plan,record,phase)
+            return self.restore_previous(plan,record,phase)
+        if state == 'MIGRATED':return self.finish_final(plan,record,phase)
+        if state in ('FINAL_START_INTENT','FINAL_STARTED','FINAL_ACTIVATE_INTENT'):
+            final=self.candidate(plan,'final');_,saved=final.role().current()
+            must(saved is not None and saved['operation_id'] == record['final_operation_id'],
+                 'community_reference_unknown_final_start')
+            status=final.control('observe')
+            if status == 'READY':
+                self.ready(plan,record,'final');self.activate(plan,'final');phase('COMMITTED')
+                return 'COMMITTED_RECONCILED'
+            self.drain(final.role());return self.resume_bridge(plan,record,phase)
+        if state in ('BRIDGE_START_INTENT','BRIDGE_STARTED','BRIDGE_ACTIVATE_INTENT','BRIDGE_READY',
+                     'DRAIN_BRIDGE_INTENT','BRIDGE_DRAINED','BACKUP_VERIFIED','BRIDGE_RESUME_INTENT','FORWARD_READY'):
+            bridge,_=self.owned_bridge(plan,record)
+            outcome=self.database(plan).status(preserved=False)
+            must(outcome in ('NOT_APPLIED','COMMITTED'),'community_reference_unknown_migration')
+            if outcome == 'NOT_APPLIED':return self.restore_previous(plan,record,phase)
+            return self.resume_bridge(plan,record,phase)
+        raise ValueError('community_reference_recovery_phase')
+
+    def active(self):
+        h=self.host;h.lease.require()
+        if not self.marker.exists():return self.previous.active()
+        marker=h.read(self.marker);ident=marker.get('plan_sha256');channel=marker.get('channel')
+        must(marker == {'schema':REFERENCE_PACKAGE_SCHEMA,'plan_sha256':ident,'channel':channel} and
+             re.fullmatch('[a-f0-9]{64}',str(ident)) and channel in ('bridge','final','previous'),
+             'community_reference_active_pointer')
+        folder=self.root/ident;plan=h.read(folder/'approval.json');self.verify(plan)
+        record=h.read(folder/'journal.json')
+        must(record['schema'] == REFERENCE_PACKAGE_SCHEMA and record['plan_sha256'] == ident,
+             'community_reference_active_journal')
+        if channel == 'previous':
+            must(record['phase'] in ('RESTORE_PREVIOUS_INTENT','RESTORED'),
+                 'community_reference_previous_not_restored')
+            return self.previous.active()
+        if channel == 'final':
+            must(record['phase'] in ('FINAL_ACTIVATE_INTENT','COMMITTED'),
+                 'community_reference_final_not_committed')
+        return self.candidate(plan,channel),self.supervisor_for(plan,record,channel)

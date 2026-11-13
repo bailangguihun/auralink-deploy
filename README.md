@@ -139,8 +139,8 @@ r25-controller-<sha>-<run>-<attempt>
 
 - [Core API Release Contract](r25/CORE_RELEASE_CONTRACT.md)
 - [AI Release Contract](r25/AI_RELEASE_CONTRACT.md)
-- [Community 运行合同](docs/community-runtime-contract.md)与[schema 2／私有图片升级合同](docs/community-learning-upgrade.md)：现有一次性发布链仍需单独审查的有限 successor，不能直接重复执行旧安装事务
-- [原版社区 2.0／schema 3 发布边界](docs/community-reference-v2-publication.md)：已实现固定 SQL renderer 和包校验；尚无绑定当前生产链的有限迁移执行器，Web 切换仍有后端/媒体/WebSocket 前置条件
+- [Community 运行合同](docs/community-runtime-contract.md)与[schema 2／私有图片升级合同](docs/community-learning-upgrade.md)：记录基础合同、002 增量与早期一次性事务；当前 schema 3 的发布顺序使用下项 Reference 后继，不能重复执行旧安装事务
+- [原版社区 2.0／schema 3 发布边界](docs/community-reference-v2-publication.md)：有限 Reference 后继绑定当前 Studio 与已提交 Community 包；兼容新包先服务旧 schema，再单事务迁移并前向恢复，Web 在后端、媒体和同源 WebSocket 接受后发布。正式制品、具体计划审核与生产回执分别记录
 
 生产数据库、媒体、模型文件、环境包装器与凭据始终保留在服务器侧，并由单独授权的运维流程管理。
 
