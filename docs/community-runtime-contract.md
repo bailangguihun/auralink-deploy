@@ -1,7 +1,11 @@
 # Community runtime candidate
 
-This library is not installed or registered with the production watchdog.
-The new [host adapter](community-host-publication.md) adds an explicitly bound
+The foundation publication narrative below records the original candidate and
+first-install contract, not the current production installation status. Inspect
+the current managed proof chain before operating. The schema 2 image/growth
+upgrade is not deployed by this change; see the [upgrade contract](community-learning-upgrade.md)
+for its media configuration, explicit migration and required finite successor.
+The [host adapter](community-host-publication.md) adds an explicitly bound
 operator CLI and finite first-install transaction, without authorizing their
 production execution or a migration. The separate finite publication successor adds exact proof verification and
 the optional original-watchdog hook; VMM execution policy and modules remain unchanged. Modules ship as a separate package-only artifact.
@@ -18,8 +22,11 @@ it contains neither runtime credentials nor a Node executable.
 release root and manifest hash/provenance, canonical Node executable/hash/exact
 version, private JSON settings path/hash, and a loopback port. The supported
 tested Node majors are 22 and 24, with minimum 22.13.0. Every shipped file is
-verified before starting. The process receives exactly the four COMMUNITY_*
-settings; no inherited NODE_OPTIONS, database credentials or provider keys.
+verified before starting. Schema 1 receives exactly the four COMMUNITY_*
+settings. A schema 2 bundle may add only COMMUNITY_MEDIA_ROOT, bound to the
+private media directory beside its settings file; native OS/architecture/libc
+must match its manifest. No NODE_OPTIONS, database credentials or provider keys
+are inherited from the caller environment.
 
 The host adapter calls the library as the intended service UID/GID and
 prepare private 0700 roots and 0600 files owned by that identity. This candidate
@@ -54,7 +61,7 @@ service. Core's companion integration test separately runs the actual JAR,
 actual Node service and native PostgreSQL, including in-flight transaction
 drain and restart persistence. Neither test is production acceptance.
 
-## Host-specific publication status
+## Historical foundation publication plan
 
 1. The original WSL/SSH inspection of current proof chain, service identity,
    Node/Python, loopback port, private roots, resources and HBA is recorded in
@@ -62,7 +69,7 @@ drain and restart persistence. Neither test is production acceptance.
    is not used as the installed contract.
 2. Review the added host adapter and finite new-directory installation
    transaction, using the installed guard's actual lease verifier.
-   The new host adapter is still uninstalled. Persistent plans register with
+   The original plan required installing this adapter. Persistent plans register with
    the original watchdog, with one initial start plus two total restarts; the
    older foreground runner is only for explicit zero-restart plans.
 3. Bind the actual release artifacts, explicit community-only migration,
@@ -73,8 +80,9 @@ drain and restart persistence. Neither test is production acceptance.
 5. Publish compatible Core, Community and Web in order, then verify two-account
    business behavior and preservation of the existing application baseline.
 
-The installed Core publisher still refuses the new candidate. The
-[finite successor](community-publication-successor.md) implements that prerequisite
-for review; it has not been released or installed. No final
-production approval digest or formal release artifact has been invented.
-Community has no GPU/VMM dependency.
+The original plan required the [finite successor](community-publication-successor.md)
+before publishing the changed Core. Those first-install prerequisites do not
+establish the current installed state. Schema 2 requires the separately reviewed
+successor described in the [upgrade contract](community-learning-upgrade.md),
+bound to current proofs, media settings and the migration receipt. Community
+has no GPU/VMM dependency.

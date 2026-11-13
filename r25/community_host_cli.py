@@ -62,13 +62,17 @@ def supervision_command(host, command, bundle, *, supervisor=None, operation_id=
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover'])
+    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover','reference-prepare','reference-install','reference-recover'])
     for name in ['plan','plan-sha256','bundle-manifest-sha256']:p.add_argument('--'+name,required=True)
     for name in ['archive','manifest','settings','node','approval','operation-id','package-plan','package-plan-sha256','review-sha256']:p.add_argument('--'+name)
     p.add_argument('--lease-fd',type=int)
     p.add_argument('--knowledge-publication-sha256')
     p.add_argument('--supervision-upgrade-sha256')
     p.add_argument('--studio-publication-sha256')
+    p.add_argument('--reference-publication-sha256')
+    p.add_argument('--reference-plan')
+    p.add_argument('--reference-plan-sha256')
+    p.add_argument('--database-plan')
     a=p.parse_args()
     if (a.lease_fd is not None) != a.command.startswith('watchdog-'):
         raise ValueError('community_watchdog_inherited_lease_required')
@@ -79,9 +83,18 @@ def main():
     if raw!=encoded(plan) or sha(raw)!=a.plan_sha256:raise ValueError('community_exact_plan_bytes')
     binding=plan['lease']
     legacy_sha=None
+    if a.command.startswith('reference-') and not a.reference_publication_sha256:
+        raise ValueError('community_reference_binding_required')
     if a.command.startswith('package-') and not a.studio_publication_sha256:
         raise ValueError('community_package_requires_studio')
-    if a.studio_publication_sha256:
+    if a.reference_publication_sha256:
+        if not all([a.knowledge_publication_sha256,a.supervision_upgrade_sha256,a.studio_publication_sha256]) or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve','reference-prepare','reference-install','reference-recover'):
+            raise ValueError('community_reference_scope')
+        from community_host import reference_lease_binding
+        binding,legacy_sha=reference_lease_binding(plan,a.plan_sha256,a.bundle_manifest_sha256,
+            a.knowledge_publication_sha256,a.supervision_upgrade_sha256,a.studio_publication_sha256,
+            a.reference_publication_sha256)
+    elif a.studio_publication_sha256:
         if not a.knowledge_publication_sha256 or not a.supervision_upgrade_sha256 or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover'):
             raise ValueError('community_studio_scope')
         from community_host import studio_lease_binding
@@ -109,7 +122,28 @@ def main():
     if a.supervision_upgrade_sha256:
         from community_supervision import RecoverySupervisor
         supervisor=RecoverySupervisor(host,a.supervision_upgrade_sha256,legacy_sha)
-    if a.command.startswith('package-') or (a.studio_publication_sha256 and (host.folder/'RELEASE_ACTIVE.json').exists()):
+    if a.reference_publication_sha256:
+        from community_host import ReferencePackageUpgrade,reference_package_context
+        with lease.held():
+            service=ReferencePackageUpgrade(host,supervisor,reference_package_context(host,a.reference_publication_sha256))
+            if a.command=='reference-prepare':
+                if not all([a.archive,a.manifest,a.review_sha256,a.database_plan]):
+                    raise ValueError('community_reference_material_required')
+                manifest=json.loads(Path(a.manifest).read_bytes())
+                provenance={k:manifest[k] for k in ('commit','run_id','run_attempt')}
+                value,path=service.prepare(a.archive,a.manifest,provenance,a.review_sha256,a.database_plan)
+                print(json.dumps(dict(community='UNSIGNED_REFERENCE_PLAN',plan_sha256=sha(encoded(value)),path=str(path))))
+                return
+            if a.command in ('reference-install','reference-recover'):
+                if not all([a.reference_plan,a.reference_plan_sha256,a.archive,a.manifest]):
+                    raise ValueError('community_reference_exact_plan_required')
+                raw=Path(a.reference_plan).read_bytes();value=json.loads(raw)
+                if raw!=encoded(value) or sha(raw)!=a.reference_plan_sha256:
+                    raise ValueError('community_reference_exact_plan')
+                result=service.install(value,a.archive,a.manifest,recover=a.command=='reference-recover')
+                print(json.dumps(dict(community=result)));return
+            host,supervisor=service.active()
+    elif a.command.startswith('package-') or (a.studio_publication_sha256 and (host.folder/'RELEASE_ACTIVE.json').exists()):
         from community_host import PackageUpgrade,package_context
         with lease.held():
             service=PackageUpgrade(host,supervisor,package_context(host,a.studio_publication_sha256))

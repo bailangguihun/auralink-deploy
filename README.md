@@ -11,6 +11,7 @@ ArtLIVE 多仓库系统的部署配置与发布控制中心。该仓库维护 R2
 | R25 发布控制 | 绑定组件版本、生成发布制品、验证控制器事务与恢复路径 |
 | Core API 发布契约 | 定义 Core 候选、验收、发布和回滚边界 |
 | AI 发布契约 | 定义 Guide/Critic 候选、运行配置与发布边界 |
+| Community 发布契约 | 校验独立服务制品、显式迁移、私有媒体与受管生命周期；schema 2/3 增量尚未部署 |
 | 配置验证 | 校验 Shell、Compose 与 R25 Python 控制器 |
 | 旧 Compose 模板 | 保留 Web、Core API、VMM、Vision 与 Nginx 的 legacy 配置 |
 
@@ -138,6 +139,8 @@ r25-controller-<sha>-<run>-<attempt>
 
 - [Core API Release Contract](r25/CORE_RELEASE_CONTRACT.md)
 - [AI Release Contract](r25/AI_RELEASE_CONTRACT.md)
+- [Community 运行合同](docs/community-runtime-contract.md)与[schema 2／私有图片升级合同](docs/community-learning-upgrade.md)：记录基础合同、002 增量与早期一次性事务；当前 schema 3 的发布顺序使用下项 Reference 后继，不能重复执行旧安装事务
+- [原版社区 2.0／schema 3 发布边界](docs/community-reference-v2-publication.md)：有限 Reference 后继绑定当前 Studio 与已提交 Community 包；兼容新包先服务旧 schema，再单事务迁移并前向恢复，Web 在后端、媒体和同源 WebSocket 接受后发布。正式制品、具体计划审核与生产回执分别记录
 
 生产数据库、媒体、模型文件、环境包装器与凭据始终保留在服务器侧，并由单独授权的运维流程管理。
 
