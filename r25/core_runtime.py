@@ -446,7 +446,7 @@ class CoreRuntime:
         successful and recovery paths; an exhausted budget is never reset.
         """
         value=guard.policy()
-        if value.get('upgrade',{}).get('core_followup',{}).get('schema') not in {'R25_KNOWLEDGE_CORE_PUBLICATION_V1','R25_STUDIO_CORE_PUBLICATION_V1'}:
+        if value.get('upgrade',{}).get('core_followup',{}).get('schema') not in {'R25_KNOWLEDGE_CORE_PUBLICATION_V1','R25_STUDIO_CORE_PUBLICATION_V1','R25_REFERENCE_CORE_PUBLICATION_V1'}:
             if not resuming:engine.community_action('drain',self.fd)
             return
         must(self.tx is not None,'knowledge_maintenance_transaction')

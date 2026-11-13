@@ -358,3 +358,30 @@ def render_studio_lifecycle(before):
     raw=replace_once(before,anchor,addition+anchor,'community_studio_method')
     ast.parse(raw)
     return raw
+
+
+def render_reference_lifecycle(before):
+    """Select one reviewed successor while retaining every Studio argument."""
+    if before.count(b"extra+=['--studio-publication-sha256',studio_id]") != 1:
+        raise OverlayRefused('reference_requires_studio_lifecycle')
+    anchor=b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+    addition=b'''        reference=self.root/'runtime/vmm-controller/REFERENCE_PUBLICATION_ACTIVE.json'
+        if reference.exists() or reference.is_symlink():
+            guard(reference,self.private)
+            pointer=json.loads(reference.read_bytes());reference_id=pointer.get('approval_sha256')
+            must(re.fullmatch('[a-f0-9]{64}',str(reference_id)) and pointer=={'schema':'R25_REFERENCE_PUBLICATION_ACTIVE_V1','approval_sha256':reference_id},'community_reference_pointer')
+            folder=self.root/'runtime/core-publications/controller-upgrades'/reference_id
+            approval=folder/'approval.json';guard(approval,self.private,0o600,reference_id)
+            raw=approval.read_bytes();must(hashlib.sha256(raw).hexdigest()==reference_id,'community_reference_approval_changed')
+            approved=json.loads(raw);journal=folder/'journal.json';guard(journal,self.private)
+            receipt=json.loads(journal.read_bytes())
+            must(approved['schema']=='R25_REFERENCE_CORE_PUBLICATION_BINDING_V1' and receipt['approval_sha256']==reference_id and receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_reference_not_installed')
+            must(approved['vmm']['studio']['marker']=={'schema':'R25_STUDIO_PUBLICATION_ACTIVE_V1','approval_sha256':studio_id},'community_reference_parent')
+            community=approved['vmm']['community'];guard(marker,self.private,0o600,community['registration_sha256'])
+            must(record['plan_sha256']==community['plan_sha256'],'community_reference_plan')
+            record=dict(record,controller_manifest_sha256=community['deploy']['manifest_sha256'],cli_sha256=community['cli_sha256'])
+            extra+=['--reference-publication-sha256',reference_id]
+'''
+    raw=replace_once(before,anchor,addition+anchor,'community_reference_method')
+    ast.parse(raw)
+    return raw

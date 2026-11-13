@@ -1,6 +1,6 @@
 # 原版社区 2.0 的 schema 3 发布边界
 
-本轮配合 Web 的原版 DOM/CSS/JS 移植和 Core 的异步 PostgreSQL 帖子/房间移植，准备 schema 3 的制品与迁移合同。生产未执行本轮迁移、安装或激活。本文不是生产执行批准，也不把本地运行、源码合并、包校验或候选 SQL 当成上线证明。
+社区 2.0 发布采用绑定当前 Studio/Community 安装链的有限 Reference 后继。控制器保留原共享租约、历史批准和包指针；同一个正式新包先在旧 schema 下运行，再执行精确前向迁移，最后切换新的受管进程。源码实现和隔离测试不等于生产已经安装或激活，实际状态以具体发布回执为准。
 
 来源为用户提供的本地 `国画社区系统2.0/国画社区系统2.0`。七个原文件的 SHA-256 清单见匹配 Web `docs/community-v2-reference.md`；后端来源与 UUID 兼容投影见 Core `community-service/docs/reference-v2.md`。原目录、SQLite 数据、密码、默认管理员和演示互动均不导入或修改。
 
@@ -27,7 +27,7 @@ Core 的显式 `003_reference_community.sql` 以当前 `[1,2]` schema 为前驱�
 
 [community_migration.py](../r25/community_migration.py) 已增加 `reference_schema_sql` 和 `REFERENCE_VERIFY_SQL`。最终 003 SHA-256 固定为 `f6dc7b8b7abfcb872f38fd396abb860e4c6e90c9e44e761dee190baa92b88c54`。渲染器要求数据库为 `artlive_community`、前驱恰为 `[1,2]`、操作 ID 合法，使用迁移角色、单事务、5 秒锁超时和 60 秒语句超时；添加 `reference_publication_receipt` 和最小运行权限。操作账本不授予 DELETE，墨币流水只增不改。丢失提交回包后通过验证 SQL 读取原操作回执、schema 和权限，不盲目重跑。
 
-渲染器只返回 SQL 字节，不执行迁移、不切换进程或激活标记。原生 PostgreSQL 最小角色测试已经完成，但当前没有绑定已安装生产链的 schema 3 有限迁移执行器。不能复用只处理 002 的 `learning_schema_sql`，也不能因 renderer 和包校验存在就直接上线。
+单独的渲染器只返回 SQL 字节。`reference_transition_sql` 将精确 `[1]` 前驱的 002+003 合成一个事务，或从精确 `[1,2]` 仅应用 003；两个源文件都固定摘要。运行中的原包不能在提交 schema 2/3 后重启，因此实际执行必须通过下文的兼容桥接流程。不能把 renderer 或包校验直接当成上线入口。
 
 旧 `community.operations` 与新 `v2_operations` 是两套保留的回执。后者记录 `RUNNING/COMMITTED/FAILED`，未观察到完成不是重新提交 SQL 或业务请求的授权。未知迁移结果必须先读原操作回执和当前 schema，不恢复旧全库、不重建账号、不清除业务历史。
 
@@ -45,13 +45,21 @@ Community 仍使用独立 runtime DB 身份、原有 loopback Core/Web/端口配
 
 本地 3000/5000/3178 端口和真实数据副本克隆只是开发运行配置，不是服务器安装路径、发布目标或生产验收。真实密码、Key、cookie、数据库、截图和媒体不进入代码仓库。
 
-## 现有一次性发布链与有限 successor
+## 现有一次性发布链与有限 Reference 后继
 
-当前 `PackageUpgrade` 是绑定旧安装链的有限一次性事务，存在激活标记时不能重复准备。本轮的包清单/schema 渲染能力不等于它已成为通用 schema 3 升级器，也没有新的生产迁移、受管启动或激活实证。
+原 `PackageUpgrade` 仍是一次性事务，既有 `RELEASE_ACTIVE.json`、approval、COMMITTED journal 和旧进程记录全部保留。新 `ReferencePackageUpgrade` 使用独立 `reference-upgrades`、`reference-releases` 与 `REFERENCE_ACTIVE.json`，不会删除旧标记或普遍接纳任意已提交前驱。
 
-后续正式执行仍需单独审查的有限 successor：精确绑定当前 release、控制器/配置摘要、原共享租约、当前拥有的 Community 进程、私有目录、正式新制品、迁移 ID/摘要和前驱证明。持原共享租约排空当前进程，再做受控迁移、配置和启动，并保留失败尝试与恢复证据。禁止删除锁、手工拉起 Node/Java/Next 或用旧 first-install 方案覆盖当前安装。
+`prepare-reference-publication` / `preflight-reference-publication` / `bind-reference-publication` / `recover-reference-publication` 绑定已提交的 Studio Core。Core V001–V017、AI 身份、应用配置和既有历史证明保持；新 Core 候选须由正式 release/run/attempt 制品验证。保留的 Studio 前像用于递归核验原链，不改写旧批准。
 
-回退必须保留 schema 3 新增的房间、门票、墨币流水、AI 草稿及旧成长数据和所有媒体，不执行反向 DDL 或恢复历史整库。回退到旧应用是否仍可写、触发器和权限是否兼容，须在具体 successor 中验收，不能仅由旧健康合同推定安全。
+Community 的 `reference-prepare` 只在匹配新 Core 已 COMMITTED 后准备私有计划；通过 `--reference-publication-sha256` 选择原 CLI，继续传入 Knowledge、supervision 和 Studio 的准确身份。私有 `--database-plan` 绑定原 native ops 备份账号、实际 OS UID/GID/groups、口令文件摘要、原 socket/端口、三个 PG 工具、原生共享库目录的完整文件及别名映射和只读数据前像，不含口令字节。计划生成后须审核原始精确字节并保存独立 approval；`reference-install` / `reference-recover` 只接受该计划摘要。
+
+正常顺序为：排空拥有的旧包 → 同一正式新包以 schema 1/2 启动并验证旧接口 → 排空桥接进程 → 验证数据库前像及私有备份 → 记录 `MIGRATION_COMMIT_INTENT` → 单事务迁移 → 读取原操作回执 → 以独立 operation/进程账本启动同一包的最终进程 → 原子激活 Reference 指针。媒体根在私有 `reference-material/<operation>/media`，包含 `reference` 子目录，旧配置和文件保持原样。
+
+迁移失去回复时，recover 只核对原 operation 的 receipt、schema、权限和原数据指纹，不再执行迁移。已知迁移完成后才继续尚未开始的最终启动；没有启动回执的 `START_INTENT` 拒绝重放。schema 提交后，恢复使用已经验证过的兼容新包，不再启动不支持前向 schema 的旧包。桥接/最终进程分别保留 V2 尝试和预算，部署 FD 不传给业务 Node。
+
+确认没有提交迁移时，恢复会排空已确认归属的桥接进程，再将服务交回原包；独立 Reference 指针记录 `previous`，本次计划进入 `RESTORED`，原始批准和所有启动记录保留。新的操作 ID 和新计划可以重新准备与审核，不会重放原迁移。已经交回服务后的幂等核验只检查相应 schema、固定回执与受管进程，允许正常业务数据继续增长。已经登记恢复且仍为 `STARTING` 的同一进程只等待就绪，不再次启动或重置预算。
+
+恢复保留 schema 3 新增的房间、门票、墨币流水、AI 草稿、旧成长数据和所有媒体，不执行反向 DDL 或恢复历史整库。`COMPATIBLE_BRIDGE_READY_FORWARD_SCHEMA_RETAINED` 表示兼容桥接包已恢复服务，仍须处理本次最终发布，不等于新 Web 已上线。未知迁移、进程归属漂移或无法确认的启动必须停在可检查状态。
 
 ## 验证分层与待验收项
 
@@ -65,7 +73,9 @@ Community 仍使用独立 runtime DB 身份、原有 loopback Core/Web/端口配
 | 原生迁移 | 固定 003 摘要的隔离原生 PostgreSQL 最小 runtime 角色七组合同通过；不是生产迁移回执 |
 | 本地包夹具 | 确定性生成、native 解码及 13 项负测已完成；最终文件数/大小/摘要以 `PACKAGE_FIXTURE_RESULT.json` 对应快照为准，非 release |
 | Deploy 合同 | `deploy-final-tests.log` 记录 102 项通过；没有因此执行生产安装或激活 |
-| 正式发布 | 有限 successor、受信制品、迁移回执、当前 release/进程身份及业务验收仍未形成生产闭环 |
+| 有限控制器 | Reference → Studio 原链、不可变父证明及 17 项 Core 迁移回归；以最终 CI 为准 |
+| 前向迁移 | `scripts/rehearse-community-reference.py` 使用全新 PG16 集群验证两种前驱、事务回滚、失回对账、数据及权限；正式打包前重复执行 |
+| 正式发布 | 仍要求真实 release 制品、具体计划批准、实际迁移/激活回执和匹配 Web/WS 业务验收；隔离测试不替代生产闭环 |
 
 钱包、任务和收益 GET 保留原版懒建钱包/结算逻辑，会改变本地数据库；打开社区的测试不能归类为数据库只读。原版功能代码存在，也不等于所有成员治理、门票/七天/退款、私有作品、共享/断线/重启或真实麦克风路径都已覆盖。
 
