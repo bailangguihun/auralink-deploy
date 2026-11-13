@@ -113,8 +113,18 @@ class Role:
         must(observed == b['node_version'], 'community_node_version_changed')
         env = self.storage.read_private_record(b['config_path'],expected_sha256=b['config_sha256'])
         must(Path(b['config_path']).lstat().st_nlink == 1, 'community_config_hardlink')
-        must(set(env) == {'COMMUNITY_DATABASE_URL','COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_PORT'}, 'community_config_keys')
+        required_keys = {'COMMUNITY_DATABASE_URL','COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_PORT'}
+        must(set(env) in (required_keys, required_keys | {'COMMUNITY_MEDIA_ROOT'}), 'community_config_keys')
         must(all(type(v) is str for v in env.values()), 'community_config_values')
+        if 'COMMUNITY_MEDIA_ROOT' in env:
+            must(m.get('learning_schema_version') == 2, 'community_media_requires_learning_bundle')
+            media_root = Path(env['COMMUNITY_MEDIA_ROOT'])
+            must(media_root.is_absolute() and media_root == Path(b['config_path']).parent/'media', 'community_media_root_binding')
+            self.storage.validate_target(media_root, exists=True, directory=True)
+        if m.get('runtime_platform'):
+            probe = subprocess.run([str(node),'-p',"JSON.stringify({os:process.platform,arch:process.arch,libc:process.report.getReport().header.glibcVersionRuntime?'glibc':'musl'})"], env={}, capture_output=True, check=True, timeout=5)
+            observed_platform = strict_json(probe.stdout)
+            must(all(observed_platform[k] == m['runtime_platform'][k] for k in ('os','arch','libc')), 'community_native_platform_changed')
         core, web, db = (urlsplit(env[k]) for k in ('COMMUNITY_CORE_ORIGIN','COMMUNITY_WEB_ORIGIN','COMMUNITY_DATABASE_URL'))
         must(core.scheme == 'http' and core.hostname == '127.0.0.1' and core.port and not core.username and
              core.path in ('','/') and not core.query and not core.fragment, 'community_core_origin')
