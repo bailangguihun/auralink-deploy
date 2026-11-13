@@ -51,9 +51,9 @@ Community 仍使用独立 runtime DB 身份、原有 loopback Core/Web/端口配
 
 `prepare-reference-publication` / `preflight-reference-publication` / `bind-reference-publication` / `recover-reference-publication` 绑定已提交的 Studio Core。Core V001–V017、AI 身份、应用配置和既有历史证明保持；新 Core 候选须由正式 release/run/attempt 制品验证。保留的 Studio 前像用于递归核验原链，不改写旧批准。
 
-Community 的 `reference-prepare` 只在匹配新 Core 已 COMMITTED 后准备私有计划；通过 `--reference-publication-sha256` 选择原 CLI，继续传入 Knowledge、supervision 和 Studio 的准确身份。私有 `--database-plan` 绑定原 native ops 备份账号、实际 OS UID/GID/groups、口令文件摘要、原 socket/端口、三个 PG 工具、原生共享库目录的完整文件及别名映射和只读数据前像，不含口令字节。计划生成后须审核原始精确字节并保存独立 approval；`reference-install` / `reference-recover` 只接受该计划摘要。
+Community 的 `reference-prepare` 只在匹配新 Core 已 COMMITTED 后准备私有计划；通过 `--reference-publication-sha256` 选择原 CLI，继续传入 Knowledge、supervision 和 Studio 的准确身份。私有 `--database-plan` 绑定原 native ops 备份账号、实际 OS UID/GID/groups、口令文件摘要、原 socket/端口、三个 PG 工具、原生共享库目录的完整文件及别名映射和只读数据前像，不含口令字节。计划生成后须审核原始精确字节并保存独立 approval；`reference-install` / `reference-recover` 通过 `--reference-plan` 与 `--reference-plan-sha256` 接受该计划及其摘要，并同时核对 `--archive` 与 `--manifest`。
 
-正常顺序为：排空拥有的旧包 → 同一正式新包以 schema 1/2 启动并验证旧接口 → 排空桥接进程 → 验证数据库前像及私有备份 → 记录 `MIGRATION_COMMIT_INTENT` → 单事务迁移 → 读取原操作回执 → 以独立 operation/进程账本启动同一包的最终进程 → 原子激活 Reference 指针。媒体根在私有 `reference-material/<operation>/media`，包含 `reference` 子目录，旧配置和文件保持原样。
+正常顺序为：排空拥有的旧包 → 同一正式新包以 schema 1/2 启动并通过受管健康检查 → 排空桥接进程 → 验证数据库前像及私有备份 → 记录 `MIGRATION_COMMIT_INTENT` → 单事务迁移 → 读取原操作回执 → 以独立 operation/进程账本启动同一包的最终进程 → 原子激活 Reference 指针。健康检查核对拥有的进程、监督账本、监听器和 `/health`；认证旧接口、媒体与 WebSocket 的业务验收仍须单独实际执行。媒体根在私有 `reference-material/<operation>/media`，包含 `reference` 子目录，旧配置和文件保持原样。
 
 迁移失去回复时，recover 只核对原 operation 的 receipt、schema、权限和原数据指纹，不再执行迁移。已知迁移完成后才继续尚未开始的最终启动；没有启动回执的 `START_INTENT` 拒绝重放。schema 提交后，恢复使用已经验证过的兼容新包，不再启动不支持前向 schema 的旧包。桥接/最终进程分别保留 V2 尝试和预算，部署 FD 不传给业务 Node。
 
