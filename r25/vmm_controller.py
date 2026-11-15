@@ -3136,8 +3136,10 @@ def code_core_runtime(rt):
             os.close(directory_fd);directory_fd=next_fd
         parent=os.fstat(directory_fd)
         must(stat.S_ISDIR(parent.st_mode) and
-             (parent.st_uid,parent.st_gid,stat.S_IMODE(parent.st_mode))==(*rt.private,0o700),
+             (parent.st_uid,parent.st_gid,stat.S_IMODE(parent.st_mode))==(*rt.scripts,0o700),
              'community_code_runtime_jar_directory_identity')
+        directory_identity={'device':parent.st_dev,'inode':parent.st_ino,
+                            'uid':parent.st_uid,'gid':parent.st_gid,'mode':0o700}
         fd=os.open(jar.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,dir_fd=directory_fd)
         before=os.fstat(fd)
         must(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and
@@ -3159,7 +3161,8 @@ def code_core_runtime(rt):
         if fd is not None:os.close(fd)
         if directory_fd is not None:os.close(directory_fd)
     must(actual==current['release']['artifact_sha256'],'community_code_runtime_jar_changed')
-    return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual}
+    return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual,
+            'jar_directory':directory_identity}
 
 
 def code_controller_sources(rt,plan):

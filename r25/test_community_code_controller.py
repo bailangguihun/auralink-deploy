@@ -164,10 +164,11 @@ class FormalRuntimeBoundary(unittest.TestCase):
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
 import vmm_controller as v
-rt=v.Runtime(Path(sys.argv[2]),Path(sys.argv[2])/'unused-lock',private=(int(sys.argv[3]),int(sys.argv[4])))
+rt=v.Runtime(Path(sys.argv[2]),Path(sys.argv[2])/'unused-lock',private=(int(sys.argv[3]),int(sys.argv[4])),scripts=(int(sys.argv[5]),int(sys.argv[4])))
 print(json.dumps(v.code_core_runtime(rt)))
 """
-            result=subprocess.run([sys.executable,'-I','-B','-c',code,str(bundle),str(root),str(os.geteuid()),str(os.getegid())],
+            script_uid=os.geteuid()+1 if alter=='owner_policy' else os.geteuid()
+            result=subprocess.run([sys.executable,'-I','-B','-c',code,str(bundle),str(root),str(os.geteuid()),str(os.getegid()),str(script_uid)],
                                   env={},capture_output=True,text=True,timeout=10)
             return result,v.sha(jar)
 
@@ -183,6 +184,11 @@ print(json.dumps(v.code_core_runtime(rt)))
 
     def test_writable_jar_parent_is_refused(self):
         result,_=self.formal_runtime('directory')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('runtime_jar_directory_identity',result.stderr)
+
+    def test_jar_parent_must_match_the_retained_script_owner(self):
+        result,_=self.formal_runtime('owner_policy')
         self.assertNotEqual(result.returncode,0)
         self.assertIn('runtime_jar_directory_identity',result.stderr)
 
