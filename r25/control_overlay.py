@@ -385,3 +385,29 @@ def render_reference_lifecycle(before):
     raw=replace_once(before,anchor,addition+anchor,'community_reference_method')
     ast.parse(raw)
     return raw
+
+
+def render_community_code_lifecycle(before):
+    """Route the original watchdog through one exact code-only successor."""
+    if before.count(b"extra+=['--reference-publication-sha256',reference_id]")!=1:
+        raise OverlayRefused('community_code_requires_reference_lifecycle')
+    anchor=b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+    addition=b'''        code=self.root/'runtime/vmm-controller/COMMUNITY_CODE_PUBLICATION_ACTIVE.json'
+        if code.exists() or code.is_symlink():
+            guard(code,self.private)
+            pointer=json.loads(code.read_bytes());code_id=pointer.get('approval_sha256')
+            must(re.fullmatch('[a-f0-9]{64}',str(code_id)) and pointer=={'schema':'R25_COMMUNITY_CODE_CONTROLLER_V1','approval_sha256':code_id},'community_code_pointer')
+            folder=self.root/'runtime/vmm-controller/community-code-publication'/code_id
+            approval=folder/'approval.json';guard(approval,self.private,0o600,code_id)
+            approved=json.loads(approval.read_bytes());journal=folder/'journal.json';guard(journal,self.private)
+            must(json.loads(journal.read_bytes())=={'schema':approved['schema'],'approval_sha256':code_id,'phase':'INSTALLED'} and approved['schema']=='R25_COMMUNITY_CODE_CONTROLLER_V1','community_code_not_installed')
+            must(extra[-2:]==['--reference-publication-sha256',approved['reference_sha256']],'community_code_parent')
+            record=dict(record,controller_manifest_sha256=approved['community_deploy']['manifest_sha256'],cli_sha256=approved['community_cli_sha256'])
+            extra+=['--code-publication-sha256',code_id]
+'''
+    raw=replace_once(before,anchor,addition+anchor,'community_code_method')
+    # Full schema-3 archive verification can exceed the old 20-second budget.
+    raw=replace_once(raw,b'pass_fds=(fd,),timeout=20)',b'pass_fds=(fd,),timeout=90)',
+                     'community_code_verified_start_timeout')
+    ast.parse(raw)
+    return raw
