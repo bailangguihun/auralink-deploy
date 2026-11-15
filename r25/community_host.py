@@ -1449,3 +1449,309 @@ class ReferencePackageUpgrade(PackageUpgrade):
             must(record['phase'] in ('FINAL_ACTIVATE_INTENT','COMMITTED'),
                  'community_reference_final_not_committed')
         return self.candidate(plan,channel),self.supervisor_for(plan,record,channel)
+
+
+CODE_PACKAGE_SCHEMA = 'ARTLIVE_COMMUNITY_CODE_PUBLICATION_V1'
+
+
+def code_publication_binding(plan,plan_sha,manifest_sha,knowledge_sha,recovery_sha,studio_sha,reference_sha,code_sha):
+    must(re.fullmatch('[a-f0-9]{64}',str(code_sha)),'community_code_controller_digest')
+    storage=R25Storage([str(ROOT/'runtime/vmm-controller'),str(ROOT/'runtime/core-publications')],0,0)
+    base=ROOT/'runtime/vmm-controller'
+    marker=storage.read_private_record(base/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json')
+    must(marker=={'schema':'R25_COMMUNITY_CODE_CONTROLLER_V1','approval_sha256':code_sha},
+         'community_code_controller_marker')
+    folder=base/'community-code-publication'/code_sha
+    approved=storage.read_private_record(folder/'approval.json',expected_sha256=code_sha)
+    must(storage.read_private_record(folder/'journal.json')==
+         {'schema':'R25_COMMUNITY_CODE_CONTROLLER_V1','approval_sha256':code_sha,'phase':'INSTALLED'} and
+         approved['schema']=='R25_COMMUNITY_CODE_CONTROLLER_V1' and approved['reference_sha256']==reference_sha and
+         approved['community_deploy']['manifest_sha256']==manifest_sha,'community_code_controller_binding')
+    previous=storage.read_private_record(ROOT/'runtime/core-publications/controller-upgrades'/reference_sha/'approval.json',
+                                         expected_sha256=reference_sha)
+    binding,legacy=reference_lease_binding(plan,plan_sha,previous['vmm']['community']['deploy']['manifest_sha256'],
+                                         knowledge_sha,recovery_sha,studio_sha,reference_sha)
+    context={'code_controller_sha256':code_sha,'core_runtime':approved['core_runtime'],
+             'community_source_provenance':approved['community_source_provenance']}
+    return binding,legacy,context
+
+
+class CodePackageUpgrade:
+    """Schema-3 code replacement with explicit retirement of a lost decision.
+
+    Original Reference approvals, process receipts and supervision bytes stay
+    immutable. A separate exact plan consumes the remaining consecutive-start
+    budget in a new process history. No SQL write or old operation replay exists.
+    """
+    def __init__(self, reference, context):
+        self.reference,self.host,self.context = reference,reference.host,context
+        self.root=self.host.folder/'code-upgrades'
+        self.marker=self.host.folder/'CODE_ACTIVE.json'
+        self.candidates={}
+
+    def predecessor(self):
+        h=self.host;h.lease.require()
+        marker=h.read(self.reference.marker)
+        must(marker['channel']=='final','community_code_final_required')
+        plan=h.read(self.reference.root/marker['plan_sha256']/'approval.json')
+        journal=h.read(self.reference.root/marker['plan_sha256']/'journal.json')
+        must(journal['phase']=='COMMITTED','community_code_reference_not_committed')
+        previous,supervisor=self.reference.active()
+        supervisor.registered()
+        return previous,supervisor,plan
+
+    def disposition(self,plan):
+        return {'schema':'ARTLIVE_COMMUNITY_DECISION_RETIREMENT_V1',
+                'plan_sha256':sha(encoded(plan)),'decision':plan['before']['unknown_decision'],
+                'reason':'NO_SURVIVING_PROCESS_AT_REVIEWED_REPLACEMENT',
+                'preserved_evidence':plan['before']['files']}
+
+    def quiet(self,plan):
+        if self.host.root==ROOT/'runtime/community':
+            proof=ROOT/'runtime/app-supervisor.pid'
+            if proof.exists():
+                info=identity(proof)
+                must((info['uid'],info['gid'],info['mode'])==(0,0,0o600),'community_code_watchdog_proof')
+                values=dict(line.split('=',1) for line in proof.read_text().splitlines() if '=' in line)
+                must(values.get('pid','').isdigit(),'community_code_watchdog_identity')
+                must(process(int(values['pid'])) is None,'community_code_watchdog_must_be_stopped')
+        previous,_,_=self.predecessor();self.no_survivors(previous)
+        must(self.evidence()==plan['before'],'community_code_preimage_drift')
+
+    def core(self):
+        self.reference.require_core()
+        if self.host.root == ROOT/'runtime/community':
+            current=ROOT/'runtime/core-publications/CURRENT.json'
+            match(current,dict(identity(current),sha256=self.context['core_runtime']['current_sha256']))
+            value=reference_core_record(self.host,current)
+            path=current.parent/'transactions'/value['transaction_id']/'journal.json'
+            match(path,dict(identity(path),sha256=self.context['core_runtime']['transaction_sha256']))
+
+    def no_survivors(self, previous):
+        """Do not infer absence from the listener or a missing receipt alone."""
+        from community_lifecycle import listeners
+        must(not listeners(previous.binding()['port']),'community_code_listener_alive')
+        base=str(self.host.folder)
+        for directory in Path('/proc').iterdir():
+            if not directory.name.isdigit() or int(directory.name)==os.getpid():continue
+            try:
+                # Managed Node/CLI spawns retain the verified operator UID.
+                # Other UIDs cannot read the private release; all listeners
+                # were checked above, regardless of their owning account.
+                status=(directory/'status').read_text()
+                uids=[int(v) for v in next(line for line in status.splitlines() if line.startswith('Uid:')).split()[1:]]
+                if os.geteuid() not in uids:continue
+                argv=[a.decode() for a in (directory/'cmdline').read_bytes().split(b'\0') if a]
+                relevant=any(base in a or a==previous.binding()['node'] or
+                             Path(a).name in ('node','community_host_cli.py') for a in argv)
+                if not relevant:continue
+                observed=process(int(directory.name))
+            except FileNotFoundError:continue
+            if observed is None:continue
+            argv=observed['argv'];related=observed['cwd'].startswith(base+'/') or any(base in a for a in argv)
+            node=observed['exe']==previous.binding()['node']
+            controller=any(a.endswith('/community_host_cli.py') for a in argv)
+            must(not (related and (node or controller)),'community_code_surviving_process')
+
+    def evidence(self):
+        previous,supervisor,reference_plan=self.predecessor()
+        previous.role().verify()
+        state=supervisor.load();path,current=previous.role().current()
+        must(current is not None and current['phase'] in ('EXITED','STOPPED'),
+             'community_code_terminal_receipt_required')
+        saved=current.get('process')
+        if saved:
+            observed=process(saved['pid'])
+            must(observed is None or observed['boot_id']!=saved['boot_id'] or observed['ticks']!=saved['ticks'],
+                 'community_code_recorded_process_alive')
+        self.no_survivors(previous)
+        must(state['attempts'] and len(state['attempts'])-state['budget_start']<3,
+             'community_code_start_budget_exhausted')
+        unknown=state['attempts'][-1] if current['operation_id']!=state['attempts'][-1] else None
+        if unknown:
+            must(not (previous.role().root/('run-'+unknown+'.json')).exists() and
+                 not (previous.role().root/('run-'+unknown+'.log')).exists(),
+                 'community_code_unknown_receipt_requires_separate_review')
+        db=self.reference.database(reference_plan);snapshot=db.snapshot()
+        must(snapshot['versions']==[1,2,3],'community_code_schema3_required')
+        operation=reference_plan['database']['operation_id']
+        from community_migration import REFERENCE_SHA
+        must(snapshot['receipts']['reference']==[{'operation_id':operation,
+             'migration_sha256':REFERENCE_SHA,'schema_version':3}],
+             'community_code_reference_receipt')
+        files=[self.reference.marker,supervisor.state,previous.role().root/'current.json',path,
+               self.reference.root/sha(encoded(reference_plan))/'journal.json']
+        return {'files':{str(p):identity(p)['sha256'] for p in files},'state':state,
+                'unknown_decision':unknown,'database':snapshot,
+                'settings':previous.settings,'reference_plan_sha256':sha(encoded(reference_plan))}
+
+    def prepare(self,archive,manifest,review_sha256):
+        h=self.host;h.lease.require();self.core()
+        must(not self.marker.exists() and not self.marker.is_symlink(),'community_code_already_active')
+        must(re.fullmatch('[a-f0-9]{64}',str(review_sha256)),'community_code_review')
+        before=self.evidence();source=self.context['community_source_provenance']
+        match(archive,dict(identity(archive),sha256=source['archive_sha256']))
+        match(manifest,dict(identity(manifest),sha256=source['manifest_sha256']))
+        provenance={k:source[k] for k in ('commit','run_id','run_attempt')}
+        value=verify_archive(Path(archive).read_bytes(),Path(manifest).read_bytes(),provenance)
+        must(value.get('reference_schema_version')==3,'community_code_bundle_schema')
+        plan={'schema':CODE_PACKAGE_SCHEMA,'context':self.context,'original_plan_sha256':h.digest,
+              'archive':identity(archive),'manifest':identity(manifest),'provenance':provenance,
+              'review_sha256':review_sha256,'before':before,'settings':before['settings']}
+        ident=sha(encoded(plan));folder=self.root/ident
+        h.storage.mkdir_private(self.root);h.storage.mkdir_private(folder)
+        for record in self.root.glob('*/journal.json'):
+            must(h.read(record)['phase']=='ABORTED_NOT_STARTED','community_code_unfinished_attempt')
+        unsigned=folder/'UNSIGNED_PLAN.json'
+        if unsigned.exists():must(unsigned.read_bytes()==encoded(plan),'community_code_plan_conflict')
+        else:h.storage.atomic_write_bytes(unsigned,encoded(plan))
+        return plan,unsigned
+
+    def verify(self,plan):
+        h=self.host;h.lease.require();self.core()
+        must(set(plan)=={'schema','context','original_plan_sha256','archive','manifest','provenance',
+             'review_sha256','before','settings'} and plan['schema']==CODE_PACKAGE_SCHEMA and
+             plan['context']==self.context and plan['original_plan_sha256']==h.digest,
+             'community_code_exact_context')
+        ident=sha(encoded(plan));folder=self.root/ident
+        approval=folder/'approval.json'
+        h.storage.file_identity(approval,expected_sha256=ident)
+        must(approval.read_bytes()==encoded(plan),'community_code_exact_approval')
+        previous,supervisor,reference_plan=self.predecessor()
+        must(sha(encoded(reference_plan))==plan['before']['reference_plan_sha256'],
+             'community_code_predecessor_changed')
+        current_path,_=previous.role().current()
+        expected={str(p) for p in (self.reference.marker,supervisor.state,
+                  previous.role().root/'current.json',current_path,
+                  self.reference.root/sha(encoded(reference_plan))/'journal.json')}
+        must(set(plan['before']['files'])==expected,'community_code_evidence_paths')
+        for path,digest in plan['before']['files'].items():
+            match(path,dict(identity(path),sha256=digest))
+        must(plan['settings']==previous.settings,'community_code_settings_changed')
+        wanted=dict(plan['settings']);wanted.pop('path');match(plan['settings']['path'],wanted)
+        journal=folder/'journal.json';disposition=folder/'decision-retirement.json'
+        required=journal.exists() and h.read(journal)['phase'] in (
+            'RETIRED','START_INTENT','STARTED','ACTIVATE_INTENT','COMMITTED')
+        if required or disposition.exists():
+            h.storage.file_identity(disposition,expected_sha256=sha(encoded(self.disposition(plan))))
+        return ident,folder
+
+    def candidate(self,plan):
+        ident=sha(encoded(plan))
+        if ident not in self.candidates:
+            base=self.host.folder/'code-releases'/ident
+            candidate=ReferenceHost(self.host,base,plan,plan['settings'])
+            candidate.source_release=base/'release'
+            self.candidates[ident]=candidate
+        return self.candidates[ident]
+
+    def materialize(self,plan,archive,manifest):
+        h=self.host;match(archive,plan['archive']);match(manifest,plan['manifest'])
+        raw=Path(archive).read_bytes();mr=Path(manifest).read_bytes()
+        value=verify_archive(raw,mr,plan['provenance']);candidate=self.candidate(plan)
+        def put(path,data):
+            for parent in reversed([path.parent,*path.parent.parents]):
+                if parent==h.folder or h.folder in parent.parents:h.storage.mkdir_private(parent)
+            if path.exists():h.storage.file_identity(path,expected_sha256=sha(data),expected_bytes=len(data))
+            else:h.storage.atomic_write_bytes(path,data)
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive_file:
+            for item in value['files']:put(candidate.source_release/item['path'],archive_file.read(item['path']))
+        put(candidate.source_release/'manifest.json',mr)
+        h.storage.mkdir_private(candidate.release/'process');candidate.role().verify()
+
+    def supervisor_for(self,plan):
+        from community_supervision import PackageSupervisor
+        _,previous,_=self.predecessor()
+        return PackageSupervisor(self.candidate(plan),sha(encoded(plan)),
+                                 plan['before']['files'][str(previous.state)],previous.state)
+
+    def data(self,plan):
+        _,_,reference_plan=self.predecessor()
+        db=self.reference.database(reference_plan);before=plan['before']['database']
+        if isinstance(db,ReferenceDatabase):
+            observed=db.read("""SELECT jsonb_build_object(
+              'versions',(SELECT jsonb_agg(version ORDER BY version) FROM community.schema_version),
+              'receipts',jsonb_build_object(
+                'learning',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY operation_id),'[]'::jsonb) FROM community.learning_publication_receipt t),
+                'reference',(SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY operation_id),'[]'::jsonb) FROM community.reference_publication_receipt t)));""")
+        else:observed=db.snapshot()
+        must(observed['versions']==[1,2,3] and observed['receipts']==before['receipts'],
+             'community_code_database_receipts_changed')
+        return observed
+
+    def install(self,plan,archive,manifest,*,recover=False,fault=None):
+        import uuid
+        h=self.host;ident,folder=self.verify(plan);journal=folder/'journal.json'
+        match(archive,plan['archive']);match(manifest,plan['manifest'])
+        record=h.read(journal) if journal.exists() else None
+        candidate=self.candidate(plan);supervisor=self.supervisor_for(plan)
+        if record:
+            must(record['schema']==CODE_PACKAGE_SCHEMA and record['plan_sha256']==ident,
+                 'community_code_journal')
+            if record['phase']=='COMMITTED':
+                self.active();return 'COMMITTED_VERIFIED_NOOP'
+            must(recover,'community_code_explicit_recovery_required')
+        else:
+            must(not recover,'community_code_not_started')
+            must(self.evidence()==plan['before'],'community_code_preimage_drift')
+            record={'schema':CODE_PACKAGE_SCHEMA,'plan_sha256':ident,'phase':'PREPARED',
+                    'operation_id':uuid.uuid4().hex,'history':[]}
+        def phase(name):
+            record['phase']=name;record['history'].append(name);h.write(journal,record)
+            if fault:fault(name)
+        if not journal.exists():phase('PREPARED')
+        if record['phase']=='PREPARED':
+            self.materialize(plan,archive,manifest);phase('MATERIALIZED')
+        if record['phase']=='MATERIALIZED':
+            self.quiet(plan)
+            disposition=self.disposition(plan)
+            path=folder/'decision-retirement.json'
+            if path.exists():must(h.read(path)==disposition,'community_code_disposition_drift')
+            else:h.storage.atomic_write_bytes(path,encoded(disposition))
+            phase('RETIRED')
+        if record['phase']=='RETIRED':
+            self.quiet(plan)
+            operation=record['operation_id'];state=dict(plan['before']['state'])
+            must(operation not in state['attempts'],'community_code_operation_reused')
+            state.update(upgrade_sha256=ident,legacy_state_sha256=supervisor.legacy_sha256,
+                         attempts=[*state['attempts'],operation],desired='RUNNING',stable=None,
+                         unhealthy=None,reason='REVIEWED_CODE_START_DECISION')
+            if supervisor.state.exists():must(h.read(supervisor.state)==state,'community_code_state_drift')
+            else:h.storage.atomic_write_bytes(supervisor.state,encoded(state))
+            phase('START_INTENT')
+            candidate.role().start(operation)
+            phase('STARTED')
+        if record['phase']=='START_INTENT':
+            # The durable intent may already have spawned: never repeat it.
+            _,saved=candidate.role().current()
+            must(saved is not None and saved['operation_id']==record['operation_id'] and
+                 saved['phase'] in ('STARTING','READY') and saved.get('process'),
+                 'community_code_unknown_start_no_replay')
+            phase('STARTED')
+        if record['phase']=='STARTED':
+            deadline=time.monotonic()+20
+            while True:
+                status=candidate.control('observe')
+                if status=='READY':break
+                must(status=='STARTING' and time.monotonic()<deadline,'community_code_not_ready')
+                time.sleep(.1)
+            candidate.preserve_running(supervisor);self.data(plan);phase('ACTIVATE_INTENT')
+        if record['phase']=='ACTIVATE_INTENT':
+            must(candidate.control('observe')=='READY','community_code_candidate_not_ready')
+            value={'schema':CODE_PACKAGE_SCHEMA,'plan_sha256':ident}
+            if self.marker.exists():must(h.read(self.marker)==value,'community_code_foreign_marker')
+            else:h.storage.atomic_write_bytes(self.marker,encoded(value))
+            phase('COMMITTED')
+        must(record['phase']=='COMMITTED','community_code_recovery_phase')
+        self.active();return 'COMMITTED'
+
+    def active(self):
+        h=self.host;h.lease.require();marker=h.read(self.marker);ident=marker.get('plan_sha256')
+        must(re.fullmatch('[a-f0-9]{64}',str(ident)) and
+             marker=={'schema':CODE_PACKAGE_SCHEMA,'plan_sha256':ident},'community_code_active_pointer')
+        plan=h.read(self.root/ident/'approval.json');self.verify(plan)
+        record=h.read(self.root/ident/'journal.json')
+        must(record['phase'] in ('ACTIVATE_INTENT','COMMITTED') and record['plan_sha256']==ident,
+             'community_code_not_committed')
+        self.data(plan)
+        return self.candidate(plan),self.supervisor_for(plan)
