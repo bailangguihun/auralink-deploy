@@ -139,7 +139,7 @@ class CodeController(unittest.TestCase):
 
 
 class FormalRuntimeBoundary(unittest.TestCase):
-    def test_four_file_formal_bundle_can_verify_the_core_runtime_in_a_fresh_interpreter(self):
+    def formal_runtime(self,alter=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);bundle=root/'formal-vmm';bundle.mkdir(mode=0o700)
             for name in v.MODULES:
@@ -153,6 +153,13 @@ class FormalRuntimeBoundary(unittest.TestCase):
             put('runtime/core-publications/CURRENT.json',v.encoded({'transaction_id':tx,'release':release}))
             put('runtime/core-publications/transactions/'+tx+'/journal.json',
                 v.encoded({'transaction_id':tx,'candidate':release,'phase':'COMMITTED'}))
+            if alter=='fifo':
+                path=root/'release/artifacts/backend.jar';path.unlink();os.mkfifo(path,0o600)
+            elif alter=='directory':(root/'release/artifacts').chmod(0o777)
+            elif alter=='symlink':
+                path=root/'release/artifacts';path.rename(path.with_name('retained-artifacts'))
+                path.symlink_to(path.with_name('retained-artifacts'),target_is_directory=True)
+            elif alter=='hardlink':os.link(root/'release/artifacts/backend.jar',root/'linked.jar')
             code="""import json,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
@@ -162,8 +169,28 @@ print(json.dumps(v.code_core_runtime(rt)))
 """
             result=subprocess.run([sys.executable,'-I','-B','-c',code,str(bundle),str(root),str(os.geteuid()),str(os.getegid())],
                                   env={},capture_output=True,text=True,timeout=10)
-            self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(json.loads(result.stdout)['jar_sha256'],v.sha(jar))
+            return result,v.sha(jar)
+
+    def test_four_file_formal_bundle_can_verify_the_core_runtime_in_a_fresh_interpreter(self):
+        result,digest=self.formal_runtime()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['jar_sha256'],digest)
+
+    def test_fifo_is_refused_without_blocking_on_open(self):
+        result,_=self.formal_runtime('fifo')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('runtime_jar_identity',result.stderr)
+
+    def test_writable_jar_parent_is_refused(self):
+        result,_=self.formal_runtime('directory')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('runtime_jar_directory_identity',result.stderr)
+
+    def test_symlink_parent_and_hardlinked_jar_are_refused(self):
+        for kind in ('symlink','hardlink'):
+            with self.subTest(kind=kind):
+                result,_=self.formal_runtime(kind)
+                self.assertNotEqual(result.returncode,0)
 
 
 if __name__=='__main__':unittest.main()

@@ -3127,9 +3127,18 @@ def code_core_runtime(rt):
     must(receipt['phase']=='COMMITTED' and receipt['transaction_id']==tx and
          receipt['candidate']==current['release'],'community_code_core_not_committed')
     jar=rt.root/'release/artifacts/backend.jar'
-    for path in (jar,*jar.parents):must(not path.is_symlink(),'community_code_runtime_jar_symlink')
-    fd=os.open(jar,os.O_RDONLY|os.O_NOFOLLOW)
+    directory_fd=None;fd=None
     try:
+        flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+        directory_fd=os.open('/',flags)
+        for part in jar.parts[1:-1]:
+            next_fd=os.open(part,flags,dir_fd=directory_fd)
+            os.close(directory_fd);directory_fd=next_fd
+        parent=os.fstat(directory_fd)
+        must(stat.S_ISDIR(parent.st_mode) and
+             (parent.st_uid,parent.st_gid,stat.S_IMODE(parent.st_mode))==(*rt.private,0o700),
+             'community_code_runtime_jar_directory_identity')
+        fd=os.open(jar.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,dir_fd=directory_fd)
         before=os.fstat(fd)
         must(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and
              (before.st_uid,before.st_gid,stat.S_IMODE(before.st_mode))==(*rt.private,0o600) and
@@ -3140,12 +3149,15 @@ def code_core_runtime(rt):
             if not block:break
             size+=len(block);must(size<=before.st_size,'community_code_runtime_jar_grew')
             digestor.update(block)
-        after=os.fstat(fd);named=jar.lstat()
-        fields=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+        after=os.fstat(fd);named=os.stat(jar.name,dir_fd=directory_fd,follow_symlinks=False)
+        fields=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,
+                         s.st_uid,s.st_gid,s.st_mode,s.st_nlink)
         must(size==before.st_size and fields(before)==fields(after)==fields(named),
              'community_code_runtime_jar_raced')
         actual=digestor.hexdigest()
-    finally:os.close(fd)
+    finally:
+        if fd is not None:os.close(fd)
+        if directory_fd is not None:os.close(directory_fd)
     must(actual==current['release']['artifact_sha256'],'community_code_runtime_jar_changed')
     return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual}
 
