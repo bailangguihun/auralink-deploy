@@ -4,7 +4,11 @@ Java/SQL/watchdog effects use the existing explicit isolated full-chain fixture.
 Node and lost-start boundaries are exercised in test_community_code_package.
 """
 from pathlib import Path
+import json
+import os
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import Mock,PropertyMock,patch
@@ -132,6 +136,34 @@ class CodeController(unittest.TestCase):
         self.prepare();plan={**self.plan,'files':{**self.plan['files'],'core-current':self.plan['files']['handoff']}}
         with self.rt.lease(),self.assertRaisesRegex(Exception,'fixed_targets'):
             v.verify_code_controller(self.rt,plan,self.folder,'before')
+
+
+class FormalRuntimeBoundary(unittest.TestCase):
+    def test_four_file_formal_bundle_can_verify_the_core_runtime_in_a_fresh_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);bundle=root/'formal-vmm';bundle.mkdir(mode=0o700)
+            for name in v.MODULES:
+                path=bundle/name;path.write_bytes((Path(__file__).parent/name).read_bytes());path.chmod(0o600)
+            def put(relative,raw):
+                path=root/relative;path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                path.write_bytes(raw);path.chmod(0o600)
+            jar=b'Explicit isolated JAR identity fixture, not a Java application.'
+            release={'artifact_sha256':v.sha(jar)};tx='a'*32
+            put('release/artifacts/backend.jar',jar)
+            put('runtime/core-publications/CURRENT.json',v.encoded({'transaction_id':tx,'release':release}))
+            put('runtime/core-publications/transactions/'+tx+'/journal.json',
+                v.encoded({'transaction_id':tx,'candidate':release,'phase':'COMMITTED'}))
+            code="""import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import vmm_controller as v
+rt=v.Runtime(Path(sys.argv[2]),Path(sys.argv[2])/'unused-lock',private=(int(sys.argv[3]),int(sys.argv[4])))
+print(json.dumps(v.code_core_runtime(rt)))
+"""
+            result=subprocess.run([sys.executable,'-I','-B','-c',code,str(bundle),str(root),str(os.geteuid()),str(os.getegid())],
+                                  env={},capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(json.loads(result.stdout)['jar_sha256'],v.sha(jar))
 
 
 if __name__=='__main__':unittest.main()

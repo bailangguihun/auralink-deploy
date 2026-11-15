@@ -3126,12 +3126,28 @@ def code_core_runtime(rt):
     receipt=json_bytes(journal)
     must(receipt['phase']=='COMMITTED' and receipt['transaction_id']==tx and
          receipt['candidate']==current['release'],'community_code_core_not_committed')
-    from r25_storage import R25Storage
     jar=rt.root/'release/artifacts/backend.jar'
-    storage=R25Storage([str(jar.parent)],*rt.private)
-    actual=storage.file_identity(jar)
-    must(actual['sha256']==current['release']['artifact_sha256'],'community_code_runtime_jar_changed')
-    return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual['sha256']}
+    for path in (jar,*jar.parents):must(not path.is_symlink(),'community_code_runtime_jar_symlink')
+    fd=os.open(jar,os.O_RDONLY|os.O_NOFOLLOW)
+    try:
+        before=os.fstat(fd)
+        must(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and
+             (before.st_uid,before.st_gid,stat.S_IMODE(before.st_mode))==(*rt.private,0o600) and
+             0<before.st_size<=256*1024*1024,'community_code_runtime_jar_identity')
+        digestor=hashlib.sha256();size=0
+        while True:
+            block=os.read(fd,1024*1024)
+            if not block:break
+            size+=len(block);must(size<=before.st_size,'community_code_runtime_jar_grew')
+            digestor.update(block)
+        after=os.fstat(fd);named=jar.lstat()
+        fields=lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+        must(size==before.st_size and fields(before)==fields(after)==fields(named),
+             'community_code_runtime_jar_raced')
+        actual=digestor.hexdigest()
+    finally:os.close(fd)
+    must(actual==current['release']['artifact_sha256'],'community_code_runtime_jar_changed')
+    return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual}
 
 
 def code_controller_sources(rt,plan):
