@@ -5,6 +5,7 @@ Discovery remains unittest's normal discovery, including load_tests hooks and
 duplicate occurrences. No tests are executed by the report verifier.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -19,10 +20,22 @@ import unittest
 SCHEMA = "ARTLIVE_R25_TEST_SHARD_V1"
 VERIFICATION_SCHEMA = "ARTLIVE_R25_TEST_SHARDS_VERIFIED_V1"
 SHARD_COUNT = 4
+# Keep the three original isolated modules on their runners. Place other slow
+# modules using the per-test timings from Deploy CI run 45135109986. Unlisted
+# modules use a stable assignment so expansion does not pile up on one runner.
 SHARD_MODULES = {
-    1: "test_managed_vmm_publication",
-    2: "test_community_publication_repair",
-    3: "test_community_publication_successor",
+    "test_community_code_controller": 1,
+    "test_managed_vmm_publication": 1,
+    "test_vmm_module_successor": 1,
+    "test_community_code_package": 2,
+    "test_community_publication_repair": 2,
+    "test_studio_publication": 2,
+    "test_vmm_module_revision": 2,
+    "test_community_publication_successor": 3,
+    "test_community_recovery_upgrade": 3,
+    "test_community_reference_upgrade": 3,
+    "test_knowledge_publication": 3,
+    "test_reference_publication": 4,
 }
 GOOD_OUTCOMES = {"success", "skipped", "expected_failure"}
 
@@ -51,8 +64,12 @@ def _flatten(tests):
 
 
 def _assignment(test_id):
+    # Use the discovery module or package prefix, including for nested TestCase
+    # names. The runner and report verifier use the same occurrence identities.
     module = test_id.split(".", 1)[0]
-    return next((shard for shard, name in SHARD_MODULES.items() if name == module), SHARD_COUNT)
+    if module in SHARD_MODULES:
+        return SHARD_MODULES[module]
+    return hashlib.sha256(module.encode("utf-8")).digest()[0] % SHARD_COUNT + 1
 
 
 def partition_tests(tests, shard):
