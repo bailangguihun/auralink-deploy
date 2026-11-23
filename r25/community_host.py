@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from community_bundle import verify_archive
 from community_lifecycle import Role, process
-from r25_storage import R25Storage, must, strict_json
+from r25_storage import R25Storage, must, sha256_value, strict_json
 
 ROOT = Path('/root/autodl-tmp/artlive-r25-native-pg16/handoff-production-20260923T062101Z')
 LOCK = Path('/root/autodl-tmp/auralink-web-deploy/runtime/frontend-deployment.lock')
@@ -31,6 +31,7 @@ SCHEMA = 'ARTLIVE_COMMUNITY_HOST_V1'
 PARENT_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_BINDING_V1'
 SUCCESSOR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_BINDING_V1'
 REPAIR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_BINDING_V1'
+ASSISTANT_ROLLOUT_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
 
 
 def sha(raw):
@@ -202,7 +203,8 @@ def studio_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sh
     return dict(plan['lease'],guard=observed),parent['legacy']['state_sha256']
 
 
-def reference_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sha, studio_sha, reference_sha):
+def reference_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade_sha, studio_sha, reference_sha,
+                            *, rollout=None):
     """One exact Reference successor; the original guard verifies its full chain."""
     def private(path, expected=None):
         item=identity(path)
@@ -234,9 +236,14 @@ def reference_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade
     must(bound['plan_sha256'] == plan_sha == sha(encoded(plan)) and
          bound['deploy']['manifest_sha256'] == manifest_sha,'community_reference_original_plan')
     private(ROOT/'runtime/community/WATCHDOG.json',bound['registration_sha256'])
+    authority=approved if rollout is None else rollout
+    if rollout is not None:
+        must(receipt['phase']=='INSTALLED' and
+             rollout['operational']['guard']['before_sha256']==approved['operational']['guard']['after_sha256'] and
+             rollout['controller_owner']==approved['controller_owner'],'community_assistant_guard_parent')
     observed=identity(ROOT/'operations/core_release_guard.py')
-    must(observed['sha256'] == approved['operational']['guard']['after_sha256'] and
-         (observed['uid'],observed['gid'],observed['mode']) == tuple(approved['controller_owner'])+(0o700,),
+    must(observed['sha256'] == authority['operational']['guard']['after_sha256'] and
+         (observed['uid'],observed['gid'],observed['mode']) == tuple(authority['controller_owner'])+(0o700,),
          'community_reference_guard')
     return dict(plan['lease'],guard=observed),recovery['legacy']['state_sha256']
 
@@ -606,11 +613,22 @@ def reference_core_record(host, path, expected=None):
     return storage.read_private_record(path,expected_sha256=expected)
 
 
-def reference_package_context(host, reference_sha):
-    """Keep the old package's immutable context across the Core-only switch."""
+def committed_core_journal(host, current, *, expected_sha256=None):
+    """Read the private COMMITTED journal bound to this Core current record."""
+    tx=current['transaction_id']
+    must(re.fullmatch('[a-f0-9]{32}',str(tx)),'community_reference_core_transaction')
+    path=ROOT/'runtime/core-publications/transactions'/tx/'journal.json'
+    receipt=reference_core_record(host,path,expected_sha256)
+    must(receipt['phase'] == 'COMMITTED' and receipt['transaction_id'] == tx and
+         receipt['candidate'] == current['release'],'community_reference_core_not_committed')
+    return receipt
+
+
+def reference_package_proofs(host, reference_sha):
+    """Return the retained Reference approval, package binding and package context."""
     host.lease.require()
     base=ROOT/'runtime/core-publications'
-    folder=base/'controller-upgrades'/reference_sha
+    folder=base/'controller-upgrades'/sha256_value(reference_sha)
     approved=reference_core_record(host,folder/'approval.json',reference_sha)
     must(sha(encoded(approved)) == reference_sha and
          approved['schema'] == 'R25_REFERENCE_CORE_PUBLICATION_BINDING_V1',
@@ -620,15 +638,22 @@ def reference_package_context(host, reference_sha):
          receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_reference_context_not_installed')
     bound=approved['vmm']['community'];previous=bound['package']
     must(bound['plan_sha256'] == host.digest,'community_reference_context_plan')
-    match(host.folder/'RELEASE_ACTIVE.json',dict(identity(host.folder/'RELEASE_ACTIVE.json'),
-                                               sha256=previous['marker_sha256']))
-    oldfolder=host.folder/'package-upgrades'/previous['plan_sha256']
-    old=host.read(oldfolder/'approval.json')
-    must(sha(encoded(old)) == previous['plan_sha256'],'community_reference_package_approval')
-    match(oldfolder/'journal.json',dict(identity(oldfolder/'journal.json'),
-                                       sha256=previous['journal_sha256']))
-    must(host.read(oldfolder/'journal.json')['phase'] == 'COMMITTED',
+    old_id=sha256_value(previous['plan_sha256'])
+    marker=host.storage.read_private_record(host.folder/'RELEASE_ACTIVE.json',sha256_value(previous['marker_sha256']))
+    must(marker=={'schema':PACKAGE_SCHEMA,'plan_sha256':old_id},'community_reference_package_marker')
+    oldfolder=host.folder/'package-upgrades'/old_id
+    old=host.storage.read_private_record(oldfolder/'approval.json',old_id)
+    must(sha(encoded(old)) == old_id,'community_reference_package_approval')
+    journal=host.storage.read_private_record(oldfolder/'journal.json',sha256_value(previous['journal_sha256']))
+    must(journal['schema']==PACKAGE_SCHEMA and journal['plan_sha256']==old_id and journal['phase']=='COMMITTED',
          'community_reference_package_not_committed')
+    return approved,previous,old['context']
+
+
+def reference_package_context(host, reference_sha):
+    """Keep the old package's immutable context across the Core-only switch."""
+    approved,previous,previous_context=reference_package_proofs(host,reference_sha)
+    base=ROOT/'runtime/core-publications'
     current=reference_core_record(host,base/'CURRENT.json')
     policy=reference_core_record(host,base/'POLICY.json')
     must(sha(encoded(policy)) == approved['operational']['policy']['after_sha256'],
@@ -638,7 +663,26 @@ def reference_package_context(host, reference_sha):
          all(current['release'].get(k) == candidate[k] for k in ('commit_sha','artifact_sha256')),
          'community_reference_context_current')
     return {'reference_sha256':reference_sha,'core_commit':candidate['commit_sha'],
-            'candidate':candidate,'predecessor':previous,'previous_context':old['context']}
+            'candidate':candidate,'predecessor':previous,'previous_context':previous_context}
+
+
+def assistant_reference_package_context(host, reference_sha, rollout_sha, rollout, code_context):
+    """Read the original Community context from the successor's fixed preimages."""
+    approved,previous,previous_context=reference_package_proofs(host,reference_sha)
+    before=ROOT/'runtime/core-publications/controller-upgrades'/sha256_value(rollout_sha)/'before'
+    policy_sha=sha256_value(approved['operational']['policy']['after_sha256'])
+    current_sha=sha256_value(rollout['assistant_rollout']['core_current_sha256'])
+    runtime=code_context['core_runtime']
+    must(rollout['operational']['policy']['before_sha256']==policy_sha and
+         runtime['current_sha256']==current_sha,'community_assistant_historical_core_binding')
+    policy=reference_core_record(host,before/'policy',policy_sha)
+    current=reference_core_record(host,before/'ILLUSTRATION_CORE_CURRENT.json',current_sha)
+    candidate=policy['upgrade']['candidate']
+    must(all(current['release'].get(key)==candidate[key] for key in ('commit_sha','artifact_sha256')) and
+         runtime['jar_sha256']==candidate['artifact_sha256'],'community_assistant_historical_core_release')
+    committed_core_journal(host,current,expected_sha256=sha256_value(runtime['transaction_sha256']))
+    return {'reference_sha256':reference_sha,'core_commit':candidate['commit_sha'],
+            'candidate':candidate,'predecessor':previous,'previous_context':previous_context}
 
 
 class ReferenceDatabase:
@@ -1081,11 +1125,7 @@ class ReferencePackageUpgrade(PackageUpgrade):
         candidate=self.context['candidate']
         must(all(current['release'].get(k) == candidate[k] for k in ('commit_sha','artifact_sha256')),
              'community_reference_new_core_required')
-        tx=current['transaction_id']
-        must(re.fullmatch('[a-f0-9]{32}',str(tx)),'community_reference_core_transaction')
-        receipt=reference_core_record(self.host,ROOT/'runtime/core-publications/transactions'/tx/'journal.json')
-        must(receipt['phase'] == 'COMMITTED' and receipt['transaction_id'] == tx and
-             receipt['candidate'] == current['release'],'community_reference_core_not_committed')
+        committed_core_journal(self.host,current)
 
     def prepare(self,archive,manifest,provenance,review_sha256,database_plan):
         h=self.host;h.lease.require();h.validate(installing=False);self.require_core()
@@ -1142,7 +1182,11 @@ class ReferencePackageUpgrade(PackageUpgrade):
         return plan,unsigned
 
     def verify(self,plan):
-        h=self.host;h.lease.require();h.validate(installing=False);self.require_core()
+        self.host.lease.require();self.require_core()
+        return self._verify_retained_package(plan)
+
+    def _verify_retained_package(self,plan):
+        h=self.host;h.lease.require();h.validate(installing=False)
         must(set(plan) == {'schema','context','original_plan_sha256','archive','manifest','provenance',
              'review_sha256','before','binding_sha256','database','settings'} and
              plan['schema'] == REFERENCE_PACKAGE_SCHEMA,'community_reference_plan')
@@ -1430,17 +1474,23 @@ class ReferencePackageUpgrade(PackageUpgrade):
             return self.resume_bridge(plan,record,phase)
         raise ValueError('community_reference_recovery_phase')
 
-    def active(self):
+    def _active_approval(self):
         h=self.host;h.lease.require()
-        if not self.marker.exists():return self.previous.active()
         marker=h.read(self.marker);ident=marker.get('plan_sha256');channel=marker.get('channel')
         must(marker == {'schema':REFERENCE_PACKAGE_SCHEMA,'plan_sha256':ident,'channel':channel} and
              re.fullmatch('[a-f0-9]{64}',str(ident)) and channel in ('bridge','final','previous'),
              'community_reference_active_pointer')
-        folder=self.root/ident;plan=h.read(folder/'approval.json');self.verify(plan)
+        folder=self.root/ident
+        plan=h.storage.read_private_record(folder/'approval.json',expected_sha256=ident)
         record=h.read(folder/'journal.json')
         must(record['schema'] == REFERENCE_PACKAGE_SCHEMA and record['plan_sha256'] == ident,
              'community_reference_active_journal')
+        return channel,plan,record
+
+    def active(self):
+        self.host.lease.require()
+        if not self.marker.exists():return self.previous.active()
+        channel,plan,record=self._active_approval();self.verify(plan)
         if channel == 'previous':
             must(record['phase'] in ('RESTORE_PREVIOUS_INTENT','RESTORED'),
                  'community_reference_previous_not_restored')
@@ -1454,7 +1504,28 @@ class ReferencePackageUpgrade(PackageUpgrade):
 CODE_PACKAGE_SCHEMA = 'ARTLIVE_COMMUNITY_CODE_PUBLICATION_V1'
 
 
-def code_publication_binding(plan,plan_sha,manifest_sha,knowledge_sha,recovery_sha,studio_sha,reference_sha,code_sha):
+def assistant_community_approval(rollout_sha, code_sha, manifest_sha, *, preserve_only):
+    base=ROOT/'runtime/core-publications'
+    storage=R25Storage([str(base)],0,0)
+    folder=base/'controller-upgrades'/sha256_value(rollout_sha)
+    marker=storage.read_private_record(base/'CONTROL_UPGRADE_ACTIVE.json')
+    must(marker=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':rollout_sha},
+         'community_assistant_controller_pointer')
+    rollout=storage.read_private_record(folder/'approval.json',expected_sha256=rollout_sha)
+    receipt=storage.read_private_record(folder/'journal.json')
+    allowed={'VERIFY_INTENT','INSTALLED'} if preserve_only else {'INSTALLED'}
+    must(rollout['schema']==receipt['schema']==ASSISTANT_ROLLOUT_SCHEMA and
+         receipt['approval_sha256']==rollout_sha and receipt['phase'] in allowed,
+         'community_assistant_controller_not_installed')
+    community=rollout['assistant_rollout']['community']
+    must(community['code_controller_sha256']==code_sha and
+         community['deploy']['manifest_sha256']==manifest_sha,'community_assistant_controller_binding')
+    sha256_value(community['code_plan_sha256'])
+    return rollout
+
+
+def code_publication_binding(plan,plan_sha,manifest_sha,knowledge_sha,recovery_sha,studio_sha,reference_sha,code_sha,
+                             *, rollout=None):
     must(re.fullmatch('[a-f0-9]{64}',str(code_sha)),'community_code_controller_digest')
     storage=R25Storage([str(ROOT/'runtime/vmm-controller'),str(ROOT/'runtime/core-publications')],0,0)
     base=ROOT/'runtime/vmm-controller'
@@ -1463,14 +1534,15 @@ def code_publication_binding(plan,plan_sha,manifest_sha,knowledge_sha,recovery_s
          'community_code_controller_marker')
     folder=base/'community-code-publication'/code_sha
     approved=storage.read_private_record(folder/'approval.json',expected_sha256=code_sha)
+    manifest=(approved['community_deploy'] if rollout is None else rollout['assistant_rollout']['community']['deploy'])
     must(storage.read_private_record(folder/'journal.json')==
          {'schema':'R25_COMMUNITY_CODE_CONTROLLER_V1','approval_sha256':code_sha,'phase':'INSTALLED'} and
          approved['schema']=='R25_COMMUNITY_CODE_CONTROLLER_V1' and approved['reference_sha256']==reference_sha and
-         approved['community_deploy']['manifest_sha256']==manifest_sha,'community_code_controller_binding')
-    previous=storage.read_private_record(ROOT/'runtime/core-publications/controller-upgrades'/reference_sha/'approval.json',
+         manifest['manifest_sha256']==manifest_sha,'community_code_controller_binding')
+    previous=storage.read_private_record(ROOT/'runtime/core-publications/controller-upgrades'/sha256_value(reference_sha)/'approval.json',
                                          expected_sha256=reference_sha)
     binding,legacy=reference_lease_binding(plan,plan_sha,previous['vmm']['community']['deploy']['manifest_sha256'],
-                                         knowledge_sha,recovery_sha,studio_sha,reference_sha)
+                                         knowledge_sha,recovery_sha,studio_sha,reference_sha,rollout=rollout)
     context={'code_controller_sha256':code_sha,'core_runtime':approved['core_runtime'],
              'community_source_provenance':approved['community_source_provenance']}
     return binding,legacy,context
@@ -1489,14 +1561,15 @@ class CodePackageUpgrade:
         self.marker=self.host.folder/'CODE_ACTIVE.json'
         self.candidates={}
 
-    def predecessor(self):
-        h=self.host;h.lease.require()
-        marker=h.read(self.reference.marker)
-        must(marker['channel']=='final','community_code_final_required')
-        plan=h.read(self.reference.root/marker['plan_sha256']/'approval.json')
-        journal=h.read(self.reference.root/marker['plan_sha256']/'journal.json')
+    def predecessor(self, *, retained=False):
+        self.host.lease.require()
+        channel,plan,journal=self.reference._active_approval()
+        must(channel=='final','community_code_final_required')
         must(journal['phase']=='COMMITTED','community_code_reference_not_committed')
-        previous,supervisor=self.reference.active()
+        if retained:self.reference._verify_retained_package(plan)
+        else:self.reference.verify(plan)
+        previous=self.reference.candidate(plan,channel)
+        supervisor=self.reference.supervisor_for(plan,journal,channel)
         supervisor.registered()
         return previous,supervisor,plan
 
@@ -1521,11 +1594,10 @@ class CodePackageUpgrade:
     def core(self):
         self.reference.require_core()
         if self.host.root == ROOT/'runtime/community':
-            current=ROOT/'runtime/core-publications/CURRENT.json'
-            match(current,dict(identity(current),sha256=self.context['core_runtime']['current_sha256']))
-            value=reference_core_record(self.host,current)
-            path=current.parent/'transactions'/value['transaction_id']/'journal.json'
-            match(path,dict(identity(path),sha256=self.context['core_runtime']['transaction_sha256']))
+            runtime=self.context['core_runtime']
+            current=reference_core_record(self.host,ROOT/'runtime/core-publications/CURRENT.json',
+                                          sha256_value(runtime['current_sha256']))
+            committed_core_journal(self.host,current,expected_sha256=sha256_value(runtime['transaction_sha256']))
 
     def no_survivors(self, previous):
         """Do not infer absence from the listener or a missing receipt alone."""
@@ -1608,7 +1680,11 @@ class CodePackageUpgrade:
         return plan,unsigned
 
     def verify(self,plan):
-        h=self.host;h.lease.require();self.core()
+        self.host.lease.require();self.core()
+        return self._verify_package(plan,self.predecessor())
+
+    def _verify_package(self,plan,predecessor):
+        h=self.host;h.lease.require()
         must(set(plan)=={'schema','context','original_plan_sha256','archive','manifest','provenance',
              'review_sha256','before','settings'} and plan['schema']==CODE_PACKAGE_SCHEMA and
              plan['context']==self.context and plan['original_plan_sha256']==h.digest,
@@ -1617,7 +1693,7 @@ class CodePackageUpgrade:
         approval=folder/'approval.json'
         h.storage.file_identity(approval,expected_sha256=ident)
         must(approval.read_bytes()==encoded(plan),'community_code_exact_approval')
-        previous,supervisor,reference_plan=self.predecessor()
+        previous,supervisor,reference_plan=predecessor
         must(sha(encoded(reference_plan))==plan['before']['reference_plan_sha256'],
              'community_code_predecessor_changed')
         current_path,_=previous.role().current()
@@ -1659,14 +1735,14 @@ class CodePackageUpgrade:
         put(candidate.source_release/'manifest.json',mr)
         h.storage.mkdir_private(candidate.release/'process');candidate.role().verify()
 
-    def supervisor_for(self,plan):
+    def supervisor_for(self,plan,predecessor=None):
         from community_supervision import PackageSupervisor
-        _,previous,_=self.predecessor()
+        _,previous,_=self.predecessor() if predecessor is None else predecessor
         return PackageSupervisor(self.candidate(plan),sha(encoded(plan)),
                                  plan['before']['files'][str(previous.state)],previous.state)
 
-    def data(self,plan):
-        _,_,reference_plan=self.predecessor()
+    def data(self,plan,predecessor=None):
+        _,_,reference_plan=self.predecessor() if predecessor is None else predecessor
         db=self.reference.database(reference_plan);before=plan['before']['database']
         if isinstance(db,ReferenceDatabase):
             observed=db.read("""SELECT jsonb_build_object(
@@ -1746,12 +1822,30 @@ class CodePackageUpgrade:
         self.active();return 'COMMITTED'
 
     def active(self):
+        self.host.lease.require();self.core()
+        return self._active_package(self.predecessor())
+
+    def active_for_assistant_rollout(self,expected_plan,core_authority,*,preserve_only):
+        self.host.lease.require()
+        selected=core_authority(preserve_only=preserve_only)
+        must(selected is not None or preserve_only,'community_assistant_core_in_flight')
+        return self._active_package(self.predecessor(retained=True),rollout_plan=sha256_value(expected_plan))
+
+    def _active_package(self,predecessor,*,rollout_plan=None):
         h=self.host;h.lease.require();marker=h.read(self.marker);ident=marker.get('plan_sha256')
         must(re.fullmatch('[a-f0-9]{64}',str(ident)) and
              marker=={'schema':CODE_PACKAGE_SCHEMA,'plan_sha256':ident},'community_code_active_pointer')
-        plan=h.read(self.root/ident/'approval.json');self.verify(plan)
+        if rollout_plan is not None:must(ident==rollout_plan,'community_assistant_code_plan')
+        plan=h.storage.read_private_record(self.root/ident/'approval.json',expected_sha256=ident)
+        self._verify_package(plan,predecessor)
         record=h.read(self.root/ident/'journal.json')
-        must(record['phase'] in ('ACTIVATE_INTENT','COMMITTED') and record['plan_sha256']==ident,
+        allowed={'COMMITTED'} if rollout_plan is not None else {'ACTIVATE_INTENT','COMMITTED'}
+        must(record['phase'] in allowed and record['schema']==CODE_PACKAGE_SCHEMA and record['plan_sha256']==ident,
              'community_code_not_committed')
-        self.data(plan)
-        return self.candidate(plan),self.supervisor_for(plan)
+        supervisor=self.supervisor_for(plan,predecessor)
+        if rollout_plan is not None:
+            expected_attempts=[*plan['before']['state']['attempts'],record.get('operation_id')]
+            attempts=supervisor.registered()['attempts']
+            must(attempts[:len(expected_attempts)]==expected_attempts,'community_assistant_code_activation')
+        self.data(plan,predecessor)
+        return self.candidate(plan),supervisor

@@ -91,6 +91,29 @@ class Reference(unittest.TestCase):
         self.assertEqual('INSTALLED_NO_RECOVERY',self.f.recover())
         self.retained()
 
+    def test_retained_reference_proof_checks_fixed_policy_current_and_controller_preimages(self):
+        self.prepare()
+        self.f.install()
+        self.commit_candidate()
+        handoff=v.env_values(self.f.g.live['handoff'].read_bytes())
+        policy=deepcopy(self.f.new)
+        expected=self.effective()
+        history={}
+        for name in ('policy','core-current','original-controller-active'):
+            target=self.rt.preserved()[name]
+            retained=self.root/'runtime/core-publications/fixture-reference-history'/name
+            original=target.read_bytes()
+            self.put(retained,original)
+            history[target]=(retained,self.rt.private,v.sha(original))
+            self.put(target,v.encoded({'fixture':'subsequent publication'}))
+        with self.assertRaises(Exception):
+            self.effective()
+        self.assertEqual(expected,v.applied_reference_publication(self.rt,policy,handoff,historical=history))
+        retained,_,_=history[self.rt.preserved()['core-current']]
+        self.put(retained,v.encoded({'fixture':'drifted saved Core record'}))
+        with self.assertRaises(Exception):
+            v.applied_reference_publication(self.rt,policy,handoff,historical=history)
+
     def test_partial_policy_copy_restores_only_the_reference_attempt(self):
         self.prepare();copy=self.f.f.rt.storage.atomic_copy_file
         def lost_reply(src,dst,*args,**kwargs):

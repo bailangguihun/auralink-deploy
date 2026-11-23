@@ -236,6 +236,43 @@ class RuntimeMethodTests(unittest.TestCase):
         with self.assertRaises(Refused):
             self.runtime.record(snapshot_id, "STOPPED", command="must not be interpreted")
 
+    def test_illustration_core_publication_keeps_the_community_process_checkpoint(self):
+        snapshot_id, _ = self.prepared()
+        observed = {"state": "READY_PRESERVED", "pid": 12, "start_ticks": 345}
+        actions = []
+
+        def community_action(action, fd):
+            actions.append((action, fd))
+            return dict(observed)
+
+        engine = SimpleNamespace(community_action=community_action)
+        runtime_module.guard.policy.return_value = {"upgrade": {"core_followup": {
+            "schema": "R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1",
+        }}}
+        self.runtime.community_maintenance(engine)
+        self.runtime.community_maintenance(engine, resuming=True)
+        self.assertEqual(actions, [("preserve", 17), ("preserve", 17)])
+        checkpoint = self.runtime.transaction_folder(snapshot_id) / "community-maintenance.json"
+        self.assertEqual(self.runtime.read(checkpoint), observed)
+        observed["start_ticks"] = 346
+        with self.assertRaisesRegex(Refused, "community_maintenance_drift"):
+            self.runtime.community_maintenance(engine, resuming=True)
+
+    def test_illustration_rollback_refuses_new_critic_before_changing_journal(self):
+        snapshot_id, _ = self.prepared()
+        journal = self.runtime.transaction_folder(snapshot_id) / "journal.json"
+        before = journal.read_bytes()
+        guard = runtime_module.guard
+        guard.policy.return_value = {"schema": guard.BUSINESS_POLICY_SCHEMA, "upgrade": {"core_followup": {
+            "schema": guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA, "ai_release": {"commit_sha": "old"},
+        }}}
+        guard.release_record.side_effect = lambda *args: {"schema": guard.BUSINESS_RECORD_SCHEMA}
+        with patch.object(guard, 'verify_assistant_rollout_ai', return_value={"commit_sha": "new"}), \
+                self.assertRaisesRegex(Refused, "illustration_core_restore_ai_before_core"):
+            self.runtime.verify_rollback_source(self.new)
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertNotIn("java_stopped", self.events)
+
     def test_begin_refuses_pending_recovery_without_replacing_active_pointer(self):
         first = self.runtime.snapshot(self.old, self.new)
         with patch.object(runtime_module.secrets, "token_hex", return_value="2" * 32):

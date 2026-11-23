@@ -35,13 +35,25 @@ class ReleaseBundleTests(unittest.TestCase):
             self.assertEqual((self.output / name).read_bytes(), (other / name).read_bytes())
         self.assertEqual(report['status'], 'NOT_DEPLOYED')
         self.assertIs(report['installation_performed'], False)
-        self.assertEqual(len(report['files']), 25)
-        self.assertEqual(sum(name.endswith('.py') for name in bundle.FILES), 24)
+        self.assertEqual(len(report['files']), 28)
+        self.assertEqual(sum(name.endswith('.py') for name in bundle.FILES), 27)
+        self.assertEqual(set(bundle.FILES) - set(bundle.FILES_V1), {
+            'assistant_rollout_binding.py', 'assistant_rollout_controller.py', 'assistant_rollout_prepare.py',
+        })
         with zipfile.ZipFile(self.output / bundle.ARCHIVE_NAME) as archive:
             self.assertEqual(archive.namelist(), list(bundle.FILES))
             for name in bundle.FILES:
                 self.assertEqual(archive.read(name), (ROOT / 'r25' / name).read_bytes())
         self.assertFalse(any(name.startswith('test_') or '/' in name or name.endswith('.env') for name in bundle.FILES))
+
+    def test_historical_inventory_is_still_verifiable(self):
+        self.output.mkdir()
+        files = {name: (ROOT / 'r25' / name).read_bytes() for name in bundle.FILES_V1}
+        payload = bundle.archive_bytes(files)
+        manifest = bundle.manifest_for(files, payload, bundle.identity(*IDENTITY))
+        (self.output / bundle.ARCHIVE_NAME).write_bytes(payload)
+        (self.output / bundle.MANIFEST_NAME).write_text(json.dumps(manifest))
+        self.assertEqual(self.verify(), manifest)
 
     def test_wrong_ref_repository_and_independent_event_identity_refused(self):
         self.build()

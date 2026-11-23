@@ -153,7 +153,7 @@ class ManagedSuccessor(unittest.TestCase):
         package=importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
         if publication_successor or publication_repair or knowledge or studio or reference:publication=True
         commit=('b3'*20 if reference else 'b1'*20 if studio else ('e' if knowledge else '6' if publication_repair else '8' if publication_successor else '9' if publication else 'c')*40);self.bundle=self.f.root/'operations/r25-controller-candidates'/commit
-        payload={name:(self.f.bundle/name).read_bytes() for name in package.FILES}
+        payload={name:(self.f.bundle/name).read_bytes() for name in package.FILES_V1}
         for name in ('core_release_guard.py','upgrade_assistant_controller.py','core_acceptance.py'):
             payload[name]=(HERE/name).read_bytes()
         if publication_successor or publication_repair or knowledge or studio or reference:

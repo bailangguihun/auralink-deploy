@@ -95,6 +95,61 @@ class CodePackage(unittest.TestCase):
         self.assertEqual(self.install(),'COMMITTED_VERIFIED_NOOP')
         self.retained()
 
+    def test_assistant_keepalive_uses_the_approved_code_package_without_touching_process_state(self):
+        self.assertEqual(self.install(),'COMMITTED')
+        ident=self.folder.name
+        with self.lease.held():
+            candidate,supervisor=self.code.active()
+            expected=candidate.preserve_running(supervisor)
+        files={p:p.read_bytes() for p in (self.code.marker,self.folder/'approval.json',
+            self.folder/'journal.json',supervisor.state,candidate.role().root/'current.json',
+            candidate.role().current()[0])}
+        from community_host_cli import assistant_community_command
+        with patch.object(self.code.reference,'require_core',side_effect=ValueError('historical_core_inactive')):
+            with self.lease.held():
+                with self.assertRaisesRegex(ValueError,'historical_core_inactive'):
+                    self.code.active()
+                self.assertEqual(assistant_community_command(self.code,'watchdog-preserve',ident,
+                    lambda *,preserve_only: None if preserve_only else self.fail('preserve scope lost')),expected)
+        for path,raw in files.items():self.assertEqual(path.read_bytes(),raw,str(path))
+        self.retained()
+
+    def test_assistant_declines_mutating_operations_in_flight_and_unapproved_active_plans(self):
+        self.assertEqual(self.install(),'COMMITTED')
+        ident=self.folder.name
+        from community_host_cli import assistant_community_command
+        with self.lease.held():
+            candidate,supervisor=self.code.active()
+        before=supervisor.state.read_bytes()
+        def transitional(*,preserve_only):
+            self.assertIs(preserve_only,False)
+            return None
+        def eligible(*,preserve_only):
+            self.assertIs(preserve_only,False)
+            return self.code.reference.context['candidate']
+        with self.lease.held():
+            for command in ('watchdog-tick','watchdog-drain','enable','stop','observe'):
+                with self.subTest(command=command),self.assertRaisesRegex(ValueError,'community_assistant_core_in_flight'):
+                    assistant_community_command(self.code,command,ident,transitional)
+            with self.assertRaisesRegex(ValueError,'community_assistant_code_plan'):
+                assistant_community_command(self.code,'observe','e'*64,eligible)
+            self.assertEqual(assistant_community_command(self.code,'observe',ident,eligible),'READY')
+            self.assertEqual(candidate.control('observe'),'READY')
+        self.assertEqual(supervisor.state.read_bytes(),before)
+
+    def test_assistant_refuses_uncommitted_or_mixed_code_activation(self):
+        self.assertEqual(self.install(),'COMMITTED')
+        journal=self.folder/'journal.json'
+        committed=self.h.read(journal)
+        from community_host_cli import assistant_community_command
+        with self.lease.held():
+            for changes, reason in (({'phase':'ACTIVATE_INTENT'},'community_code_not_committed'),
+                                    ({'operation_id':'e'*32},'community_assistant_code_activation')):
+                with self.subTest(changes=changes),self.assertRaisesRegex(ValueError,reason):
+                    self.h.write(journal,dict(committed,**changes))
+                    assistant_community_command(self.code,'observe',self.folder.name,
+                                               lambda **_:self.code.reference.context['candidate'])
+
     def interrupt_before_spawn(self,target):
         def fail(phase):
             if phase==target:raise InterruptedError(target)

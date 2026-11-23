@@ -13,14 +13,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  package:
-    name: Build controller installation artifact
-    # Match the native PostgreSQL 16 jobs in PR CI.
+  r25-shards:
+    name: Verify release R25 suite shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
-    # Run the same full proof suite as PR CI; its 20/30-minute runs timed out
-    # with every completed test passing. Allow slower runners and artifact checks.
-    # This remains package-only.
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Require release branch
         shell: bash
@@ -51,8 +51,52 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Verify complete R25 test suite
-        run: python -B -m unittest discover -s r25 -p 'test_*.py' -v
+      - name: Run assigned occurrences from complete R25 discovery
+        run: |
+          python -B scripts/r25_test_shards.py run \
+            --shard '${{ matrix.shard }}' --commit "$GITHUB_SHA" \
+            --report "$RUNNER_TEMP/r25-release-shard-${{ matrix.shard }}/report.json"
+
+      - name: Retain release test proof and per-test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r25-release-shard-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/r25-release-shard-${{ matrix.shard }}/report.json
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Build controller installation artifact
+    needs: r25-shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require release branch
+        shell: bash
+        run: test "$GITHUB_REF" = refs/heads/release
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: r25-release-shard-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/r25-release-shard-reports
+
+      - name: Verify four complete reports for this exact release commit
+        run: |
+          python -B scripts/r25_test_shards.py verify-reports \
+            --directory "$RUNNER_TEMP/r25-release-shard-reports" --commit "$GITHUB_SHA"
 
       - uses: actions/checkout@v4
         with:
