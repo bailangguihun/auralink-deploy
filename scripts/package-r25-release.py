@@ -15,7 +15,7 @@ HISTORICAL_REPOSITORY = 'Hang-666-star/auralink-deploy'
 # to the current owner or accept an arbitrary fork with the same project name.
 VERIFIABLE_REPOSITORIES = (REPOSITORY, HISTORICAL_REPOSITORY)
 REF = 'refs/heads/release'
-FILES = tuple(sorted((
+FILES_V1 = tuple(sorted((
     'assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py','assistant_acceptance.py','assistant_backup.py','upgrade_assistant_controller.py',
     'ai_publish.py', 'ai_release_candidate.py', 'ai_release_guard.py', 'ai_runtime.py',
     'ai-baseline.json', 'control_overlay.py', 'core_acceptance.py', 'core_publish.py',
@@ -24,6 +24,8 @@ FILES = tuple(sorted((
     'install_ai_controller.py', 'install_core_controller.py', 'publisher_transaction.py',
     'r25_storage.py', 'verify-r25-artifact.py',
 )))
+FILES = tuple(sorted((*FILES_V1, 'assistant_rollout_binding.py', 'assistant_rollout_controller.py',
+                      'assistant_rollout_prepare.py')))
 MAX_FILE_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = len(FILES) * (MAX_FILE_BYTES + 512)
 ARCHIVE_NAME = 'r25-controller.zip'
@@ -60,7 +62,7 @@ def digest(data):
 def archive_bytes(payload):
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED) as archive:
-        for name in FILES:
+        for name in sorted(payload):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = (stat.S_IFREG | 0o600) << 16
@@ -71,7 +73,8 @@ def archive_bytes(payload):
 def manifest_for(payload, archive, expected):
     return dict(schema=1, **expected, status='NOT_DEPLOYED', installation_performed=False,
                 archive=dict(name=ARCHIVE_NAME, bytes=len(archive), sha256=digest(archive)),
-                files=[dict(path=name, bytes=len(payload[name]), sha256=digest(payload[name])) for name in FILES])
+                files=[dict(path=name, bytes=len(payload[name]), sha256=digest(payload[name]))
+                       for name in sorted(payload)])
 
 
 def create(source, output, repository, ref, commit, run_id, run_attempt):
@@ -109,7 +112,7 @@ def verify(archive_path, manifest_path, repository, ref, commit, run_id, run_att
     manifest = strict_json(read_regular(manifest_path, MAX_FILE_BYTES))
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         entries = archive.infolist()
-        require([entry.filename for entry in entries] == list(FILES), 'archive_allowlist')
+        require(tuple(entry.filename for entry in entries) in (FILES_V1, FILES), 'archive_allowlist')
         payload = {}
         for entry in entries:
             require(entry.file_size <= MAX_FILE_BYTES and entry.compress_type == zipfile.ZIP_STORED,

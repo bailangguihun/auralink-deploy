@@ -166,7 +166,12 @@ class AIRuntime:
         current = guard.reference(before_current.get('release'))
         before = self.verify_candidate(current)
         after = self.verify_candidate(candidate)
-        configuration = self.successor_configuration(current, candidate, after)
+        policy = guard.core.policy()
+        rollout = guard.core.is_assistant_rollout(policy)
+        if rollout:
+            must(guard.core.verify_assistant_rollout_ai(policy, candidate=candidate) == current,
+                 'illustration_ai_current_binding')
+        configuration = self.successor_configuration(current, candidate, after, policy)
         guard.verify_live(current)
         paired_core = self.core.current()
         self.core.verify_current(paired_core)
@@ -182,7 +187,7 @@ class AIRuntime:
         if added:
             must(added == set(guard.ASSISTANT_PATHS)-set(guard.SOURCE_PATHS) and not new_directory.exists() and not new_directory.is_symlink(), 'ai_new_directory_must_be_absent')
         changed = sorted({role(name) for name, value in files.items() if value['before'] != value['after']})
-        if configuration is not None:
+        if configuration is not None or rollout:
             must(changed == ['critic'], 'successor_guide_source_preserved')
         must(shutil.disk_usage(STORE).free > 64 * 1024 * 1024 + sum(x['before']['bytes'] for x in files.values() if x['before'] is not None) * 3,
              'ai_snapshot_disk_space')
@@ -216,8 +221,7 @@ class AIRuntime:
         return {'ai': ROOT / 'runtime/config/assistant-private/assistant-runtime.json',
                 'core': ROOT / 'runtime/config/application.yml'}
 
-    def successor_configuration(self, current, candidate, record):
-        policy = guard.core.policy()
+    def successor_configuration(self, current, candidate, record, policy):
         transition = policy.get('upgrade', {}).get('successor')
         if transition is None: return None
         module = guard.core.business_module(policy)
@@ -302,6 +306,9 @@ class AIRuntime:
 
     def validate_recovery(self, tx):
         self.core.require_lease()
+        policy = guard.core.policy()
+        if guard.core.is_assistant_rollout(policy):
+            guard.core.verify_assistant_rollout_ai(policy, for_start=False)
         journal, snapshot = self.load(tx)
         must(self.read(STORE / 'ACTIVE.json').get('transaction_id') == tx, 'ai_not_active_transaction')
         must(self.current() in (snapshot['current'], snapshot['candidate']), 'ai_current_drift')

@@ -71,7 +71,7 @@ class Knowledge(unittest.TestCase):
         return release
     def controller_package(self,commit,run):
         spec=importlib.util.spec_from_file_location('knowledge_fixture_package',HERE.parent/'scripts/package-r25-release.py');package=importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
-        sources={n:(self.f.bundle/n).read_bytes() for n in package.FILES};raw=package.archive_bytes(sources)
+        sources={n:(self.f.bundle/n).read_bytes() for n in package.FILES_V1};raw=package.archive_bytes(sources)
         manifest=package.manifest_for(sources,raw,package.identity('bailangguihun/auralink-deploy',package.REF,commit,run,'1'));folder=self.root/'operations/r25-controller-candidates'/commit
         for n,b in sources.items():self.put(folder/n,b)
         self.put(folder/'r25-controller.zip',raw);self.put(folder/'r25-controller-manifest.json',v.encoded(manifest))

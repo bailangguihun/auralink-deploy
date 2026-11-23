@@ -411,3 +411,29 @@ def render_community_code_lifecycle(before):
                      'community_code_verified_start_timeout')
     ast.parse(raw)
     return raw
+
+
+def render_assistant_rollout_lifecycle(before):
+    """Route the existing Community watchdog through the approved successor."""
+    anchor = b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+    if (before.count(b"extra+=['--code-publication-sha256',code_id]") != 1 or
+            b"--assistant-rollout-sha256" in before):
+        raise OverlayRefused('assistant_rollout_requires_community_code')
+    addition = b'''        controller=self.root/'runtime/core-publications/CONTROL_UPGRADE_ACTIVE.json'
+        guard(controller,self.private)
+        pointer=json.loads(controller.read_bytes());rollout_id=pointer.get('approval_sha256')
+        must(re.fullmatch('[a-f0-9]{64}',str(rollout_id)) and pointer=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':rollout_id},'community_rollout_pointer')
+        folder=controller.parent/'controller-upgrades'/rollout_id
+        approval=folder/'approval.json';guard(approval,self.private,0o600,rollout_id)
+        raw=approval.read_bytes();must(hashlib.sha256(raw).hexdigest()==rollout_id,'community_rollout_approval_changed')
+        approved=json.loads(raw);journal=folder/'journal.json';guard(journal,self.private)
+        receipt=json.loads(journal.read_bytes())
+        must(approved['schema']==receipt['schema']=='R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1' and receipt['approval_sha256']==rollout_id and receipt['phase'] in ('VERIFY_INTENT','INSTALLED'),'community_rollout_not_installed')
+        community=approved['assistant_rollout']['community']
+        must(extra[-2:]==['--code-publication-sha256',community['code_controller_sha256']],'community_rollout_parent')
+        record=dict(record,controller_manifest_sha256=community['deploy']['manifest_sha256'],cli_sha256=community['cli_sha256'])
+        extra+=['--assistant-rollout-sha256',rollout_id]
+'''
+    raw = replace_once(before, anchor, addition + anchor, 'community_rollout_method')
+    ast.parse(raw)
+    return raw

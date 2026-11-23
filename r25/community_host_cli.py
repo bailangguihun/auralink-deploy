@@ -14,6 +14,9 @@ import stat
 import sys
 
 
+ASSISTANT_COMMANDS={'observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve'}
+
+
 def verify_controller(root, digest, owner=(0,0)):
     root=Path(root).absolute()
     manifest=root/'manifest.json'
@@ -49,15 +52,29 @@ def bootstrap(digest):
 
 def supervision_command(host, command, bundle, *, supervisor=None, operation_id=None):
     """Shared production CLI dispatch, also exercised across fixture processes."""
+    with host.lease.held():
+        return _supervision_action(host,command,bundle,supervisor,operation_id)
+
+
+def _supervision_action(host, command, bundle, supervisor, operation_id):
     from community_supervision import Supervisor
     supervisor=supervisor or Supervisor(host)
-    with host.lease.held():
-        if command=='register':return supervisor.register(bundle)
-        if command=='enable':
-            return supervisor.enable() if type(supervisor) is Supervisor else supervisor.enable(operation_id)
-        if command in {'disable','watchdog-tick','watchdog-drain'}:
-            return supervisor.tick(drain=command in {'disable','watchdog-drain'})
-        raise ValueError('community_supervision_command')
+    if command=='register':return supervisor.register(bundle)
+    if command=='enable':
+        return supervisor.enable() if type(supervisor) is Supervisor else supervisor.enable(operation_id)
+    if command in {'disable','watchdog-tick','watchdog-drain'}:
+        return supervisor.tick(drain=command in {'disable','watchdog-drain'})
+    raise ValueError('community_supervision_command')
+
+
+def assistant_community_command(code, command, expected_plan, core_authority, *, operation_id=None):
+    if command not in ASSISTANT_COMMANDS:raise ValueError('community_assistant_scope')
+    preserve=command=='watchdog-preserve'
+    host,supervisor=code.active_for_assistant_rollout(expected_plan,core_authority,preserve_only=preserve)
+    if preserve:return host.preserve_running(supervisor)
+    if command=='observe':return host.control('observe')
+    if command=='stop':command='disable'
+    return _supervision_action(host,command,None,supervisor,operation_id)
 
 
 def main():
@@ -71,6 +88,7 @@ def main():
     p.add_argument('--studio-publication-sha256')
     p.add_argument('--reference-publication-sha256')
     p.add_argument('--code-publication-sha256')
+    p.add_argument('--assistant-rollout-sha256')
     p.add_argument('--reference-plan')
     p.add_argument('--reference-plan-sha256')
     p.add_argument('--database-plan')
@@ -85,6 +103,16 @@ def main():
     binding=plan['lease']
     legacy_sha=None
     code_context=None
+    rollout=None
+    if a.assistant_rollout_sha256 is not None:
+        if not a.code_publication_sha256 or a.command not in ASSISTANT_COMMANDS:
+            raise ValueError('community_assistant_scope')
+        from community_host import assistant_community_approval
+        rollout=assistant_community_approval(a.assistant_rollout_sha256,a.code_publication_sha256,
+            a.bundle_manifest_sha256,preserve_only=a.command=='watchdog-preserve')
+        entry=ROOT/'operations/community-controller'/a.bundle_manifest_sha256/'community_host_cli.py'
+        if Path(__file__).absolute()!=entry or identity(entry)['sha256']!=rollout['assistant_rollout']['community']['cli_sha256']:
+            raise ValueError('community_assistant_controller_entry')
     if a.command.startswith('code-') and not a.code_publication_sha256:
         raise ValueError('community_code_controller_required')
     if a.command.startswith('reference-') and not a.reference_publication_sha256:
@@ -100,7 +128,7 @@ def main():
         from community_host import code_publication_binding
         binding,legacy_sha,code_context=code_publication_binding(plan,a.plan_sha256,a.bundle_manifest_sha256,
             a.knowledge_publication_sha256,a.supervision_upgrade_sha256,a.studio_publication_sha256,
-            a.reference_publication_sha256,a.code_publication_sha256)
+            a.reference_publication_sha256,a.code_publication_sha256,rollout=rollout)
     elif a.reference_publication_sha256:
         if not all([a.knowledge_publication_sha256,a.supervision_upgrade_sha256,a.studio_publication_sha256]) or a.command not in ('observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve','reference-prepare','reference-install','reference-recover'):
             raise ValueError('community_reference_scope')
@@ -136,6 +164,19 @@ def main():
     if a.supervision_upgrade_sha256:
         from community_supervision import RecoverySupervisor
         supervisor=RecoverySupervisor(host,a.supervision_upgrade_sha256,legacy_sha)
+    if rollout is not None:
+        from community_host import CodePackageUpgrade,ReferencePackageUpgrade,assistant_reference_package_context
+        from core_release_guard import require_community_rollout
+        with lease.held():
+            context=assistant_reference_package_context(host,a.reference_publication_sha256,
+                a.assistant_rollout_sha256,rollout,code_context)
+            code=CodePackageUpgrade(ReferencePackageUpgrade(host,supervisor,context),code_context)
+            def core_authority(*,preserve_only):
+                return require_community_rollout(a.assistant_rollout_sha256,lease.fd,preserve_only=preserve_only)
+            result=assistant_community_command(code,a.command,rollout['assistant_rollout']['community']['code_plan_sha256'],
+                                               core_authority,operation_id=a.operation_id)
+        print(json.dumps(dict(community=result)))
+        return
     if a.reference_publication_sha256:
         from community_host import ReferencePackageUpgrade,reference_package_context
         with lease.held():

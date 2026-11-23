@@ -639,6 +639,8 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
+    if value.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1':
+        return applied_assistant_rollout(rt,value,handoff,controller)
     if (rt.store/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json').exists():return applied_code_publication(rt,value,handoff)
     if (rt.store/'REFERENCE_PUBLICATION_ACTIVE.json').exists():return applied_reference_publication(rt,value,handoff)
     if (rt.store/'STUDIO_PUBLICATION_ACTIVE.json').exists():return applied_studio_publication(rt,value,handoff)
@@ -2454,7 +2456,7 @@ def verify_reference_publication(rt, plan, phase='before', *, runtime=False, his
     must(sha(studio_handoff(before['handoff'],entries)) == entries['handoff']['after_sha256'] and
          entries['guard']['after_sha256'] == entries['core_release_guard.py']['after_sha256'],
          'reference_control_render')
-    current=read(rt.preserved()['original-controller-active'],rt.private)
+    current=proof_read(historical,rt.preserved()['original-controller-active'],rt.private)
     after=encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':sha(encoded(plan))})
     must(sha(current) in ({binding['control_active_sha256']} if phase == 'before' else
          {sha(after)} if phase == 'after' else {binding['control_active_sha256'],sha(after)}),
@@ -2474,7 +2476,7 @@ def applied_reference_publication(rt, value, handoff, *, historical=None):
     must(record.get('schema') == REFERENCE_SCHEMA and record.get('approval_sha256') == ident and
          record.get('phase') in {'VERIFY_INTENT','INSTALLED'},'reference_incomplete')
     previous=verify_reference_publication(rt,plan,'after',runtime=True,historical=historical)
-    must(json_read(rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256']) == value
+    must(proof_json(historical,rt.preserved()['policy'],rt.private,plan['operational']['policy']['after_sha256']) == value
          and env_values(proof_read(historical,rt.targets()['handoff'][0],rt.private)) == handoff,'reference_arguments')
     must(value['upgrade']['core_followup']['schema'] == 'R25_REFERENCE_CORE_PUBLICATION_V1' and
          value['upgrade']['core_followup']['predecessor_policy_sha256'] ==
@@ -2482,7 +2484,7 @@ def applied_reference_publication(rt, value, handoff, *, historical=None):
          value['upgrade']['assistant']['migrations'] == previous['upgrade']['assistant']['migrations'] and
          value['upgrade']['compatibility'] == previous['upgrade']['compatibility'],
          'reference_retention_preserved')
-    knowledge_current(rt,plan,value)
+    knowledge_current(rt,plan,value,historical=historical)
     result=copy.deepcopy(value)
     result['controllers']['lifecycle_adapter.py']=plan['operational']['lifecycle']['after_sha256']
     return result
@@ -3119,13 +3121,19 @@ def code_controller_folder(rt,ident):
     return rt.store/'community-code-publication'/digest(ident)
 
 
-def code_core_runtime(rt):
-    raw=read(rt.preserved()['core-current'],rt.private);current=json_bytes(raw)
+def code_core_receipt(rt, historical=None):
+    raw=proof_read(historical,rt.preserved()['core-current'],rt.private);current=json_bytes(raw)
     tx=digest(current['transaction_id'],32)
     journal=read(rt.root/'runtime/core-publications/transactions'/tx/'journal.json',rt.private)
     receipt=json_bytes(journal)
     must(receipt['phase']=='COMMITTED' and receipt['transaction_id']==tx and
          receipt['candidate']==current['release'],'community_code_core_not_committed')
+    return raw,journal,current['release']
+
+
+def code_core_runtime(rt, *, historical=None, read_archived_jar=None):
+    raw,journal,release=code_core_receipt(rt,historical)
+    must((historical is None)==(read_archived_jar is None),'community_code_history_requires_verified_archive')
     jar=rt.root/'release/artifacts/backend.jar'
     directory_fd=None;fd=None
     try:
@@ -3140,6 +3148,16 @@ def code_core_runtime(rt):
              'community_code_runtime_jar_directory_identity')
         directory_identity={'device':parent.st_dev,'inode':parent.st_ino,
                             'uid':parent.st_uid,'gid':parent.st_gid,'mode':0o700}
+        if read_archived_jar is not None:
+            actual=digest(release['artifact_sha256'])
+            commit=digest(release['commit_sha'],40)
+            folder=rt.root/'runtime/core-publications/releases'/(actual+'-'+commit)
+            accepted=json_read(folder/'record.json',rt.private,digest(release['accepted_record_sha256']))
+            must(accepted.get('commit_sha')==commit and accepted.get('artifact_sha256')==actual,
+                 'community_code_archived_core_record')
+            read_archived_jar(folder/'backend.jar',owner=rt.private,expected=actual,limit=256*1024*1024)
+            return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual,
+                    'jar_directory':directory_identity}
         fd=os.open(jar.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK,dir_fd=directory_fd)
         before=os.fstat(fd)
         must(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and
@@ -3160,18 +3178,18 @@ def code_core_runtime(rt):
     finally:
         if fd is not None:os.close(fd)
         if directory_fd is not None:os.close(directory_fd)
-    must(actual==current['release']['artifact_sha256'],'community_code_runtime_jar_changed')
+    must(actual==release['artifact_sha256'],'community_code_runtime_jar_changed')
     return {'current_sha256':sha(raw),'transaction_sha256':sha(journal),'jar_sha256':actual,
             'jar_directory':directory_identity}
 
 
-def code_controller_sources(rt,plan):
+def code_controller_sources(rt,plan,*,historical=None):
     formal,sources=revision_bundles(rt,plan['deploy'],plan['controller_deploy'])
     _,community=knowledge_community_bundle(rt,plan['community_deploy'],plan['controller_deploy'])
     for name in MODULES:
         if name!='vmm_controller.py':
             path,owner,mode=rt.targets()['publisher-guard' if name=='core_release_guard.py' else name]
-            must(read(path,owner,mode)==sources[name],'community_code_unrelated_module')
+            must(proof_read(historical,path,owner,mode)==sources[name],'community_code_unrelated_module')
     parent=json_read(rt.root/'runtime/core-publications/controller-upgrades'/plan['reference_sha256']/'approval.json',
                      rt.private,plan['reference_sha256'])
     _,old=knowledge_community_bundle(rt,parent['vmm']['community']['deploy'],parent['deploy'])
@@ -3188,8 +3206,8 @@ def code_controller_sources(rt,plan):
     return formal,sources,renderer
 
 
-def code_controller_render(rt,plan,before):
-    _,sources,renderer=code_controller_sources(rt,plan)
+def code_controller_render(rt,plan,before,*,historical=None):
+    _,sources,renderer=code_controller_sources(rt,plan,historical=historical)
     after={'vmm_controller.py':sources['vmm_controller.py'],
            'lifecycle':renderer.render_community_code_lifecycle(before['lifecycle'])}
     handoff=before['handoff'];values=env_values(handoff)
@@ -3201,18 +3219,20 @@ def code_controller_render(rt,plan,before):
     return after
 
 
-def verify_code_controller(rt,plan,folder,phase,*,runtime=False):
+def verify_code_controller(rt,plan,folder,phase,*,runtime=False,historical=None,read_archived_jar=None):
     must(set(plan)=={'schema','deploy','controller_deploy','community_deploy','community_cli_sha256',
          'community_source_provenance','reference_sha256','core_runtime','review_evidence_sha256',
          'lease','preserved','files'} and plan['schema']==CODE_CONTROLLER_SCHEMA and
          phase in ('before','mixed','after'),'community_code_controller_plan')
     must(plan['lease']==community_upgrade_lease(rt),'community_code_lease_changed')
+    must(historical is None or (runtime and phase=='after'),'community_code_history_runtime_only')
     parent=digest(plan['reference_sha256'])
     must(json_read(rt.store/'REFERENCE_PUBLICATION_ACTIVE.json',rt.private)==
          {'schema':REFERENCE_MARKER,'approval_sha256':parent},'community_code_reference_changed')
     receipt=json_read(rt.root/'runtime/core-publications/controller-upgrades'/parent/'journal.json',rt.private)
     must(receipt['phase']=='INSTALLED' and receipt['approval_sha256']==parent,'community_code_reference_incomplete')
-    must(code_core_runtime(rt)==plan['core_runtime'],'community_code_core_runtime_changed')
+    observed=code_core_runtime(rt,historical=historical,read_archived_jar=read_archived_jar)
+    must(observed==plan['core_runtime'],'community_code_core_runtime_changed')
     source=plan['community_source_provenance']
     must(set(source)=={'commit','run_id','run_attempt','archive_sha256','manifest_sha256'},'community_code_source_fields')
     digest(source['commit'],40);digest(source['archive_sha256']);digest(source['manifest_sha256'])
@@ -3221,9 +3241,9 @@ def verify_code_controller(rt,plan,folder,phase,*,runtime=False):
     must(set(plan['preserved'])==set(rt.preserved()),'community_code_preserved_inventory')
     for name,path in rt.preserved().items():
         if runtime and name not in {'policy','core-current','original-controller-active','application'}:continue
-        read(path,rt.private,expected=plan['preserved'][name])
+        proof_read(historical,path,rt.private,expected=plan['preserved'][name])
     must(set(plan['files'])==set(CODE_CONTROLLER_TARGETS),'community_code_fixed_targets')
-    before={};history={}
+    before={};history=dict(historical or {})
     for name in CODE_CONTROLLER_TARGETS:
         entry=plan['files'][name]
         must(set(entry)=={'before_sha256','after_sha256'},'community_code_target_fields')
@@ -3233,7 +3253,7 @@ def verify_code_controller(rt,plan,folder,phase,*,runtime=False):
         else:
             must(phase=='before','community_code_missing_preimage')
             before[name]=read(path,owner,mode,entry['before_sha256'])
-        actual=read(path,owner,mode)
+        actual=proof_read(historical,path,owner,mode)
         if runtime and name=='handoff':
             wanted=read(folder/'after'/name,rt.private,expected=entry['after_sha256'])
             must(control_handoff_values(actual)==control_handoff_values(wanted) and
@@ -3242,15 +3262,15 @@ def verify_code_controller(rt,plan,folder,phase,*,runtime=False):
         else:must(sha(actual) in (set(entry.values()) if phase=='mixed' else {entry[phase+'_sha256']}),
                   'community_code_live_target_drift:'+name)
         if saved.exists():history[path]=(saved,rt.private,entry['before_sha256'])
-    after=code_controller_render(rt,plan,before)
+    after=code_controller_render(rt,plan,before,historical=historical)
     must(all(sha(after[n])==plan['files'][n]['after_sha256'] for n in after),'community_code_render_changed')
     for name,raw in after.items():
         saved=folder/'after'/name
         if saved.exists():must(read(saved,rt.private)==raw,'community_code_after_image')
         else:must(phase=='before','community_code_missing_after_image')
-    # Only these three fixed control targets have historical projections.
-    # Core CURRENT/policy, parent approvals and process receipts stay live.
-    effective=applied_reference_publication(rt,json_read(rt.preserved()['policy'],rt.private),
+    # Runtime succession may supply independently verified preimages. The
+    # original Code proof still supplies only its own three fixed targets.
+    effective=applied_reference_publication(rt,proof_json(historical,rt.preserved()['policy'],rt.private),
                  env_values(before['handoff']),historical=history)
     if not runtime:revision_stopped(rt);revision_apps_committed(rt)
     return effective,after
@@ -3352,6 +3372,66 @@ def applied_code_publication(rt,value,handoff):
          handoff==env_values(read(rt.targets()['handoff'][0],rt.private)),'community_code_overlay_arguments')
     effective['controllers']['lifecycle_adapter.py']=plan['files']['lifecycle']['after_sha256']
     return effective
+
+
+def assistant_rollout_history(rt, approval, folder):
+    """Use only the fixed targets retained by the approved controller installer."""
+    targets=publication_targets(rt)
+    history={}
+    for name, entry in {**approval['files'],**approval['operational']}.items():
+        if name=='assistant_rollout_binding.py':
+            must(entry['before_sha256'] is None,'assistant_rollout_new_binding_module')
+            continue
+        target,_,_=targets[name]
+        before=folder/'before'/name
+        want=entry['before_sha256']
+        read(before,rt.private,expected=digest(want))
+        history[target]=(before,rt.private,want)
+    for key, name, digest_name in (
+            ('core-current','ILLUSTRATION_CORE_CURRENT.json','core_current_sha256'),
+            ('original-controller-active','CONTROL_UPGRADE_ACTIVE.json','control_active_sha256')):
+        before=folder/'before'/name
+        want=digest(approval['assistant_rollout'][digest_name])
+        read(before,rt.private,expected=want)
+        history[rt.preserved()[key]]=(before,rt.private,want)
+    return history
+
+
+def applied_assistant_rollout(rt,value,handoff,controller):
+    path,owner,mode=rt.targets()['publisher-guard']
+    raw=read(path,owner,mode,digest(value['runtime_modules']['core_release_guard.py']))
+    spec=importlib.util.spec_from_file_location('_r25_assistant_rollout_vmm_guard',path)
+    guard=importlib.util.module_from_spec(spec)
+    sys.modules[spec.name]=guard
+    exec(compile(raw,str(path),'exec',dont_inherit=True),guard.__dict__)
+    must(guard.ROOT==rt.root,'assistant_rollout_fixed_root')
+    approval,folder,_=guard.load_assistant_rollout_approval(value)
+    must(sha(controller)==approval['files']['vmm_controller.py']['after_sha256'],
+         'assistant_rollout_controller_digest')
+    live=read(rt.targets()['handoff'][0],rt.private)
+    must(handoff==env_values(live),'assistant_rollout_live_handoff_arguments')
+    want=read(folder/'after/handoff',rt.private,
+              expected=approval['operational']['handoff']['after_sha256'])
+    approved_env=env_values(want)
+    must(control_handoff_values(want)==control_handoff_values(live) and
+         handoff.get('R25_CORE_RELEASE_POLICY_SHA256')==approval['operational']['policy']['after_sha256'] and
+         all(handoff.get(key)==approved_env.get(key) for key in approved_env if key.startswith('R25_AI_RELEASE_')),
+         'assistant_rollout_handoff_binding')
+    # This proof can see an authorized in-flight JAR transition. The Java
+    # launcher and Community CLI independently enforce their start phases.
+    guard.verify_assistant_rollout_core(value,approval,folder,preserve_only=True)
+    code_id=digest(approval['assistant_rollout']['community']['code_controller_sha256'])
+    marker=json_read(rt.store/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json',rt.private)
+    must(marker=={'schema':CODE_CONTROLLER_SCHEMA,'approval_sha256':code_id},
+         'assistant_rollout_code_pointer')
+    code,code_folder=load_code_controller(rt,code_id)
+    must(json_read(code_folder/'journal.json',rt.private)=={
+         'schema':CODE_CONTROLLER_SCHEMA,'approval_sha256':code_id,'phase':'INSTALLED'},
+         'assistant_rollout_code_not_installed')
+    history=assistant_rollout_history(rt,approval,folder)
+    verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,
+                           read_archived_jar=guard.read_file)
+    return value
 
 
 def main():
