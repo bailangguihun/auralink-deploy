@@ -93,7 +93,7 @@ class PartitionContracts(unittest.TestCase):
             'test_misc.C.test_z',
         ]
         tests = [Case(identity) for identity in ids]
-        expected = {1: [1, 3], 2: [2], 3: [5], 4: [0, 4, 6]}
+        expected = {1: [0, 1, 3, 6], 2: [2, 4], 3: [5], 4: []}
         observed = []
         for shard in range(1, 5):
             partition = self.runner.partition_tests(tests, shard)
@@ -103,6 +103,16 @@ class PartitionContracts(unittest.TestCase):
             observed.extend(index for index, _ in partition)
         self.assertEqual(sorted(observed), list(range(len(tests))))
         self.assertEqual(len(observed), len(set(observed)))
+
+    def test_long_running_modules_do_not_share_a_shard(self):
+        longest = (
+            'test_reference_publication',
+            'test_community_code_controller',
+            'test_community_recovery_upgrade',
+            'test_studio_publication',
+        )
+        shards = {self.runner._assignment(name + '.Example.test_case') for name in longest}
+        self.assertEqual(len(shards), 4)
 
 
 class RunContracts(unittest.TestCase):
@@ -114,7 +124,7 @@ class RunContracts(unittest.TestCase):
         self.reports = self.root / 'reports'
         self.reports.mkdir()
 
-    def test_four_cli_shards_cover_discovery_and_new_tests_join_remainder(self):
+    def test_four_cli_shards_cover_discovery_and_assign_new_modules_stably(self):
         write_module(self.start, 'test_brand_new', '''
             import unittest
             class New(unittest.TestCase):
@@ -140,8 +150,10 @@ class RunContracts(unittest.TestCase):
         executed = [item for report in reports for item in report['executed']]
         self.assertEqual(sorted(item['occurrence_index'] for item in executed),
                          list(range(len(discovered))))
-        self.assertTrue(any(item['test_id'].startswith('test_brand_new.')
-                            for item in reports[3]['executed']))
+        new_module_shards = [report['shard'] for report in reports
+                             if any(item['test_id'].startswith('test_brand_new.')
+                                    for item in report['executed'])]
+        self.assertEqual(new_module_shards, [3])
         for item in executed:
             self.assertEqual(item['test_id'], discovered[item['occurrence_index']])
         result = cli('verify-reports', '--directory', self.reports, '--commit', COMMIT)
@@ -169,7 +181,7 @@ class RunContracts(unittest.TestCase):
                 def test_error(self):
                     raise RuntimeError('synthetic test exception')
         ''')
-        result, report, _ = run_report(self.start, self.reports, 4)
+        result, report, _ = run_report(self.start, self.reports, 2)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(report['successful'])
         self.assertEqual(len(report['failures']), 1)
@@ -188,7 +200,7 @@ class RunContracts(unittest.TestCase):
                 def test_interrupt_this_synthetic_child(self):
                     os._exit(23)
         ''')
-        result, report, _ = run_report(self.start, self.reports, 4)
+        result, report, _ = run_report(self.start, self.reports, 2)
         self.assertEqual(result.returncode, 23)
         self.assertFalse(report['successful'])
         self.assertEqual(report['status'], 'incomplete')

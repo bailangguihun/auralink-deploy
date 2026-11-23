@@ -263,6 +263,10 @@ class CoreRuntime:
         record = guard.release_record(release.artifact_sha256, release.accepted_record_sha256, release.commit_sha)
         if value.get('schema') != guard.BUSINESS_POLICY_SCHEMA or record.get('schema') != guard.BUSINESS_RECORD_SCHEMA:
             return self.verify_current(release)
+        followup = value.get('upgrade', {}).get('core_followup', {})
+        if followup.get('schema') == guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA:
+            must(guard.verify_assistant_rollout_ai(value, for_start=False) == followup['ai_release'],
+                 'illustration_core_restore_ai_before_core')
         if 'successor' in value.get('upgrade',{}):
             must(guard.successor_configuration_phase(value) == 'bridge', 'successor_restore_ai_before_core')
             ai_current = self.read(ROOT/'runtime/ai-publications/CURRENT.json')
@@ -441,12 +445,14 @@ class CoreRuntime:
     def community_maintenance(self, engine, *, resuming=False):
         """This no-schema-change release preserves the existing Community process.
 
-        Older contracts retain their drain behavior. The finite knowledge
-        binding keeps the exact process and lifetime retry ledger on both the
-        successful and recovery paths; an exhausted budget is never reset.
+        The preservation contracts keep the exact process and lifetime retry
+        ledger on both the successful and recovery paths. Earlier contracts
+        use their original drain behavior.
         """
         value=guard.policy()
-        if value.get('upgrade',{}).get('core_followup',{}).get('schema') not in {'R25_KNOWLEDGE_CORE_PUBLICATION_V1','R25_STUDIO_CORE_PUBLICATION_V1','R25_REFERENCE_CORE_PUBLICATION_V1'}:
+        if value.get('upgrade',{}).get('core_followup',{}).get('schema') not in {
+                'R25_KNOWLEDGE_CORE_PUBLICATION_V1', 'R25_STUDIO_CORE_PUBLICATION_V1',
+                'R25_REFERENCE_CORE_PUBLICATION_V1', guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA}:
             if not resuming:engine.community_action('drain',self.fd)
             return
         must(self.tx is not None,'knowledge_maintenance_transaction')

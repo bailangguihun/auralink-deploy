@@ -64,7 +64,7 @@ def release_folder(ref):
     return STORE / 'releases' / (ref['source_tree_sha256'] + '-' + ref['commit_sha'])
 
 
-def policy():
+def handoff_values():
     values = {}
     for line in read_file(ROOT / 'runtime/handoff-control.env').decode().splitlines():
         if not line or line.startswith('#'):
@@ -73,6 +73,11 @@ def policy():
         key, value = line.split('=', 1)
         must(key not in values, 'ai_handoff_duplicate')
         values[key] = value
+    return values
+
+
+def policy():
+    values = handoff_values()
     expected = digest_value(values.get('R25_AI_RELEASE_POLICY_SHA256'))
     result = private_record(STORE / 'POLICY.json', expected)
     v2 = result.get('schema') == 'R25_AI_SOURCE_POLICY_V2'
@@ -118,6 +123,20 @@ def accepted(ref):
 
 
 def selected_reference():
+    values = handoff_values()
+    if 'R25_CORE_RELEASE_POLICY_SHA256' in values:
+        core_policy = core.assistant_rollout_policy(values)
+        if core_policy is not None:
+            path = ROOT / 'operations/core_release_guard.py'
+            digest = digest_value(values.get('R25_CORE_RELEASE_GUARD_SHA256'))
+            owner = core_policy['installation'].get('controller_owner')
+            must(values.get('R25_CORE_RELEASE_GUARD') == str(path) and
+                 type(owner) is list and len(owner) == 2 and all(type(x) is int and x >= 0 for x in owner),
+                 'illustration_ai_core_guard_binding')
+            raw = read_file(path, owner=tuple(owner), mode=0o700, expected=digest)
+            module = core.source_module(path, 'r25_bound_ai_illustration_core_guard', raw)
+            ref = module.verify_assistant_rollout_ai(core_policy)
+            return reference(ref)
     current = private_record(STORE / 'CURRENT.json')
     must(current.get('schema') == 'R25_AI_CURRENT_V1', 'ai_current_schema')
     ref = reference(current.get('release'))

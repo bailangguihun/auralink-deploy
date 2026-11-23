@@ -253,6 +253,30 @@ assert sys.modules['core_acceptance'].__class__ is object
         self.assertNotIn('WHERE', business.RETENTION_SQL.split("'active_work'")[0])
         self.assertNotIn('UPDATE ', business.RETENTION_SQL)
 
+    def test_illustration_core_requires_the_already_committed_migration_ledger(self):
+        from assistant_release import schema_prefixes
+
+        _, current = self.retention()
+        value = deepcopy(self.policy)
+        migrations = [{'version': f'V{index:03d}', 'sha256': 'a' * 64} for index in range(1, 18)]
+        value['upgrade'].update(capability='assistant-v1', assistant={'migrations': migrations},
+                                core_followup={'schema': 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1'})
+        helper = SimpleNamespace(migration_inventory=lambda entries: entries, schema_prefixes=schema_prefixes)
+
+        def query(sql):
+            if sql == business.ASSISTANT_LEDGER_SQL:
+                return json.dumps({'ledger': ledger})
+            self.assertEqual(sql, business.RETENTION_SQL)
+            return json.dumps(dict(current, versions=[entry['version'] for entry in ledger]))
+
+        with patch.object(business, 'validate_policy', return_value=value), \
+                patch.object(business, 'assistant_module', return_value=helper):
+            ledger = migrations[:16]
+            with self.assertRaisesRegex(business.Refused, 'illustration_core_requires_committed_schema'):
+                business.verify_compatibility(value, query)
+            ledger = migrations
+            self.assertEqual(business.verify_compatibility(value, query)['database_writes'], 0)
+
     def test_retained_row_changes_unknown_schema_and_active_work_refuse(self):
         _, current = self.retention()
         for change in ('table', 'schema', 'work', 'database'):

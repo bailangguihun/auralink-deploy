@@ -181,6 +181,53 @@ class FollowupFixture(unittest.TestCase):
         binding['ai_journal_sha256']=self.put(path,guard.encoded(journal))
         with self.assertRaisesRegex(Exception,'not_committed'):guard.verify_core_followup_context(self.new,self.old,business)
 
+    def test_historical_proof_does_not_treat_old_ai_as_live(self):
+        self.assertEqual(self.f.install(), 'INSTALLED')
+        root = self.f.root
+        store = root / 'runtime/ai-publications'
+        live = (
+            store / 'POLICY.json',
+            store / 'CURRENT.json',
+            store / 'ACTIVE.json',
+            root / 'release/critic-service/app/main.py',
+            root / 'runtime/config/assistant-private/assistant-runtime.json',
+        )
+        for path in live:
+            with self.subTest(path=path.name):
+                raw = path.read_bytes()
+                self.put(path, raw + b'\n')
+                with self.assertRaisesRegex(guard.Refused, 'file_digest'):
+                    guard.verify_core_followup_context(self.new, validator=business)
+                self.assertEqual(guard.verify_core_followup_history(self.new, validator=business),
+                                 self.plan['current_ai_release'])
+                self.put(path, raw)
+
+    def test_historical_proof_rejects_drift_in_retained_receipts(self):
+        self.assertEqual(self.f.install(), 'INSTALLED')
+        binding = self.new['upgrade']['core_followup']
+        ref = binding['ai_release']
+        store = self.f.root / 'runtime/ai-publications'
+        transaction = store / 'transactions' / binding['ai_transaction_id']
+        release = store / 'releases' / (ref['source_tree_sha256'] + '-' + ref['commit_sha'])
+        predecessor = self.f.store / 'core-followup-baselines' / (binding['predecessor_policy_sha256'] + '.json')
+        for path in (predecessor, transaction / 'journal.json', transaction / 'snapshot.json', release / 'record.json'):
+            with self.subTest(path=path.name):
+                raw = path.read_bytes()
+                self.put(path, raw + b'\n')
+                with self.assertRaisesRegex(guard.Refused, 'file_digest'):
+                    guard.verify_core_followup_history(self.new, validator=business)
+                self.put(path, raw)
+
+    def test_historical_proof_requires_committed_phase_even_with_matching_digest(self):
+        self.assertEqual(self.f.install(), 'INSTALLED')
+        binding = self.new['upgrade']['core_followup']
+        path = self.f.root / 'runtime/ai-publications/transactions' / binding['ai_transaction_id'] / 'journal.json'
+        journal = self.f.rt.read(path)
+        journal['phase'] = 'START_INTENT'
+        binding['ai_journal_sha256'] = self.put(path, guard.encoded(journal))
+        with self.assertRaisesRegex(guard.Refused, 'not_committed'):
+            guard.verify_core_followup_history(self.new, validator=business)
+
     def test_foreign_service_context_missing_review_backup_and_lease_busy_refused(self):
         import fcntl
         f=self.f;path=f.store/'CONTROL_UPGRADE_REVIEW.json';raw=path.read_bytes();path.unlink()
@@ -364,6 +411,82 @@ print('STANDALONE_CORE_FOLLOWUP_GUARD_OK')
                 with self.subTest(wrong=wrong),self.assertRaises(Exception):fixture.preparation(wrong=wrong)
                 self.assertFalse((fixture.f.store/'core-followup-plans').exists())
             finally:fixture.doCleanups()
+
+
+class IllustrationCoreFollowup(unittest.TestCase):
+    def setUp(self):
+        from test_reference_publication import Reference
+
+        fixture = Reference('runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.prepare()
+        self.assertEqual(fixture.f.install(), 'INSTALLED')
+        fixture.commit_candidate()
+        self.put = fixture.put
+        self.root = fixture.root
+        self.store = self.root / 'runtime/core-publications'
+        old_raw = (self.store / 'POLICY.json').read_bytes()
+        self.old = guard.strict_json(old_raw)
+        self.old_sha = business.sha(old_raw)
+        self.predecessor = self.store / 'core-followup-baselines' / (self.old_sha + '.json')
+        self.new = deepcopy(self.old)
+        self.upgrade = self.new['upgrade']
+        self.upgrade['baseline_release'] = guard.strict_json((self.store / 'CURRENT.json').read_bytes())['release']
+        self.upgrade['candidate'].update(commit_sha='1' * 40, artifact_sha256='2' * 64, payload_fingerprint='3' * 64)
+        self.upgrade['core_followup'].update(schema='R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1',
+                                            predecessor_policy_sha256=self.old_sha)
+        assistant = self.upgrade['assistant']
+        assistant.update(baseline_policy_sha256=self.old_sha,
+                         baseline_payload_fingerprint=self.old['upgrade']['candidate']['payload_fingerprint'],
+                         compatible_recovery_jar_sha256=self.upgrade['baseline_release']['artifact_sha256'])
+        assistant['artifacts']['core'].update(commit='1' * 40, sha256='2' * 64)
+
+    def test_only_new_policy_accepts_candidate_with_committed_reference_proof(self):
+        def validate_fixture_policy(value):
+            business.validate_core_followup(value)
+            return value
+
+        # The inherited installer fixture uses synthetic module inventories.
+        with patch.object(business, 'validate_policy', side_effect=validate_fixture_policy):
+            with self.assertRaisesRegex(business.Refused, 'business_candidate_not_approved'):
+                business.candidate_matches(self.old, self.upgrade['candidate'])
+            self.assertEqual(business.candidate_matches(self.new, self.upgrade['candidate']), self.upgrade['candidate'])
+        ref = self.old['upgrade']['core_followup']['ai_release']
+        self.assertEqual(guard.verify_core_followup_context(self.new, self.old, business), ref)
+        self.put(self.predecessor, guard.encoded(self.old))
+        self.assertEqual(guard.verify_core_followup_context(self.new, validator=business), ref)
+        current = self.root / 'runtime/ai-publications/CURRENT.json'
+        self.put(current, current.read_bytes() + b'\n')
+        with self.assertRaisesRegex(guard.Refused, 'file_digest'):
+            guard.verify_core_followup_context(self.new, validator=business)
+
+    def test_wrong_ancestor_and_changed_reference_contract_are_refused(self):
+        wrong = deepcopy(self.old)
+        wrong['upgrade']['core_followup']['schema'] = 'R25_STUDIO_CORE_PUBLICATION_V1'
+        wrong_sha = business.sha(guard.encoded(wrong))
+        wrong_successor = deepcopy(self.new)
+        wrong_successor['upgrade']['core_followup']['predecessor_policy_sha256'] = wrong_sha
+        wrong_successor['upgrade']['assistant']['baseline_policy_sha256'] = wrong_sha
+        with self.assertRaisesRegex(guard.Refused, 'managed_vmm_successor_predecessor_contract'):
+            guard.verify_core_followup_context(wrong_successor, wrong, business)
+
+        self.put(self.predecessor, guard.encoded(self.old))
+        for change in ('payload', 'migrations', 'retention', 'config', 'rollback_record'):
+            value = deepcopy(self.new)
+            upgrade = value['upgrade']
+            if change == 'payload':
+                upgrade['candidate']['payload_fingerprint'] = self.old['upgrade']['candidate']['payload_fingerprint']
+            elif change == 'migrations':
+                upgrade['assistant']['migrations'].pop()
+            elif change == 'retention':
+                upgrade['compatibility']['retention_manifest_sha256'] = '4' * 64
+            elif change == 'config':
+                upgrade['configuration']['knowledge']['stats-sha256'] = '5' * 64
+            else:
+                upgrade['baseline_release']['accepted_record_sha256'] = '6' * 64
+            with self.subTest(change=change), self.assertRaises(guard.Refused):
+                guard.verify_core_followup_context(value, validator=business)
 
 
 if __name__=='__main__':unittest.main()

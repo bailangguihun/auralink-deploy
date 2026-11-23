@@ -278,7 +278,7 @@ class InstalledV2Upgrade(unittest.TestCase):
         # Package exact synthetic review-bound payload, not an invented project run.
         spec=importlib.util.spec_from_file_location('successor_fixture_package',Path(__file__).parent.parent/'scripts/package-r25-release.py')
         pack=importlib.util.module_from_spec(spec);spec.loader.exec_module(pack)
-        payload={name:(f.bundle/name).read_bytes() if (f.bundle/name).exists() else (Path(__file__).parent/name).read_bytes() for name in pack.FILES}
+        payload={name:(f.bundle/name).read_bytes() if (f.bundle/name).exists() else (Path(__file__).parent/name).read_bytes() for name in pack.FILES_V1}
         blob=pack.archive_bytes(payload);manifest=pack.manifest_for(payload,blob,
             pack.identity('bailangguihun/auralink-deploy',pack.REF,'d'*40,'42','1'))
         for name,raw in payload.items():

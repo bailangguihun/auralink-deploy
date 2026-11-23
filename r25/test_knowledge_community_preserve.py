@@ -253,6 +253,17 @@ class KnowledgeCommunityPreserve(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'preserve_requires_knowledge_binding'):
                 cli.main()
 
+    def test_assistant_cli_needs_code_binding_and_excludes_package_mutation(self):
+        args = ['--plan', str(self.fixture.f.approval), '--plan-sha256', self.h.digest,
+                '--bundle-manifest-sha256', self.fixture.bundle.digest,
+                '--assistant-rollout-sha256', 'e'*64]
+        for command, extra in (('observe', []), ('code-install', ['--code-publication-sha256','f'*64])):
+            with self.subTest(command=command), \
+                 patch.object(sys, 'argv', ['community_host_cli.py', command, *args, *extra]), \
+                 patch.object(cli, 'bootstrap'), patch.object(cli.os, 'geteuid', return_value=0):
+                with self.assertRaisesRegex(ValueError, 'community_assistant_scope'):
+                    cli.main()
+
 
 if __name__ == '__main__':
     unittest.main()

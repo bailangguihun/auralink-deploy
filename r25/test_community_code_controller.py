@@ -3,6 +3,7 @@
 Java/SQL/watchdog effects use the existing explicit isolated full-chain fixture.
 Node and lost-start boundaries are exercised in test_community_code_package.
 """
+from copy import deepcopy
 from pathlib import Path
 import json
 import os
@@ -14,6 +15,7 @@ import unittest
 from unittest.mock import Mock,PropertyMock,patch
 
 import vmm_controller as v
+import core_release_guard as core_guard
 import test_reference_publication as reference_fixture
 
 
@@ -136,6 +138,129 @@ class CodeController(unittest.TestCase):
         self.prepare();plan={**self.plan,'files':{**self.plan['files'],'core-current':self.plan['files']['handoff']}}
         with self.rt.lease(),self.assertRaisesRegex(Exception,'fixed_targets'):
             v.verify_code_controller(self.rt,plan,self.folder,'before')
+
+    def install_historical_overlay(self):
+        self.prepare()
+        v.install_code_controller(self.rt,self.ident)
+        root = self.rt.root
+        store = root/'runtime/core-publications'
+        current = v.json_read(store/'CURRENT.json',self.rt.private)
+        previous = current['release']
+        jar = root/'release/artifacts/backend.jar'
+        archive = store/'releases'/(previous['artifact_sha256']+'-'+previous['commit_sha'])/'backend.jar'
+        self.put(archive,jar.read_bytes())
+        next_jar = b'Fixture successor Core artifact'
+        next_core = {'commit_sha':'d'*40,'artifact_sha256':v.sha(next_jar),'accepted_record_sha256':'c'*64}
+        # Only the independent Core runtime eligibility check is simulated.
+        # Approval parsing and the archived JAR reader are the shipped guard.
+        fixture_guard = Path(core_guard.__file__).read_bytes() + f'''
+ROOT = Path({str(root)!r})
+STORE = ROOT / 'runtime/core-publications'
+
+def private_record(path, expected=None):
+    return strict_json(read_file(path, owner={self.rt.private!r}, expected=expected))
+
+def verify_assistant_rollout_core(value, approval, folder, *, preserve_only=False):
+    must(preserve_only and private_record(STORE / 'CURRENT.json')['release'] == {next_core!r},
+         'fixture_core_release_identity')
+    return {next_core!r}
+'''.encode()
+        controller = b'# Approved successor VMM controller fixture\n'
+        old_policy = self.f.f.new
+        next_policy = deepcopy(old_policy)
+        next_policy['upgrade']['core_followup']['schema'] = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1'
+        next_policy['runtime_modules']['core_release_guard.py'] = v.sha(fixture_guard)
+        handoff_path = self.rt.targets()['handoff'][0]
+        replacements = {'R25_CORE_RELEASE_POLICY_SHA256':v.sha(v.encoded(next_policy)),
+                        'R25_VMM_CONTROLLER_SHA256':v.sha(controller)}
+        next_handoff = handoff_path.read_bytes()
+        old_values = v.env_values(next_handoff)
+        for key,value in replacements.items():
+            next_handoff = next_handoff.replace(f'{key}={old_values[key]}\n'.encode(),f'{key}={value}\n'.encode())
+        files = {'core_release_guard.py':fixture_guard,'vmm_controller.py':controller}
+        operational = {'policy':v.encoded(next_policy),'handoff':next_handoff}
+        targets = v.publication_targets(self.rt)
+        before = {name:targets[name][0].read_bytes() for name in files.keys() | operational.keys()}
+        before['ILLUSTRATION_CORE_CURRENT.json'] = (store/'CURRENT.json').read_bytes()
+        before['CONTROL_UPGRADE_ACTIVE.json'] = (store/'CONTROL_UPGRADE_ACTIVE.json').read_bytes()
+        review = v.encoded({'fixture':'Reviewed successor VMM proof'})
+        approval = {
+            'schema':core_guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA,
+            'review_evidence_sha256':v.sha(review),
+            'controller_owner':next_policy['installation']['controller_owner'],
+            'private_owner':next_policy['installation']['private_owner'],
+            'assistant_rollout':{'community':{'code_controller_sha256':self.ident},
+                'core_current_sha256':v.sha(before['ILLUSTRATION_CORE_CURRENT.json']),
+                'control_active_sha256':v.sha(before['CONTROL_UPGRADE_ACTIVE.json'])},
+        }
+        for field,updates in (('files',files),('operational',operational)):
+            approval[field] = {name:{'before_sha256':v.sha(before[name]),'after_sha256':v.sha(raw)}
+                               for name,raw in updates.items()}
+        approval['files']['assistant_rollout_binding.py'] = {'before_sha256':None,'after_sha256':'a'*64}
+        approval_sha = v.sha(v.encoded(approval))
+        folder = store/'controller-upgrades'/approval_sha
+        self.put(folder/'approval.json',v.encoded(approval))
+        self.put(folder/'review.json',review)
+        self.put(folder/'journal.json',v.encoded({'schema':approval['schema'],'phase':'INSTALLED',
+                                                'approval_sha256':approval_sha}))
+        self.put(folder/'after/handoff',next_handoff)
+        for name,raw in before.items():self.put(folder/'before'/name,raw)
+        for name,raw in {**files,**operational}.items():
+            path,_,mode=targets[name]
+            self.put(path,raw)
+            path.chmod(mode)
+        self.put(store/'CONTROL_UPGRADE_ACTIVE.json',v.encoded({'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1',
+                                                              'approval_sha256':approval_sha}))
+        tx = 'ef'*16
+        self.assertFalse((store/'transactions'/tx).exists())
+        self.put(store/'CURRENT.json',v.encoded(dict(current,release=next_core,previous=previous,transaction_id=tx)))
+        self.put(store/'transactions'/tx/'journal.json',v.encoded({'phase':'COMMITTED','transaction_id':tx,
+                                                                  'candidate':next_core}))
+        self.put(jar,next_jar)
+        self.put(self.f.f.g.live['preview-jar'],next_jar)
+        return next_policy, v.env_values(next_handoff), approval, folder, archive
+
+    def test_rollout_accepts_exact_historical_code_controller_through_reference_chain(self):
+        policy,handoff,approval,folder,_ = self.install_historical_overlay()
+        with self.rt.lease():
+            self.assertEqual(v.apply_policy_overlay(policy,handoff,self.rt.root,fixture_runtime=self.rt),policy)
+            history = v.assistant_rollout_history(self.rt,approval,folder)
+            for phase,runtime in (('before',False),('mixed',False),('after',False),('before',True),('mixed',True)):
+                with self.subTest(phase=phase,runtime=runtime), \
+                     self.assertRaisesRegex(v.Refused,'community_code_history_runtime_only'):
+                    v.verify_code_controller(self.rt,self.plan,self.folder,phase,runtime=runtime,
+                                             historical=history,read_archived_jar=core_guard.read_file)
+            with self.assertRaisesRegex(v.Refused,'community_code_core_runtime_changed'):
+                v.applied_code_publication(self.rt,self.f.f.new,handoff)
+
+    def test_rollout_rejects_drift_in_archived_core_or_old_code_plan(self):
+        policy,handoff,_,folder,archive = self.install_historical_overlay()
+        code_marker = self.rt.store/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json'
+        cases = ((archive,b'Replaced archived JAR','file_digest'),
+                 (archive.parent/'record.json',b'{}','file_digest'),
+                 (folder/'before/ILLUSTRATION_CORE_CURRENT.json',b'{}','file_digest'),
+                 (self.folder/'approval.json',b'{}','file_digest'),
+                 (code_marker,v.encoded({'schema':v.CODE_CONTROLLER_SCHEMA,'approval_sha256':'f'*64}),
+                  'assistant_rollout_code_pointer'))
+        with self.rt.lease():
+            self.assertEqual(v.apply_policy_overlay(policy,handoff,self.rt.root,fixture_runtime=self.rt),policy)
+            for path,tampered,reason in cases:
+                with self.subTest(path=str(path)):
+                    raw = path.read_bytes()
+                    self.put(path,tampered)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError,reason):
+                            v.apply_policy_overlay(policy,handoff,self.rt.root,fixture_runtime=self.rt)
+                    finally:
+                        self.put(path,raw)
+            raw = archive.read_bytes()
+            archive.unlink()
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    v.apply_policy_overlay(policy,handoff,self.rt.root,fixture_runtime=self.rt)
+            finally:
+                self.put(archive,raw)
+            self.assertEqual(v.apply_policy_overlay(policy,handoff,self.rt.root,fixture_runtime=self.rt),policy)
 
 
 class FormalRuntimeBoundary(unittest.TestCase):

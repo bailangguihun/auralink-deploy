@@ -68,6 +68,20 @@ def undo(result, original_launcher_hash):
 
 
 class OverlayTests(unittest.TestCase):
+    def test_assistant_rollout_routes_only_from_existing_community_code_overlay(self):
+        anchor = b"        bundle=self.root/'operations/community-controller'/record['controller_manifest_sha256']\n"
+        legacy = b"class Engine:\n    def choose(self):\n" + anchor
+        with self.assertRaisesRegex(overlay.OverlayRefused, 'assistant_rollout_requires_community_code'):
+            overlay.render_assistant_rollout_lifecycle(legacy)
+        code = legacy.replace(anchor, b"        extra+=['--code-publication-sha256',code_id]\n" + anchor)
+        rendered = overlay.render_assistant_rollout_lifecycle(code)
+        ast.parse(rendered)
+        self.assertEqual(rendered.count(anchor), 1)
+        self.assertIn(b"extra+=['--assistant-rollout-sha256',rollout_id]", rendered)
+        self.assertIn(b"must(extra[-2:]==['--code-publication-sha256',community['code_controller_sha256']]", rendered)
+        with self.assertRaises(overlay.OverlayRefused):
+            overlay.render_assistant_rollout_lifecycle(rendered)
+
     def test_unapproved_hash_and_nonbytes_input_are_refused(self):
         lifecycle, launcher = fixtures()
         for inputs in ((lifecycle, launcher), (bytearray(lifecycle), launcher),
