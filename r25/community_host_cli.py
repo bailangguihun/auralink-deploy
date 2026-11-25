@@ -168,8 +168,11 @@ def main():
         from community_host import CodePackageUpgrade,ReferencePackageUpgrade,assistant_reference_package_context
         from core_release_guard import require_community_rollout
         with lease.held():
+            predecessor=rollout.get('illustration_predecessor')
+            historical_id=(rollout['installed_control']['approval_sha256'] if predecessor is not None
+                           else a.assistant_rollout_sha256)
             context=assistant_reference_package_context(host,a.reference_publication_sha256,
-                a.assistant_rollout_sha256,rollout,code_context)
+                historical_id,predecessor if predecessor is not None else rollout,code_context)
             code=CodePackageUpgrade(ReferencePackageUpgrade(host,supervisor,context),code_context)
             def core_authority(*,preserve_only):
                 return require_community_rollout(a.assistant_rollout_sha256,lease.fd,preserve_only=preserve_only)

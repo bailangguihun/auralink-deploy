@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import os
@@ -198,6 +199,89 @@ class AssistantRolloutControllerTest(unittest.TestCase):
 
     def recover(self):
         return self.controller.recover(self, approval_sha256=self.approval_sha)
+
+    def set_successor_plan(self):
+        prior = deepcopy(self.new_plan)
+        plan = self.new_plan = deepcopy(self.new_plan)
+        plan['schema'] = self.controller.SUCCESSOR
+        for name in ('assistant_rollout_binding.py', 'core_publish.py'):
+            path, _, mode = self.controller.targets(plan)[name]
+            before = self.write(path, f'old {name}'.encode(), mode)
+            plan['files'][name] = {'before_sha256': before, 'after_sha256': hashlib.sha256(self.after(name)).hexdigest()}
+        prior['operational']['policy']['after_sha256'] = plan['operational']['policy']['before_sha256']
+        prior_id = hashlib.sha256(guard.encoded(prior)).hexdigest()
+        prior_folder = self.controller.transaction_path(prior_id)
+        self.record(prior_folder/'approval.json', prior)
+        plan['installed_control'] = {
+            'approval_sha256': prior_id,
+            'journal_sha256': self.record(prior_folder/'journal.json', {
+                'schema': self.controller.SCHEMA, 'approval_sha256': prior_id, 'phase': 'INSTALLED',
+            }),
+        }
+        rollout = plan['assistant_rollout']
+        rollout['control_active_sha256'] = self.record(
+            self.store/'CONTROL_UPGRADE_ACTIVE.json', self.controller._active_record(prior_id))
+        evidence = plan['successor'] = {
+            'candidate': {'repository': 'bailangguihun/auralink-core-api', 'commit_sha': 'd'*40,
+                          'artifact_sha256': 'f'*64, 'artifact_bytes': 100,
+                          'payload_fingerprint': 'e'*64, 'github_run_id': '4', 'github_run_attempt': '1'},
+            'web': {'commit_sha': 'd'*40, 'selection_sha256': '9'*64, 'reference_sha256': '8'*64,
+                    'github_run_id': '15', 'github_run_attempt': '1', 'archive_sha256': '7'*64,
+                    'build_id': 'next-build', 'receipt_stamp': '1800000000000000000', 'receipt_sha256': 'a'*64},
+        }
+        for component, base, tx, ref in (('core', self.store, '1'*32, self.core),
+                                         ('ai', self.ai, '2'*32, plan['current_ai_release'])):
+            folder = base/'transactions'/tx
+            evidence[component+'_journal_sha256'] = self.record(folder/'journal.json', {
+                'phase': 'COMMITTED', 'transaction_id': tx, 'candidate': ref,
+            })
+            if component == 'ai':
+                evidence['ai_snapshot_sha256'] = self.record(folder/'snapshot.json', {'candidate': ref})
+        self.targets = self.controller.targets(plan)
+        self.approval_sha = hashlib.sha256(guard.encoded(plan)).hexdigest()
+        self.folder = self.controller.transaction_path(self.approval_sha)
+        self.record(self.folder/'approval.json', plan)
+        self.record(self.folder/'review.json', {'reviewed': True})
+        for name in self.targets:
+            self.write(self.folder/'after'/name, self.after(name))
+
+    def test_successor_recovers_known_partial_install_without_rewriting_parent_receipts(self):
+        self.set_successor_plan()
+        original = {name: path.read_bytes() for name, (path, _, _) in self.targets.items()}
+        parent = self.controller.transaction_path(self.new_plan['installed_control']['approval_sha256'])
+        parent_receipt = (parent/'journal.json').read_bytes()
+        old_pointer = (self.store/'CONTROL_UPGRADE_ACTIVE.json').read_bytes()
+        atomic_copy = self.storage.atomic_copy_file
+
+        def fail_second_target(source, target, *args, **kwargs):
+            if source == self.folder/'after/core_runtime.py':
+                raise OSError('interrupted successor copy')
+            return atomic_copy(source, target, *args, **kwargs)
+
+        with patch.object(self.controller, 'verify_successor_web_preimage'), \
+             patch.object(self.storage, 'atomic_copy_file', side_effect=fail_second_target):
+            with self.assertRaises(OSError):
+                self.install()
+            journal = self.read(self.folder/'journal.json')
+            self.assertEqual((journal['schema'], journal['phase']), (self.controller.SUCCESSOR, 'RECOVERY_REQUIRED'))
+            self.assertNotEqual(self.targets['core_business.py'][0].read_bytes(), original['core_business.py'])
+            with patch.object(self.controller, '_recovery_engine', return_value=self.service):
+                self.assertEqual(self.recover(), 'RESTORED')
+        self.assertEqual((parent/'journal.json').read_bytes(), parent_receipt)
+        self.assertEqual((self.store/'CONTROL_UPGRADE_ACTIVE.json').read_bytes(), old_pointer)
+        self.assertEqual({name: path.read_bytes() for name, (path, _, _) in self.targets.items()}, original)
+
+    def test_successor_installs_once_and_refuses_missing_community_preservation(self):
+        self.set_successor_plan()
+        with patch.object(self.controller, 'verify_successor_web_preimage'):
+            with patch.object(self.service, 'community_action', return_value={'state': 'UNKNOWN_START_RECEIPT'}):
+                with self.assertRaisesRegex(Refused, 'community_not_preserved'):
+                    self.install()
+            self.assertEqual(self.service.stops, 0)
+            self.assertFalse((self.folder/'journal.json').exists())
+            self.assertEqual(self.install(), 'INSTALLED')
+            self.assertEqual(self.install(), 'INSTALLED_VERIFIED_NOOP')
+            self.assertEqual((self.service.stops, self.service.starts), (1, 1))
 
     def test_installed_receipt_ignores_an_exact_retry_without_stopping_watchdog(self):
         self.assertEqual(self.install(), 'INSTALLED')

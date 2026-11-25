@@ -314,13 +314,16 @@ def _read_core_proof(value, approval, folder, store, jars, storage, preserve_onl
     read = storage.read_private_record
     _require(folder.parent == store / 'controller-upgrades' and _digest(folder.name),
              'rollout_core_controller_folder')
-    _require(approval['schema'] == 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
-             and read(folder / 'approval.json', expected_sha256=folder.name) == approval,
+    schema = {
+        'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1': 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1',
+        'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1': 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1',
+    }.get(approval['schema'])
+    _require(schema is not None and read(folder / 'approval.json', expected_sha256=folder.name) == approval,
              'rollout_core_controller_approval')
     policy_sha256 = approval['operational']['policy']['after_sha256']
     upgrade = value['upgrade']
     _require(_digest(policy_sha256) and value['schema'] == 'R25_CORE_BUSINESS_POLICY_V2'
-             and upgrade['core_followup']['schema'] == 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1'
+             and upgrade['core_followup']['schema'] == schema
              and read(store / 'POLICY.json', expected_sha256=policy_sha256) == value,
              'rollout_core_approved_policy')
 
@@ -333,6 +336,11 @@ def _read_core_proof(value, approval, folder, store, jars, storage, preserve_onl
     before_active = read(before / 'ILLUSTRATION_CORE_ACTIVE.json', expected_sha256=plan['core_active_sha256'])
     before_release = _before_reference(before_current, 'CORE', CORE_REFERENCE)
     old_tx = _active_transaction(before_active, 'CORE')
+    if 'successor' in approval:
+        old_journal = read(store / 'transactions' / old_tx / 'journal.json',
+                           expected_sha256=approval['successor']['core_journal_sha256'])
+        _require(old_journal.get('phase') == 'COMMITTED' and old_journal.get('candidate') == before_release,
+                 'rollout_core_successor_parent_not_committed')
     _require(before_release == upgrade['baseline_release'] == approval['current_release'],
              'rollout_core_approved_baseline')
 

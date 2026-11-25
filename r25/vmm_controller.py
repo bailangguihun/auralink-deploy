@@ -639,7 +639,8 @@ def apply_policy_overlay(value, handoff, root=ROOT, *, fixture_runtime=None):
     rt=fixture_runtime or Runtime(root,LOCK)
     must(handoff['R25_VMM_CONTROLLER']==str(rt.targets()['vmm_controller.py'][0]),'overlay_controller_path')
     controller=read(rt.targets()['vmm_controller.py'][0],rt.private,expected=digest(handoff.get('R25_VMM_CONTROLLER_SHA256')))
-    if value.get('upgrade',{}).get('core_followup',{}).get('schema')=='R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1':
+    if value.get('upgrade',{}).get('core_followup',{}).get('schema') in {
+            'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1', 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'}:
         return applied_assistant_rollout(rt,value,handoff,controller)
     if (rt.store/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json').exists():return applied_code_publication(rt,value,handoff)
     if (rt.store/'REFERENCE_PUBLICATION_ACTIVE.json').exists():return applied_reference_publication(rt,value,handoff)
@@ -3428,7 +3429,20 @@ def applied_assistant_rollout(rt,value,handoff,controller):
     must(json_read(code_folder/'journal.json',rt.private)=={
          'schema':CODE_CONTROLLER_SCHEMA,'approval_sha256':code_id,'phase':'INSTALLED'},
          'assistant_rollout_code_not_installed')
-    history=assistant_rollout_history(rt,approval,folder)
+    if guard.is_assistant_rollout_successor(value):
+        prior = approval['installed_control']
+        prior_id = digest(prior['approval_sha256'])
+        prior_folder = rt.root/'runtime/core-publications/controller-upgrades'/prior_id
+        parent = json_read(prior_folder/'approval.json', rt.private, prior_id)
+        receipt = json_read(prior_folder/'journal.json', rt.private, prior['journal_sha256'])
+        must(parent['schema'] == receipt['schema'] == guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA and
+             receipt['phase'] == 'INSTALLED' and receipt['approval_sha256'] == prior_id and
+             parent['operational']['policy']['after_sha256'] == approval['operational']['policy']['before_sha256'] and
+             parent['assistant_rollout']['community']['code_controller_sha256'] == code_id,
+             'illustration_successor_vmm_parent')
+        history = assistant_rollout_history(rt, parent, prior_folder)
+    else:
+        history = assistant_rollout_history(rt, approval, folder)
     verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,
                            read_archived_jar=guard.read_file)
     return value

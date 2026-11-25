@@ -25,6 +25,7 @@ from upgrade_core_controller import ControlUpgradeRuntime, upgrade_lease
 
 
 REQUEST = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_REQUEST_V1'
+SUCCESSOR_REQUEST = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_REQUEST_V1'
 REF_FIELDS = ('repository', 'ref', 'commit', 'run_id', 'run_attempt')
 CONTROLLER_FILES = {
     'ai-baseline.json', 'ai_publish.py', 'ai_release_candidate.py', 'ai_release_guard.py', 'ai_runtime.py',
@@ -93,8 +94,9 @@ def approval_input(rt, path, identity, name, expected, *, controller_manifest=Fa
     return files
 
 
-def release_inputs(rt, request, old, files, bundle):
-    core = request['core']
+def core_candidate(rt, core, old):
+    guard.must(core.keys() == {'commit', 'run_id', 'run_attempt', 'artifact_sha256', 'report_sha256', 'manifest_sha256'},
+               'illustration_core_input_fields')
     incoming = core_publish.incoming_path(core['commit'], core['run_id'], core['run_attempt'])
     jar = incoming / 'auralink-backend-0.0.1-SNAPSHOT.jar'
     report = incoming / 'r25-artifact-verification.json'
@@ -112,6 +114,11 @@ def release_inputs(rt, request, old, files, bundle):
                  'github_run_id': core['run_id'], 'github_run_attempt': core['run_attempt'],
                  'artifact_sha256': identity['artifact']['sha256'], 'artifact_bytes': identity['artifact']['bytes'],
                  'payload_fingerprint': guard.payload_fingerprint(jar)}
+    return candidate
+
+
+def release_inputs(rt, request, old, files, bundle):
+    candidate = core_candidate(rt, request['core'], old)
     ai = request['ai']
     folder = ai_publish.incoming_path(ai['commit'], ai['run_id'], ai['run_attempt'])
     manifest_raw = guard.read_file(folder/'ai-release-candidate.json', expected=ai['manifest_sha256'])
@@ -272,16 +279,161 @@ def prepare(rt, request_sha256):
             'unsigned_plan': str(folder/'UNSIGNED_PLAN.json')}
 
 
+def successor_archives(rt, request, parent):
+    formal = request['deploy']
+    for item in (formal, request['vmm'], request['community']):
+        guard.must(all(item[key] == formal[key] for key in REF_FIELDS) and
+                   item['repository'] == 'bailangguihun/auralink-deploy' and item['ref'] == 'refs/heads/release',
+                   'illustration_successor_formal_run')
+        guard.digest_value(item['commit'], 40)
+    commit = formal['commit']
+    ops = guard.ROOT/'operations'
+    bundle = ops/'r25-controller-candidates'/commit
+    files = approval_input(rt, bundle, formal, 'r25-controller.zip', sorted(CONTROLLER_FILES), controller_manifest=True)
+    guard.must(sha(files[Path(__file__).name]) == formal['tool_sha256'] == sha(Path(__file__).read_bytes()),
+               'illustration_successor_prepare_tool')
+    vmm = approval_input(rt, ops/'r25-vmm-candidates'/commit, request['vmm'], 'vmm-extension.zip', VMM_FILES)
+    guard.must(vmm['core_release_guard.py'] == files['core_release_guard.py'], 'illustration_same_core_guard')
+    community = approval_input(rt, ops/'r25-community-candidates'/commit, request['community'],
+                               'community-controller.zip', COMMUNITY_FILES)
+    prior = parent['assistant_rollout']['community']['deploy']
+    installed = ops/'community-controller'/guard.digest_value(prior['manifest_sha256'])
+    target = ops/'community-controller'/guard.digest_value(request['community']['manifest_sha256'])
+    manifest = rt.read(target/'manifest.json', request['community']['manifest_sha256'])
+    guard.must({path.name for path in target.iterdir()} == set(COMMUNITY_FILES) | {'manifest.json'},
+               'illustration_successor_community_inventory')
+    for name, content in community.items():
+        path = target/name
+        rt.identity(path, expected_sha256=sha(content), expected_bytes=len(content))
+        guard.reject_legacy_bytecode(path)
+        if name not in {'community_host.py', 'community_host_cli.py'}:
+            guard.must(guard.read_file(installed/name) == content, 'illustration_successor_community_behavior')
+    guard.must({item['path']: item['sha256'] for item in manifest['files']} ==
+               {name: sha(content) for name, content in community.items()}, 'illustration_successor_community_manifest')
+    return bundle, files, vmm, community
+
+
+def successor_commit_evidence(rt, pointers):
+    evidence = {}
+    for component in ('core', 'ai'):
+        active_path = pointers[component + '_active_sha256']
+        current = rt.read(pointers[component + '_current_sha256'])
+        tx = guard.digest_value(rt.read(active_path).get('transaction_id'), 32)
+        folder = active_path.parent/'transactions'/tx
+        key = component + '_journal_sha256'
+        evidence[key] = rt.identity(folder/'journal.json')['sha256']
+        journal = rt.read(folder/'journal.json', evidence[key])
+        guard.must(current.get('transaction_id') == tx == journal.get('transaction_id') and
+                   journal.get('phase') == 'COMMITTED' and journal.get('candidate') == current.get('release'),
+                   'illustration_successor_parent_commit')
+        if component == 'ai':
+            evidence['ai_snapshot_sha256'] = guard.digest_value(journal['snapshot_sha256'])
+    return evidence
+
+
+def prepare_successor(rt, request_sha256):
+    request_sha256 = guard.digest_value(request_sha256)
+    inputs = guard.STORE/'assistant-rollout-successor-requests'/request_sha256
+    request = rt.read(inputs/'request.json', request_sha256)
+    guard.must(request.keys() == {'schema', 'deploy', 'vmm', 'community', 'core', 'web', 'review_evidence_sha256'} and
+               request['schema'] == SUCCESSOR_REQUEST, 'illustration_successor_request')
+    review = guard.read_file(inputs/'review.json', expected=request['review_evidence_sha256'])
+    guard.strict_json(review)
+    with upgrade_lease(rt):
+        rt.require_terminal_application_transactions()
+        assistant_backup.require_terminal(rt)
+        old_sha = rt.identity(guard.STORE/'POLICY.json')['sha256']
+        old = rt.read(guard.STORE/'POLICY.json', old_sha)
+        guard.must(old['upgrade']['core_followup']['schema'] == guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA,
+                   'illustration_successor_predecessor')
+        guard.policy()
+        parent, prior_folder, phase = guard.load_assistant_rollout_approval(old)
+        guard.must(phase == 'INSTALLED', 'illustration_successor_predecessor')
+        critic = guard.verify_assistant_rollout_ai(old)
+        current = rt.current()
+        rt.verify_current(current)
+        rt.require_no_active_work()
+        bundle, files, vmm, community = successor_archives(rt, request, parent)
+        candidate = core_candidate(rt, request['core'], old)
+        guard.must(request['web']['commit_sha'] != parent['assistant_rollout']['web_commit'],
+                   'illustration_successor_requires_new_web')
+        pointers = controller._pointer_paths()
+        evidence = successor_commit_evidence(rt, pointers)
+        evidence.update(candidate=candidate, web=request['web'])
+        controller.validate_successor(evidence)
+        frontend = guard.frontend_digests()
+        controller.verify_successor_web_preimage(frontend, evidence['web'])
+        rollout = {
+            **{name: rt.identity(path)['sha256'] for name, path in pointers.items()},
+            'core_candidate_manifest_sha256': request['core']['manifest_sha256'],
+            'web_commit': parent['assistant_rollout']['web_commit'],
+            'ai_candidate': parent['assistant_rollout']['ai_candidate'],
+            'community': {**parent['assistant_rollout']['community'], 'deploy': request['community'],
+                          'cli_sha256': sha(community['community_host_cli.py'])},
+        }
+        plan = {'schema': controller.SUCCESSOR, 'from_policy_schema': old['schema'], 'deploy': request['deploy'],
+                'current_release': asdict(current), 'current_ai_release': critic,
+                'installed_control': {'approval_sha256': prior_folder.name,
+                                      'journal_sha256': rt.identity(prior_folder/'journal.json')['sha256']},
+                'frontend': frontend,
+                'preserved': {name: rt.identity(LIVE_FILES[name])['sha256'] for name in controller.PRESERVED},
+                'services': service_identities(rt.engine()), 'next_owner': 'c5ea',
+                'controller_owner': old['installation']['controller_owner'],
+                'private_owner': old['installation']['private_owner'],
+                'files': {}, 'operational': {}, 'review_evidence_sha256': sha(review),
+                'assistant_rollout': rollout, 'successor': evidence}
+        targets = controller.targets(plan)
+        renderer = guard.source_module(bundle/'control_overlay.py', 'illustration_successor_renderer',
+                                       files['control_overlay.py'])
+        material = {name: (vmm if name == 'vmm_controller.py' else files)[name] for name in controller.files(plan)}
+        material.update(guard=files['core_release_guard.py'], **{'ai-guard': files['ai_release_guard.py']})
+        path, owner, mode = targets['lifecycle']
+        material['lifecycle'] = renderer.render_assistant_rollout_successor_lifecycle(
+            guard.read_file(path, owner=owner, mode=mode))
+        for name, (path, owner, mode) in targets.items():
+            before = rt.identity(path, expected_owner=owner, expected_mode=mode)['sha256']
+            source = 'files' if name in controller.files(plan) else 'operational'
+            plan[source][name] = {'before_sha256': before}
+            if name in material:
+                plan[source][name]['after_sha256'] = sha(material[name])
+        next_policy = guard.render_assistant_rollout_successor_policy(old, plan)
+        validator = guard.source_module(bundle/'core_business.py', 'illustration_successor_validator', files['core_business.py'])
+        validator.validate_policy(next_policy)
+        material['policy'] = guard.encoded(next_policy)
+        material['handoff'] = replace_env(guard.read_file(LIVE_FILES['handoff']), {
+            'R25_CORE_RELEASE_POLICY_SHA256': sha(material['policy']),
+            'R25_CORE_RELEASE_GUARD_SHA256': sha(material['guard']),
+            'R25_AI_RELEASE_GUARD_SHA256': sha(material['ai-guard']),
+            'R25_LIFECYCLE_ADAPTER_SHA256': sha(material['lifecycle']),
+            'R25_VMM_CONTROLLER_SHA256': sha(material['vmm_controller.py']),
+        })
+        for name in ('policy', 'handoff'):
+            plan['operational'][name]['after_sha256'] = sha(material[name])
+        controller.validate(plan)
+        raw_plan = guard.encoded(plan)
+        ident = sha(raw_plan)
+        folder = controller.transaction_path(ident)
+        rt.storage.mkdir_private(folder)
+        rt.storage.mkdir_private(folder/'after')
+        for name, raw in material.items():
+            put(rt, folder/'after'/name, raw)
+        put(rt, folder/'review.json', review)
+        put(rt, folder/'UNSIGNED_PLAN.json', raw_plan)
+    return {'outcome': 'ILLUSTRATION_SUCCESSOR_PREPARED_NOT_INSTALLED', 'approval_sha256': ident,
+            'unsigned_plan': str(folder/'UNSIGNED_PLAN.json')}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('prepare', 'install', 'recover'))
+    parser.add_argument('action', choices=('prepare', 'prepare-successor', 'install', 'recover'))
     parser.add_argument('--request-sha256')
     parser.add_argument('--approval-sha256')
     args = parser.parse_args(argv)
     rt = ControlUpgradeRuntime()
     try:
-        if args.action=='prepare' and args.request_sha256 and not args.approval_sha256:
-            result = prepare(rt, args.request_sha256)
+        if args.action in {'prepare', 'prepare-successor'} and args.request_sha256 and not args.approval_sha256:
+            operation = prepare_successor if args.action == 'prepare-successor' else prepare
+            result = operation(rt, args.request_sha256)
         elif args.action in {'install', 'recover'} and not args.request_sha256 and args.approval_sha256:
             result = getattr(controller, args.action)(rt, approval_sha256=args.approval_sha256)
         else:

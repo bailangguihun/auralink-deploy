@@ -22,12 +22,13 @@ RECORD_SCHEMA = 'R25_CORE_BUSINESS_RELEASE_V2'
 REPOSITORY = 'Hang-666-star/auralink-core-api'
 CURRENT_REPOSITORY = 'bailangguihun/auralink-core-api'
 ASSISTANT_ILLUSTRATION_CORE_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1'
+ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'
 MANAGED_CORE_SCHEMAS = (
     'R25_MANAGED_VMM_CORE_FOLLOWUP_V1', 'R25_MANAGED_VMM_CORE_SUCCESSOR_V1',
     'R25_MANAGED_VMM_CORE_PUBLICATION_V1', 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_V1',
     'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_V1', 'R25_KNOWLEDGE_CORE_PUBLICATION_V1',
     'R25_STUDIO_CORE_PUBLICATION_V1', 'R25_REFERENCE_CORE_PUBLICATION_V1',
-    ASSISTANT_ILLUSTRATION_CORE_SCHEMA,
+    ASSISTANT_ILLUSTRATION_CORE_SCHEMA, ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA,
 )
 VERIFIED_REPOSITORIES = (CURRENT_REPOSITORY, REPOSITORY)
 CONFIG_KEYS = ('snapshot-root', 'graph-sha256', 'stats-sha256', 'map-enabled', 'china-sha256')
@@ -184,7 +185,7 @@ def validate_policy(policy):
          'business_controller_contract')
     assistant=policy.get('upgrade',{}).get('capability')=='assistant-v1'
     expected_modules=RUNTIME_MODULES | ({'assistant_release.py','assistant_runtime.py','assistant_runtime_overlay.py','assistant_acceptance.py','assistant_backup.py','upgrade_assistant_controller.py'} if assistant else set())
-    if policy.get('upgrade',{}).get('core_followup',{}).get('schema') == ASSISTANT_ILLUSTRATION_CORE_SCHEMA:
+    if policy.get('upgrade',{}).get('core_followup',{}).get('schema') in (ASSISTANT_ILLUSTRATION_CORE_SCHEMA, ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA):
         expected_modules |= {'assistant_rollout_binding.py', 'ai_release_guard.py', 'ai_runtime.py'}
     must(set(policy['runtime_modules']) == expected_modules, 'business_module_binding')
     up = policy.get('upgrade')
@@ -398,7 +399,7 @@ def validate_core_followup(policy):
         'ai_active_sha256','ai_current_sha256','ai_journal_sha256','ai_snapshot_sha256','ai_configuration_sha256'},
         'core_followup_contract_fields')
     must(value['schema'] in ('R25_ASSISTANT_CORE_FOLLOWUP_V1',*MANAGED_CORE_SCHEMAS), 'core_followup_contract_schema')
-    if value['schema'] == ASSISTANT_ILLUSTRATION_CORE_SCHEMA:
+    if value['schema'] in (ASSISTANT_ILLUSTRATION_CORE_SCHEMA, ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA):
         must(up['candidate']['repository'] == CURRENT_REPOSITORY, 'illustration_core_candidate_repository')
     managed=value['schema'] in MANAGED_CORE_SCHEMAS
     first_managed=value['schema']=='R25_MANAGED_VMM_CORE_FOLLOWUP_V1'
@@ -794,7 +795,7 @@ def verify_compatibility(policy, query):
         ledger=strict_json(query(ASSISTANT_LEDGER_SQL))['ledger']
         entries=up['assistant']['migrations']; helper.migration_inventory(entries)
         must(len(ledger) in helper.schema_prefixes(entries) and ledger==[{'version':x['version'],'sha256':x['sha256']} for x in entries[:len(ledger)]],'assistant_live_schema_binding')
-        if up.get('core_followup', {}).get('schema') == ASSISTANT_ILLUSTRATION_CORE_SCHEMA:
+        if up.get('core_followup', {}).get('schema') in (ASSISTANT_ILLUSTRATION_CORE_SCHEMA, ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA):
             must(len(ledger) == len(entries), 'illustration_core_requires_committed_schema')
         must(current['versions']==[x['version'] for x in ledger],'assistant_schema_observation')
     comparison=('database','port','major','tables') if up['capability']=='assistant-v1' else ('database','port','major','versions','tables')
