@@ -64,6 +64,16 @@ class BootstrapSourceLoadingTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(cached.exists())
 
+    def test_archived_extensionless_lifecycle_compiles_only_verified_bytes(self):
+        path = self.root / 'before' / 'lifecycle'
+        path.parent.mkdir()
+        path.write_bytes(b'raise AssertionError("read unverified disk bytes")\n')
+        verified = b'RECOVERY_SOURCE = "verified"\n'
+        module = installer.guard.source_module(path, 'fixture_extensionless_lifecycle', verified)
+        self.addCleanup(sys.modules.pop, 'fixture_extensionless_lifecycle', None)
+        self.assertEqual(module.RECOVERY_SOURCE, 'verified')
+        self.assertEqual(Path(module.__file__), path)
+
     def test_prefix_and_symlink_cache_are_refused_without_cleanup(self):
         prefix = self.root / 'prefix'
         with patch.object(sys, 'pycache_prefix', str(prefix)):
