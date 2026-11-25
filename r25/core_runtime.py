@@ -267,6 +267,9 @@ class CoreRuntime:
         if followup.get('schema') == guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA:
             must(guard.verify_assistant_rollout_ai(value, for_start=False) == followup['ai_release'],
                  'illustration_core_restore_ai_before_core')
+        if followup.get('schema') == guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA:
+            approval, _, _ = guard.load_assistant_rollout_approval(value)
+            guard.verify_assistant_rollout_successor_web(value, approval, core_at=None)
         if 'successor' in value.get('upgrade',{}):
             must(guard.successor_configuration_phase(value) == 'bridge', 'successor_restore_ai_before_core')
             ai_current = self.read(ROOT/'runtime/ai-publications/CURRENT.json')
@@ -452,7 +455,8 @@ class CoreRuntime:
         value=guard.policy()
         if value.get('upgrade',{}).get('core_followup',{}).get('schema') not in {
                 'R25_KNOWLEDGE_CORE_PUBLICATION_V1', 'R25_STUDIO_CORE_PUBLICATION_V1',
-                'R25_REFERENCE_CORE_PUBLICATION_V1', guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA}:
+                'R25_REFERENCE_CORE_PUBLICATION_V1', guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA,
+                guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA}:
             if not resuming:engine.community_action('drain',self.fd)
             return
         must(self.tx is not None,'knowledge_maintenance_transaction')

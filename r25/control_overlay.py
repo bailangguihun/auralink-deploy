@@ -437,3 +437,14 @@ def render_assistant_rollout_lifecycle(before):
     raw = replace_once(before, anchor, addition + anchor, 'community_rollout_method')
     ast.parse(raw)
     return raw
+
+
+def render_assistant_rollout_successor_lifecycle(before):
+    original = (b"approved['schema']==receipt['schema']=="
+                b"'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'")
+    extended = (b"approved['schema']==receipt['schema'] and approved['schema'] in "
+                b"('R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1',"
+                b"'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1')")
+    raw = replace_once(before, original, extended, 'illustration_successor_lifecycle_contract')
+    ast.parse(raw)
+    return raw
