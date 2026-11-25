@@ -29,6 +29,8 @@ class CommunityRuntimeTest(unittest.TestCase):
         for p in (self.root,self.release,self.config):p.mkdir(mode=0o700)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0));self.port=sock.getsockname()[1]
+        # The host rejects using the Community listener as its Core upstream.
+        core_port = 39112 if self.port == 39111 else 39111
         for name in REQUIRED:
             p=self.release/name;p.parent.mkdir(mode=0o700,parents=True,exist_ok=True);p.write_text('fixture');p.chmod(0o600)
         (self.release/'package.json').write_text('{"type":"module"}')
@@ -45,7 +47,7 @@ process.once('SIGTERM',()=>{server.close();setTimeout(()=>console.log('fixture_d
         self.manifest['archive_sha256']=digest(self.zip_bytes)
         raw=json.dumps(self.manifest).encode();(self.release/'manifest.json').write_bytes(raw);(self.release/'manifest.json').chmod(0o600)
         config=json.dumps(dict(COMMUNITY_DATABASE_URL='postgres://fixture:fixture@127.0.0.1:5432/community_fixture',
-            COMMUNITY_CORE_ORIGIN='http://127.0.0.1:39111',COMMUNITY_WEB_ORIGIN='https://fixture.invalid',COMMUNITY_PORT=str(self.port))).encode()
+            COMMUNITY_CORE_ORIGIN=f'http://127.0.0.1:{core_port}',COMMUNITY_WEB_ORIGIN='https://fixture.invalid',COMMUNITY_PORT=str(self.port))).encode()
         (self.config/'env.json').write_bytes(config);(self.config/'env.json').chmod(0o600)
         # Tool-cache executables may be group-writable on hosted CI. Exercise
         # the real private-runtime contract using an exact isolated byte copy;
