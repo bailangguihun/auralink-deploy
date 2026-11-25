@@ -15,6 +15,7 @@ import sys
 
 
 ASSISTANT_COMMANDS={'observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve'}
+RECEIPT_COMMANDS={'receipt-prepare','receipt-repair','receipt-recover'}
 
 
 def verify_controller(root, digest, owner=(0,0)):
@@ -79,7 +80,7 @@ def assistant_community_command(code, command, expected_plan, core_authority, *,
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover','reference-prepare','reference-install','reference-recover','code-prepare','code-install','code-recover'])
+    p.add_argument('command',choices=['check','install','recover','observe','stop','supervise','bind-web','register','enable','disable','watchdog-tick','watchdog-drain','watchdog-preserve','package-prepare','package-install','package-recover','reference-prepare','reference-install','reference-recover','code-prepare','code-install','code-recover',*sorted(RECEIPT_COMMANDS)])
     for name in ['plan','plan-sha256','bundle-manifest-sha256']:p.add_argument('--'+name,required=True)
     for name in ['archive','manifest','settings','node','approval','operation-id','package-plan','package-plan-sha256','review-sha256']:p.add_argument('--'+name)
     p.add_argument('--lease-fd',type=int)
@@ -89,6 +90,7 @@ def main():
     p.add_argument('--reference-publication-sha256')
     p.add_argument('--code-publication-sha256')
     p.add_argument('--assistant-rollout-sha256')
+    p.add_argument('--receipt-controller-sha256')
     p.add_argument('--reference-plan')
     p.add_argument('--reference-plan-sha256')
     p.add_argument('--database-plan')
@@ -96,7 +98,13 @@ def main():
     if (a.lease_fd is not None) != a.command.startswith('watchdog-'):
         raise ValueError('community_watchdog_inherited_lease_required')
     if os.geteuid()!=0:raise ValueError('community_host_requires_current_root_operator')
-    bootstrap(a.bundle_manifest_sha256)
+    receipt_command = a.command in RECEIPT_COMMANDS
+    if receipt_command:
+        if not a.receipt_controller_sha256 or not a.assistant_rollout_sha256:
+            raise ValueError('community_receipt_repair_controller_required')
+    elif a.receipt_controller_sha256:
+        raise ValueError('community_receipt_repair_scope')
+    bootstrap(a.receipt_controller_sha256 if receipt_command else a.bundle_manifest_sha256)
     from community_host import ROOT,Host,encoded,identity,production_lease,sha
     raw=Path(a.plan).read_bytes();plan=json.loads(raw)
     if raw!=encoded(plan) or sha(raw)!=a.plan_sha256:raise ValueError('community_exact_plan_bytes')
@@ -105,13 +113,17 @@ def main():
     code_context=None
     rollout=None
     if a.assistant_rollout_sha256 is not None:
-        if not a.code_publication_sha256 or a.command not in ASSISTANT_COMMANDS:
+        if not a.code_publication_sha256 or a.command not in ASSISTANT_COMMANDS | RECEIPT_COMMANDS:
             raise ValueError('community_assistant_scope')
         from community_host import assistant_community_approval
         rollout=assistant_community_approval(a.assistant_rollout_sha256,a.code_publication_sha256,
             a.bundle_manifest_sha256,preserve_only=a.command=='watchdog-preserve')
         entry=ROOT/'operations/community-controller'/a.bundle_manifest_sha256/'community_host_cli.py'
-        if Path(__file__).absolute()!=entry or identity(entry)['sha256']!=rollout['assistant_rollout']['community']['cli_sha256']:
+        executing = entry
+        if receipt_command:
+            executing = ROOT/'operations/community-controller'/a.receipt_controller_sha256/'community_host_cli.py'
+            verify_controller(entry.parent,a.bundle_manifest_sha256)
+        if Path(__file__).absolute()!=executing or identity(entry)['sha256']!=rollout['assistant_rollout']['community']['cli_sha256']:
             raise ValueError('community_assistant_controller_entry')
     if a.command.startswith('code-') and not a.code_publication_sha256:
         raise ValueError('community_code_controller_required')
@@ -121,9 +133,9 @@ def main():
         raise ValueError('community_package_requires_studio')
     if a.code_publication_sha256:
         if not all([a.reference_publication_sha256,a.knowledge_publication_sha256,
-                    a.supervision_upgrade_sha256,a.studio_publication_sha256]) or a.command not in (
+                    a.supervision_upgrade_sha256,a.studio_publication_sha256]) or a.command not in {
                     'observe','stop','enable','watchdog-tick','watchdog-drain','watchdog-preserve',
-                    'code-prepare','code-install','code-recover'):
+                    'code-prepare','code-install','code-recover',*RECEIPT_COMMANDS}:
             raise ValueError('community_code_scope')
         from community_host import code_publication_binding
         binding,legacy_sha,code_context=code_publication_binding(plan,a.plan_sha256,a.bundle_manifest_sha256,
@@ -176,8 +188,25 @@ def main():
             code=CodePackageUpgrade(ReferencePackageUpgrade(host,supervisor,context),code_context)
             def core_authority(*,preserve_only):
                 return require_community_rollout(a.assistant_rollout_sha256,lease.fd,preserve_only=preserve_only)
-            result=assistant_community_command(code,a.command,rollout['assistant_rollout']['community']['code_plan_sha256'],
-                                               core_authority,operation_id=a.operation_id)
+            code_plan=rollout['assistant_rollout']['community']['code_plan_sha256']
+            if receipt_command:
+                from community_host import StartReceiptRepair
+                selected=core_authority(preserve_only=False)
+                host,supervisor=code.active_for_assistant_rollout(code_plan,core_authority,preserve_only=False)
+                authority={'controller_sha256':a.receipt_controller_sha256,
+                           'active_controller_sha256':a.assistant_rollout_sha256,
+                           'code_plan_sha256':code_plan,'core_release':selected}
+                repair=StartReceiptRepair(code,host,supervisor,authority)
+                if a.command=='receipt-prepare' and a.operation_id and a.review_sha256 and not a.package_plan_sha256:
+                    _,folder=repair.prepare(a.operation_id,a.review_sha256)
+                    result={'outcome':'PREPARED_UNSIGNED','approval_sha256':folder.name,
+                            'plan':str(folder/'UNSIGNED_PLAN.json')}
+                elif a.command!='receipt-prepare' and a.package_plan_sha256 and not (a.operation_id or a.review_sha256):
+                    result=repair.execute(a.package_plan_sha256,recover=a.command=='receipt-recover')
+                else:
+                    raise ValueError('community_receipt_repair_arguments')
+            else:
+                result=assistant_community_command(code,a.command,code_plan,core_authority,operation_id=a.operation_id)
         print(json.dumps(dict(community=result)))
         return
     if a.reference_publication_sha256:

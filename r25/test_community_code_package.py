@@ -95,6 +95,78 @@ class CodePackage(unittest.TestCase):
         self.assertEqual(self.install(),'COMMITTED_VERIFIED_NOOP')
         self.retained()
 
+    def receipt_repair_fixture(self):
+        from community_host import StartReceiptRepair
+        self.assertEqual(self.code.install(self.plan,self.archive,self.manifest), 'COMMITTED')
+        host, supervisor = self.code.active()
+        host.control('stop')
+        deadline = time.monotonic()+5
+        while host.control('observe') not in ('STOPPED','EXITED'):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        state = supervisor.load()
+        last = 'd'*32
+        state['budget_start'] = len(state['attempts'])
+        state['attempts'].append(last)
+        state.update(stable=None, unhealthy=None, reason='START_DECISION')
+        self.h.write(supervisor.state,state)
+        repair = StartReceiptRepair(self.code, host, supervisor, {'controller_sha256': 'a'*64})
+        review = encoded({'review': 'verified isolated receipt repair'})
+        review_sha = sha(review)
+        self.h.storage.mkdir_private(repair.root)
+        self.h.storage.mkdir_private(repair.root/'reviews')
+        self.h.storage.atomic_write_bytes(repair.root/'reviews'/(review_sha+'.json'),review)
+        plan, folder = repair.prepare(last, review_sha)
+        self.h.storage.atomic_write_bytes(folder/'approval.json', encoded(plan))
+        return repair, plan, folder, state
+
+    def test_reviewed_receipt_repair_uses_new_managed_start_and_keeps_the_old_decision(self):
+        with self.lease.held():
+            repair, plan, folder, state = self.receipt_repair_fixture()
+            old_path, _ = repair.host.role().current()
+            receipt = old_path.read_bytes()
+            self.assertEqual(repair.execute(folder.name), 'COMMITTED')
+            observed = repair.supervisor.load()
+            self.assertEqual(observed['attempts'], state['attempts']+[plan['operation_id']])
+            self.assertEqual(observed['budget_start'], state['budget_start'])
+            self.assertEqual(old_path.read_bytes(), receipt)
+            self.assertFalse((old_path.parent/('run-'+plan['missing_operation_id']+'.json')).exists())
+            self.assertEqual(repair.host.preserve_running(repair.supervisor)['state'], 'READY_PRESERVED')
+            self.assertEqual(repair.execute(folder.name, recover=True), 'COMMITTED_VERIFIED_NOOP')
+        self.retained()
+
+    def test_recovery_of_lost_new_receipt_never_replays_the_spawn(self):
+        with self.lease.held():
+            repair, plan, folder, state = self.receipt_repair_fixture()
+            with patch.object(repair.host, 'control', side_effect=TimeoutError('interrupted spawn')) as start:
+                with self.assertRaises(TimeoutError):
+                    repair.execute(folder.name)
+                start.assert_called_once_with('start', plan['operation_id'])
+            self.assertEqual(self.h.read(folder/'journal.json')['phase'], 'START_INTENT')
+            with self.assertRaisesRegex(ValueError, 'unknown_start_no_replay'):
+                repair.execute(folder.name, recover=True)
+            self.assertEqual(repair.supervisor.load()['attempts'], state['attempts']+[plan['operation_id']])
+        self.retained()
+
+    def test_recovery_observes_existing_managed_spawn_after_lost_reply(self):
+        with self.lease.held():
+            repair, plan, folder, _ = self.receipt_repair_fixture()
+            control = repair.host.control
+
+            def start_and_lose_reply(action, operation):
+                control(action, operation)
+                raise TimeoutError('lost reply after the owned start')
+
+            with patch.object(repair.host, 'control', side_effect=start_and_lose_reply) as start:
+                with self.assertRaises(TimeoutError):
+                    repair.execute(folder.name)
+                start.assert_called_once_with('start', plan['operation_id'])
+            with patch.object(repair.host, 'control', wraps=control) as observe:
+                self.assertEqual(repair.execute(folder.name, recover=True), 'COMMITTED')
+                self.assertTrue(all(call.args == ('observe',) for call in observe.call_args_list))
+            self.assertEqual(repair.host.role().current()[1]['operation_id'], plan['operation_id'])
+        self.retained()
+
     def test_assistant_keepalive_uses_the_approved_code_package_without_touching_process_state(self):
         self.assertEqual(self.install(),'COMMITTED')
         ident=self.folder.name
