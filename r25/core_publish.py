@@ -86,7 +86,9 @@ def stage(rt, commit, run_id, attempt):
         business_identity = {'repository': candidate['repository'], 'commit_sha': commit,
             'github_run_id': run_id, 'github_run_attempt': attempt, 'artifact_sha256': digest,
             'artifact_bytes': candidate['artifact']['bytes'], 'payload_fingerprint': fingerprint}
+        manifest_sha256 = rt.identity(manifest)['sha256']
         if business:
+            guard.verify_assistant_rollout_successor_manifest(policy, manifest_sha256)
             module = guard.business_module(policy)
             module.candidate_matches(policy, business_identity)
             module.verify_assets(policy)
@@ -104,7 +106,7 @@ def stage(rt, commit, run_id, attempt):
                     'repository': candidate['repository'],
                     'commit_sha': commit, 'github_run_id': run_id, 'github_run_attempt': attempt,
                     'artifact_sha256': digest, 'artifact_bytes': candidate['artifact']['bytes'],
-                    'candidate_manifest_sha256': rt.identity(manifest)['sha256'],
+                    'candidate_manifest_sha256': manifest_sha256,
                     'policy_sha256': rt.identity(guard.STORE / 'POLICY.json')['sha256'],
                     'payload_fingerprint': fingerprint,
                     'scope': ('explicit knowledge-read-v1 business upgrade; authenticated acceptance before CURRENT' if business else

@@ -307,6 +307,7 @@ class AIRuntime:
     def validate_recovery(self, tx):
         self.core.require_lease()
         policy = guard.core.policy()
+        must(not guard.core.is_assistant_rollout_successor(policy), 'illustration_successor_ai_is_frozen')
         if guard.core.is_assistant_rollout(policy):
             guard.core.verify_assistant_rollout_ai(policy, for_start=False)
         journal, snapshot = self.load(tx)

@@ -138,6 +138,37 @@ class AssistantRolloutCoreProofTests(unittest.TestCase):
             preserve_only=preserve_only, storage=self.storage, _layout=(self.store, self.jars),
         )
 
+    def test_finite_successor_binds_parent_receipt_even_after_new_commit_or_restore(self):
+        self.policy['upgrade']['core_followup']['schema'] = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'
+        self.policy_sha = self.json(self.store/'POLICY.json', self.policy)
+        self.record['policy_sha256'] = self.policy_sha
+        self.approval['schema'] = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
+        self.approval['operational']['policy']['after_sha256'] = self.policy_sha
+        journal = self.old_transaction/'journal.json'
+        parent = {'schema': 'R25_CORE_TRANSACTION_V1', 'transaction_id': self.old_tx, 'snapshot_id': self.old_tx,
+                  'phase': 'COMMITTED', 'candidate': self.previous}
+        self.approval['successor'] = {'core_journal_sha256': self.json(journal, parent)}
+        self.folder = self.directory('core-publications/controller-upgrades/' + sha256(self.encode(self.approval)).hexdigest())
+        self.json(self.folder/'approval.json', self.approval)
+        before = self.directory(self.folder.relative_to(self.root)/'before')
+        self.json(before/'ILLUSTRATION_CORE_CURRENT.json', self.before_current)
+        self.json(before/'ILLUSTRATION_CORE_ACTIVE.json', self.before_active)
+        self.set_successor()
+        self.assertEqual(self.verify(), self.successor)
+
+        self.set_successor(phase='START_INTENT')
+        self.assertEqual(self.verify(preserve_only=True), self.successor)
+        with self.assertRaisesRegex(binding.BindingRefused, 'in_flight'):
+            self.verify()
+
+        self.set_successor(phase='RESTORED')
+        for path in self.jars.values():
+            self.write(path, self.old_jar)
+        self.assertEqual(self.verify(), self.previous)
+        self.json(journal, dict(parent, phase='RESTORED'))
+        with self.assertRaises(Exception):
+            self.verify()
+
     def test_committed_successor_requires_both_live_jars_and_bound_pointers(self):
         self.assertEqual(self.verify(), self.successor)
         self.write(self.jars['preview-jar'], self.old_jar)

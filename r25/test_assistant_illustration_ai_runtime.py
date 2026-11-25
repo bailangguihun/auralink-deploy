@@ -195,6 +195,38 @@ class IllustrationAIReleaseTest(unittest.TestCase):
         with self.assertRaises(guard.Refused):
             ai.validate_critic_identity(self.root, 'main.py')
 
+    def test_successor_critic_start_keeps_original_ai_receipt_across_new_core(self):
+        self.policy['upgrade']['core_followup']['schema'] = guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA
+        self.bind_ai_guard()
+        self.transition('COMMITTED', current=self.before_current | {
+            'release': self.new, 'previous': self.old, 'transaction_id': fixture.AFTER_TX,
+        })
+        self.install(self.new_source)
+        path = self.store/'transactions'/fixture.AFTER_TX
+        self.approval['current_release'] = fixture.CORE_AFTER
+        self.approval['current_ai_release'] = self.new
+        self.approval['assistant_rollout'].update({
+            f'ai_{name.lower()}_sha256': sha((self.store/(name + '.json')).read_bytes())
+            for name in ('ACTIVE', 'CURRENT')
+        })
+        self.approval['successor'] = {f'ai_{name}_sha256': sha((path/(name + '.json')).read_bytes())
+                                      for name in ('journal', 'snapshot')}
+        core = fixture.CORE_AFTER | {'commit_sha': '6'*40}
+        tx = '7'*32
+        self.put(self.core/'CURRENT.json', {'transaction_id': tx, 'release': core})
+        self.put(self.core/'transactions'/tx/'journal.json', {
+            'phase': 'COMMITTED', 'candidate': core, 'history': [{'phase': 'COMMITTED', 'at_unix': 100}],
+        })
+        with patch.object(guard, 'verify_assistant_rollout_core', return_value=core), \
+             patch.object(guard, 'verify_assistant_rollout_successor_web') as web:
+            self.assertEqual(ai.validate_critic_identity(self.root, 'main.py'), sha(self.new_source['critic-service/app/main.py']))
+            self.assertEqual(web.call_args.args[2], 100)
+            with self.assertRaisesRegex(guard.Refused, 'ai_is_frozen'):
+                self.verify(candidate=self.old)
+            self.put(path/'snapshot.json', {'foreign': True})
+            with self.assertRaisesRegex(guard.Refused, 'fixture_file_identity'):
+                ai.validate_critic_identity(self.root, 'main.py')
+
     def test_managed_publication_and_rollback_restore_exact_critic_source(self):
         self.bind_ai_guard()
         self.put(self.root / 'runtime/config/internal-token', b'a' * 72)

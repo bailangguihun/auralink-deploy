@@ -8,6 +8,7 @@ independent equivalence proof, with its established 60c5 capability baseline.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import importlib.util
 import json
@@ -31,6 +32,8 @@ BUSINESS_POLICY_SCHEMA = 'R25_CORE_BUSINESS_POLICY_V2'
 BUSINESS_RECORD_SCHEMA = 'R25_CORE_BUSINESS_RELEASE_V2'
 ASSISTANT_ILLUSTRATION_CORE_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_V1'
 ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
+ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'
+ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
 ASSISTANT_AI_PATHS = tuple(sorted((
     'guide_service/__init__.py', 'guide_service/__main__.py', 'guide_service/app.py',
     'guide_service/config.py', 'guide_service/diagnostics.py', 'guide_service/env_loader.py',
@@ -192,7 +195,49 @@ def handoff_values():
 
 
 def is_assistant_rollout(value):
-    return value.get('upgrade', {}).get('core_followup', {}).get('schema') == ASSISTANT_ILLUSTRATION_CORE_SCHEMA
+    return value.get('upgrade', {}).get('core_followup', {}).get('schema') in {
+        ASSISTANT_ILLUSTRATION_CORE_SCHEMA, ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA,
+    }
+
+
+def is_assistant_rollout_successor(value):
+    return value.get('upgrade', {}).get('core_followup', {}).get('schema') == ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA
+
+
+def render_assistant_rollout_successor_policy(old, plan):
+    must(is_assistant_rollout(old) and not is_assistant_rollout_successor(old),
+         'illustration_successor_predecessor')
+    value = deepcopy(old)
+    upgrade = value['upgrade']
+    prior = old['upgrade']['candidate']
+    candidate = plan['successor']['candidate']
+    baseline = plan['current_release']
+    must(all(baseline.get(field) == prior[field] for field in ('commit_sha', 'artifact_sha256'))
+         and all(candidate[field] != prior[field] for field in (
+             'commit_sha', 'artifact_sha256', 'payload_fingerprint')),
+         'illustration_successor_candidate')
+    old_sha = plan['operational']['policy']['before_sha256']
+    upgrade.update(candidate=deepcopy(candidate), baseline_release=deepcopy(baseline),
+                   web_commit=plan['successor']['web']['commit_sha'])
+    upgrade['core_followup'].update(schema=ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA,
+                                    predecessor_policy_sha256=old_sha)
+    assistant = upgrade['assistant']
+    assistant.update(baseline_policy_sha256=old_sha,
+                     baseline_payload_fingerprint=prior['payload_fingerprint'],
+                     compatible_recovery_jar_sha256=baseline['artifact_sha256'],
+                     review_evidence_sha256=plan['review_evidence_sha256'])
+    assistant['artifacts']['core'] = {'repository': candidate['repository'], 'commit': candidate['commit_sha'],
+                                      'sha256': candidate['artifact_sha256']}
+    deploy = plan['deploy']
+    assistant['artifacts']['deploy'] = {'repository': deploy['repository'], 'commit': deploy['commit'],
+                                        'sha256': deploy['archive_sha256']}
+    for name, entry in plan['files'].items():
+        if name in value['runtime_modules']:
+            value['runtime_modules'][name] = entry['after_sha256']
+    value['controllers']['core_release_guard.py'] = plan['operational']['guard']['after_sha256']
+    if 'lifecycle' in plan['operational']:
+        value['controllers']['lifecycle_adapter.py'] = plan['operational']['lifecycle']['after_sha256']
+    return value
 
 
 def assistant_rollout_policy(values):
@@ -449,7 +494,9 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
     approval = private_record(folder / 'approval.json', digest)
     receipt = private_record(folder / 'journal.json')
     phase = receipt.get('phase')
-    must(approval.get('schema') == receipt.get('schema') == ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA and
+    successor = is_assistant_rollout_successor(value)
+    schema = ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL if successor else ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA
+    must(approval.get('schema') == receipt.get('schema') == schema and
          receipt.get('approval_sha256') == digest and phase in {'VERIFY_INTENT', 'INSTALLED'},
          'illustration_controller_installation')
     private_record(folder / 'review.json', digest_value(approval.get('review_evidence_sha256')))
@@ -457,9 +504,14 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
     raw = private_record(STORE / 'POLICY.json', policy_sha)
     installation = raw.get('installation', {})
     must(raw.get('schema') == value.get('schema') == BUSINESS_POLICY_SCHEMA and is_assistant_rollout(raw) and
+         is_assistant_rollout_successor(raw) == successor and
          raw.get('upgrade') == value.get('upgrade') and installation == value.get('installation') and
          all(approval.get(field) == installation.get(field) for field in ('private_owner', 'controller_owner')),
          'illustration_approved_policy_binding')
+    if successor:
+        old = private_record(folder / 'before/policy', approval['operational']['policy']['before_sha256'])
+        must(raw == render_assistant_rollout_successor_policy(old, approval),
+             'illustration_successor_rendered_policy')
     return approval, folder, phase
 
 
@@ -484,7 +536,7 @@ def require_community_rollout(approval_sha256, lease_fd, *, preserve_only=False)
     return verify_assistant_rollout_core(policy, approval, folder, preserve_only=preserve_only)
 
 
-def _rollout_web_commit_receipt(selection, reference, *, commit, before, core_at):
+def _rollout_web_commit_receipt(selection, reference, *, commit, before, core_at, artifact=None):
     selection_sha, reference_sha = (hashlib.sha256(read_file(path)).hexdigest() for path in (selection, reference))
     runtime = LOCK.parent
     for stage in sorted(runtime.glob('frontend-selection-transition-*'), reverse=True):
@@ -498,14 +550,26 @@ def _rollout_web_commit_receipt(selection, reference, *, commit, before, core_at
         if not (state.get('state') == 'COMMITTED' and state.get('expected_commit') == commit and
                 state.get('new_selection_sha') == selection_sha and state.get('new_reference_sha') == reference_sha):
             continue
-        must(state.get('stage') == str(stage) and state.get('selection') == str(selection) and
-             state.get('reference') == str(reference) and state.get('old_selection_sha') == before['selection_sha256'] and
-             state.get('old_reference_sha') == before['reference_sha256'], 'illustration_web_transition_binding')
-        for side, hashes in (('old', before), ('new', {'selection_sha256': selection_sha, 'reference_sha256': reference_sha})):
-            for name in ('selection', 'reference'):
-                read_file(stage / (side + '.' + name), expected=hashes[name + '_sha256'])
+        after = {'selection_sha256': selection_sha, 'reference_sha256': reference_sha}
+        verify_rollout_web_receipt(stage, state, before, after, paths=(selection, reference), artifact=artifact)
         return selection_sha
     raise Refused('illustration_web_commit_receipt_required')
+
+
+def verify_rollout_web_receipt(stage, state, before, after, *, paths, artifact=None):
+    selection, reference = paths
+    must(state.get('stage') == str(stage) and state.get('selection') == str(selection) and
+         state.get('reference') == str(reference) and state.get('old_selection_sha') == before['selection_sha256'] and
+         state.get('old_reference_sha') == before['reference_sha256'] and
+         state.get('new_selection_sha') == after['selection_sha256'] and
+         state.get('new_reference_sha') == after['reference_sha256'], 'illustration_web_transition_binding')
+    if artifact is not None:
+        expected_ref = '-'.join(artifact[key] for key in ('commit_sha', 'github_run_id', 'github_run_attempt'))
+        must(state.get('requested_ref') == expected_ref and state.get('artifact_sha256') == artifact['archive_sha256'] and
+             state.get('expected_build_id') == artifact['build_id'], 'illustration_successor_web_artifact')
+    for side, hashes in (('old', before), ('new', after)):
+        for name in ('selection', 'reference'):
+            read_file(stage / (side + '.' + name), expected=hashes[name + '_sha256'])
 
 
 def verify_assistant_rollout_web(value, approval):
@@ -518,11 +582,39 @@ def verify_assistant_rollout_web(value, approval):
          journal.get('phase') == 'COMMITTED' and journal.get('candidate') == core.get('release') and
          type(history) is list and history and type(history[-1]) is dict and history[-1].get('phase') == 'COMMITTED' and
          type(history[-1].get('at_unix')) is int and history[-1]['at_unix'] > 0, 'illustration_web_core_commit_order')
-    selection = ROOT / 'runtime/config/frontend-selection.json'
-    reference = ROOT / 'runtime/config/frontend-selection.reference'
-    approval_before = approval['frontend']
-    selection_sha = _rollout_web_commit_receipt(selection, reference, commit=commit, before=approval_before,
+    selection, reference = frontend_paths()
+    selection_sha = _rollout_web_commit_receipt(selection, reference, commit=commit, before=approval['frontend'],
                                                 core_at=history[-1]['at_unix'])
+    return _verify_rollout_live_web(value, commit, selection_sha)
+
+
+def frontend_paths():
+    return (ROOT / 'runtime/config/frontend-selection.json',
+            ROOT / 'runtime/config/frontend-selection.reference')
+
+
+def frontend_digests():
+    return dict(zip(('selection_sha256', 'reference_sha256'),
+                    (hashlib.sha256(read_file(path)).hexdigest() for path in frontend_paths()), strict=True))
+
+
+def verify_assistant_rollout_successor_web(value, approval, core_at):
+    observed = frontend_digests()
+    before = approval['frontend']
+    after = approval['successor']['web']
+    if observed == before:
+        commit = approval['assistant_rollout']['web_commit']
+    else:
+        must(all(after[key] == digest for key, digest in observed.items()), 'illustration_successor_web_pair')
+        must(core_at is not None, 'illustration_successor_web_core_not_committed')
+        commit = after['commit_sha']
+        _rollout_web_commit_receipt(*frontend_paths(), commit=commit, before=before, core_at=core_at,
+                                    artifact=after)
+    return _verify_rollout_live_web(value, digest_value(commit, 40), observed['selection_sha256'])
+
+
+def _verify_rollout_live_web(value, commit, selection_sha):
+    selection, reference = frontend_paths()
     selected = private_record(selection, selection_sha)
     build_id = selected.get('build_id')
     provenance = selected.get('provenance')
@@ -609,6 +701,9 @@ def _verify_rollout_live_ai(files, owner):
 def verify_assistant_rollout_ai(value, *, candidate=None, for_start=True):
     """Verify a complete AI side for startup, or known bytes during recovery."""
     approval, folder, controller_phase = load_assistant_rollout_approval(value)
+    if is_assistant_rollout_successor(value):
+        must(candidate is None, 'illustration_successor_ai_is_frozen')
+        return verify_assistant_rollout_successor_ai(value, approval, folder, for_start=for_start)
     if controller_phase == 'VERIFY_INTENT':
         must(candidate is None, 'illustration_ai_controller_not_installed')
         return verify_core_followup_context(value)
@@ -688,6 +783,53 @@ def verify_assistant_rollout_ai(value, *, candidate=None, for_start=True):
 
 
 
+def verify_assistant_rollout_successor_ai(value, approval, folder, *, for_start):
+    proof = approval['successor']
+    ref = approval['current_ai_release']
+    store = ROOT / 'runtime/ai-publications'
+    pointers = approval['assistant_rollout']
+    current = private_record(store / 'CURRENT.json', pointers['ai_current_sha256'])
+    active = private_record(store / 'ACTIVE.json', pointers['ai_active_sha256'])
+    must(current.get('schema') == 'R25_AI_CURRENT_V1' and current.get('release') == ref,
+         'illustration_successor_ai_current')
+    tx = digest_value(active.get('transaction_id'), 32)
+    must(active == {'schema': 'R25_AI_ACTIVE_V1', 'transaction_id': tx}, 'illustration_successor_ai_active')
+    path = store / 'transactions' / tx
+    journal = private_record(path / 'journal.json', proof['ai_journal_sha256'])
+    snapshot = private_record(path / 'snapshot.json', proof['ai_snapshot_sha256'])
+    must(journal.get('schema') == 'R25_AI_TRANSACTION_V1' and journal.get('phase') == 'COMMITTED' and
+         snapshot.get('schema') == 'R25_AI_SNAPSHOT_V1' and journal.get('candidate') == snapshot.get('candidate') == ref and
+         journal.get('transaction_id') == snapshot.get('transaction_id') == tx and
+         journal.get('snapshot_sha256') == proof['ai_snapshot_sha256'] and
+         snapshot.get('core') == approval['current_release'],
+         'illustration_successor_ai_provenance')
+    followup = value['upgrade']['core_followup']
+    policy_sha = followup['ai_policy_sha256']
+    must(handoff_values().get('R25_AI_RELEASE_POLICY_SHA256') == policy_sha, 'illustration_successor_ai_policy')
+    ai_policy = private_record(store / 'POLICY.json', policy_sha)
+    read_file(ROOT / 'runtime/config/assistant-private/assistant-runtime.json',
+              owner=tuple(value['installation']['private_owner']), expected=followup['ai_configuration_sha256'])
+    record = private_record(_rollout_record_path(ref) / 'record.json', digest_value(ref['record_sha256']))
+    files = _rollout_ai_inventory(record, ref, ai_policy, policy_sha)
+    _verify_rollout_live_ai({name: (item,) for name, item in files.items()}, tuple(ai_policy['source_owner']))
+    if for_start:
+        selected = verify_assistant_rollout_core(value, approval, folder, preserve_only=True)
+        must(selected is not None, 'illustration_successor_core_in_flight')
+        committed_at = None
+        if selected != approval['current_release']:
+            core = private_record(STORE / 'CURRENT.json')
+            if core.get('release') == selected:
+                tx = digest_value(core.get('transaction_id'), 32)
+                journal = private_record(STORE / 'transactions' / tx / 'journal.json')
+                if journal.get('phase') == 'COMMITTED' and journal.get('candidate') == selected:
+                    event = journal['history'][-1]
+                    must(event.get('phase') == 'COMMITTED' and type(event.get('at_unix')) is int,
+                         'illustration_successor_core_commit_order')
+                    committed_at = event['at_unix']
+        verify_assistant_rollout_successor_web(value, approval, committed_at)
+    return ref
+
+
 def successor_configuration_phase(value):
     """Authorize final configuration only through the exact AI journal.
 
@@ -756,6 +898,13 @@ def require_release_configuration(value, record):
         read_file(ROOT / 'runtime/config/application.yml', expected=expected)
 
 
+def verify_assistant_rollout_successor_manifest(value, manifest_sha256):
+    if is_assistant_rollout_successor(value):
+        approval, _, _ = load_assistant_rollout_approval(value)
+        must(manifest_sha256 == approval['assistant_rollout']['core_candidate_manifest_sha256'],
+             'illustration_successor_core_manifest')
+
+
 def release_record(artifact_sha, expected_record=None, commit=None):
     artifact_sha = digest_value(artifact_sha)
     commit = digest_value(commit, 40)
@@ -786,6 +935,7 @@ def release_record(artifact_sha, expected_record=None, commit=None):
                  record.get('policy_sha256') == hashlib.sha256(read_file(STORE / 'POLICY.json')).hexdigest(),
                  'business_record_policy')
             business_module(expected).candidate_matches(expected, record)
+            verify_assistant_rollout_successor_manifest(expected, record.get('candidate_manifest_sha256'))
         must(type(record.get('artifact_bytes')) is int and 0 < record['artifact_bytes'] < 512 * 1024 * 1024,
              'release_artifact_size')
         return record

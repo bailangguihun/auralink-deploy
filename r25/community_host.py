@@ -238,9 +238,11 @@ def reference_lease_binding(plan, plan_sha, manifest_sha, knowledge_sha, upgrade
     private(ROOT/'runtime/community/WATCHDOG.json',bound['registration_sha256'])
     authority=approved if rollout is None else rollout
     if rollout is not None:
+        parent = rollout.get('illustration_predecessor', rollout)
         must(receipt['phase']=='INSTALLED' and
-             rollout['operational']['guard']['before_sha256']==approved['operational']['guard']['after_sha256'] and
-             rollout['controller_owner']==approved['controller_owner'],'community_assistant_guard_parent')
+             parent['operational']['guard']['before_sha256']==approved['operational']['guard']['after_sha256'] and
+             authority['controller_owner']==parent['controller_owner']==approved['controller_owner'],
+             'community_assistant_guard_parent')
     observed=identity(ROOT/'operations/core_release_guard.py')
     must(observed['sha256'] == authority['operational']['guard']['after_sha256'] and
          (observed['uid'],observed['gid'],observed['mode']) == tuple(authority['controller_owner'])+(0o700,),
@@ -1514,13 +1516,28 @@ def assistant_community_approval(rollout_sha, code_sha, manifest_sha, *, preserv
     rollout=storage.read_private_record(folder/'approval.json',expected_sha256=rollout_sha)
     receipt=storage.read_private_record(folder/'journal.json')
     allowed={'VERIFY_INTENT','INSTALLED'} if preserve_only else {'INSTALLED'}
-    must(rollout['schema']==receipt['schema']==ASSISTANT_ROLLOUT_SCHEMA and
+    must(rollout['schema']==receipt['schema'] and
+         rollout['schema'] in (ASSISTANT_ROLLOUT_SCHEMA, 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1') and
          receipt['approval_sha256']==rollout_sha and receipt['phase'] in allowed,
          'community_assistant_controller_not_installed')
     community=rollout['assistant_rollout']['community']
     must(community['code_controller_sha256']==code_sha and
          community['deploy']['manifest_sha256']==manifest_sha,'community_assistant_controller_binding')
     sha256_value(community['code_plan_sha256'])
+    if rollout['schema'] != ASSISTANT_ROLLOUT_SCHEMA:
+        previous = rollout['installed_control']
+        prior_id = sha256_value(previous['approval_sha256'])
+        prior = base/'controller-upgrades'/prior_id
+        parent = storage.read_private_record(prior/'approval.json',expected_sha256=prior_id)
+        installed = storage.read_private_record(prior/'journal.json',expected_sha256=previous['journal_sha256'])
+        must(parent['schema']==installed['schema']==ASSISTANT_ROLLOUT_SCHEMA and
+             installed['approval_sha256']==prior_id and installed['phase']=='INSTALLED' and
+             all(parent['operational'][key]['after_sha256']==rollout['operational'][key]['before_sha256']
+                 for key in ('guard','policy')) and
+             all(parent['assistant_rollout']['community'][key]==community[key]
+                 for key in ('code_controller_sha256','code_plan_sha256')),
+             'community_assistant_successor_parent')
+        rollout = dict(rollout, illustration_predecessor=parent)
     return rollout
 
 
