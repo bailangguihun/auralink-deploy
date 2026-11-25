@@ -233,6 +233,30 @@ def verify_assistant_rollout_core(value, approval, folder, *, preserve_only=Fals
             with self.assertRaisesRegex(v.Refused,'community_code_core_runtime_changed'):
                 v.applied_code_publication(self.rt,self.f.f.new,handoff)
 
+    def test_successor_uses_the_retained_core_publisher_in_the_reference_proof(self):
+        _, _, parent, parent_folder, _ = self.install_historical_overlay()
+        publisher = v.publication_targets(self.rt)['core_publish.py'][0]
+        original = publisher.read_bytes()
+        successor_folder = parent_folder.parent / ('d'*64)
+        archived = successor_folder / 'before/core_publish.py'
+        self.put(archived, original)
+        self.put(publisher, b'# Reviewed successor publisher\n')
+        successor = {'files': {'core_publish.py': {'before_sha256':v.sha(original),
+                                                    'after_sha256':v.sha(publisher.read_bytes())}}}
+        with self.rt.lease():
+            historical = v.assistant_rollout_history(self.rt,parent,parent_folder)
+            with self.assertRaisesRegex(v.Refused,'reference_target_drift:core_publish.py'):
+                v.verify_code_controller(self.rt,self.plan,self.folder,'after',runtime=True,
+                                         historical=historical,read_archived_jar=core_guard.read_file)
+            history = v.assistant_rollout_successor_history(
+                self.rt,successor,successor_folder,parent,parent_folder)
+            v.verify_code_controller(self.rt,self.plan,self.folder,'after',runtime=True,
+                                     historical=history,read_archived_jar=core_guard.read_file)
+            self.assertEqual(publisher.read_bytes(),b'# Reviewed successor publisher\n')
+            self.put(archived,b'changed history')
+            with self.assertRaisesRegex(v.Refused,'file_digest'):
+                v.assistant_rollout_successor_history(self.rt,successor,successor_folder,parent,parent_folder)
+
     def test_rollout_rejects_drift_in_archived_core_or_old_code_plan(self):
         policy,handoff,_,folder,archive = self.install_historical_overlay()
         code_marker = self.rt.store/'COMMUNITY_CODE_PUBLICATION_ACTIVE.json'
