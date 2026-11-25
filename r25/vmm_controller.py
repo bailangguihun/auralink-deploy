@@ -3398,6 +3398,19 @@ def assistant_rollout_history(rt, approval, folder):
     return history
 
 
+def assistant_rollout_successor_history(rt, approval, folder, parent, parent_folder):
+    history = assistant_rollout_history(rt, parent, parent_folder)
+    # The first illustration controller did not replace the Core publisher.
+    # Its exact successor preimage still belongs to the Reference proof.
+    target, _, _ = publication_targets(rt)['core_publish.py']
+    archived = folder/'before/core_publish.py'
+    wanted = digest(approval['files']['core_publish.py']['before_sha256'])
+    must(target not in history, 'illustration_successor_publisher_history_overlap')
+    read(archived, rt.private, expected=wanted)
+    history[target] = (archived, rt.private, wanted)
+    return history
+
+
 def applied_assistant_rollout(rt,value,handoff,controller):
     path,owner,mode=rt.targets()['publisher-guard']
     raw=read(path,owner,mode,digest(value['runtime_modules']['core_release_guard.py']))
@@ -3440,7 +3453,7 @@ def applied_assistant_rollout(rt,value,handoff,controller):
              parent['operational']['policy']['after_sha256'] == approval['operational']['policy']['before_sha256'] and
              parent['assistant_rollout']['community']['code_controller_sha256'] == code_id,
              'illustration_successor_vmm_parent')
-        history = assistant_rollout_history(rt, parent, prior_folder)
+        history = assistant_rollout_successor_history(rt, approval, folder, parent, prior_folder)
     else:
         history = assistant_rollout_history(rt, approval, folder)
     verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,

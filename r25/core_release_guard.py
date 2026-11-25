@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
 import os
@@ -1001,7 +1002,10 @@ class Guard:
 
 def source_module(path, name, raw):
     """Execute only the already verified source bytes, never a .pyc cache."""
-    specification = importlib.util.spec_from_file_location(name, path)
+    # Controller preimages have fixed extensionless names. The loader supplies
+    # the module metadata, while exec still uses the digest-verified bytes.
+    loader = SourceFileLoader(name, str(path))
+    specification = importlib.util.spec_from_file_location(name, path, loader=loader)
     module = importlib.util.module_from_spec(specification)
     previous = sys.modules.get(name)
     sys.modules[name] = module
