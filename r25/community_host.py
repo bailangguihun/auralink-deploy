@@ -1866,3 +1866,141 @@ class CodePackageUpgrade:
             must(attempts[:len(expected_attempts)]==expected_attempts,'community_assistant_code_activation')
         self.data(plan,predecessor)
         return self.candidate(plan),supervisor
+
+
+class StartReceiptRepair:
+    """Retire one missing start receipt and spend one existing retry via the managed role."""
+
+    SCHEMA = 'ARTLIVE_COMMUNITY_START_RECEIPT_REPAIR_V1'
+
+    def __init__(self, code, host, supervisor, authority):
+        self.code, self.host, self.supervisor = code, host, supervisor
+        self.authority = authority
+        self.root = code.host.folder/'start-receipt-repairs'
+
+    def _review(self, review_sha256):
+        path = self.root/'reviews'/(sha256_value(review_sha256)+'.json')
+        self.host.storage.read_private_record(path, expected_sha256=review_sha256)
+
+    def _terminal_context(self, state, missing):
+        from community_supervision import START_LIMIT
+        h, role = self.host, self.host.role()
+        h.lease.require()
+        must(state['desired'] == 'RUNNING' and state['reason'] == 'START_DECISION' and
+             state['attempts'] and state['attempts'][-1] == missing and
+             len(state['attempts'])-state['budget_start'] < START_LIMIT and len(state['attempts']) < 16384,
+             'community_receipt_repair_state_or_budget')
+        role.verify()
+        path, current = role.current()
+        must(current is not None and current['phase'] in ('EXITED','STOPPED') and
+             current['operation_id'] != missing, 'community_receipt_repair_terminal_predecessor')
+        saved = current.get('process')
+        if saved:
+            observed = process(saved['pid'])
+            must(observed is None or observed['boot_id'] != saved['boot_id'] or observed['ticks'] != saved['ticks'],
+                 'community_receipt_repair_predecessor_alive')
+        self._require_no_receipt(role, missing)
+        self.code.no_survivors(h)
+        self.code.data(h.package_plan, self.code.predecessor(retained=True))
+        return {'current_sha256': identity(role.root/'current.json')['sha256'],
+                'receipt_sha256': identity(path)['sha256'], 'receipt_operation_id': current['operation_id']}
+
+    @staticmethod
+    def _require_no_receipt(role, operation):
+        for suffix in ('.json','.log'):
+            path = role.root/('run-'+operation+suffix)
+            must(not path.exists() and not path.is_symlink(), 'community_receipt_repair_operation_evidence')
+
+    def prepare(self, missing, review_sha256):
+        import uuid
+        h = self.host
+        h.lease.require()
+        self._review(review_sha256)
+        must(type(missing) is str and re.fullmatch('[a-f0-9]{32}', missing), 'community_receipt_repair_identity')
+        state = self.supervisor.registered()
+        before = self._terminal_context(state, missing)
+        raw = self.supervisor.state.read_bytes()
+        state_sha256 = identity(self.supervisor.state)['sha256']
+        must(sha(raw)==state_sha256 and strict_json(raw)==state, 'community_receipt_repair_state_drift')
+        plan = {'schema': self.SCHEMA, 'authority': self.authority, 'review_sha256': review_sha256,
+                'missing_operation_id': missing, 'operation_id': uuid.uuid4().hex,
+                'before': dict(before, state_sha256=state_sha256)}
+        folder = self.root/sha(encoded(plan))
+        h.storage.mkdir_private(folder)
+        h.storage.atomic_write_bytes(folder/'before-supervision.json', raw)
+        h.storage.atomic_write_bytes(folder/'UNSIGNED_PLAN.json', encoded(plan))
+        return plan, folder
+
+    def execute(self, approval_sha256, *, recover=False):
+        h = self.host
+        h.lease.require()
+        approval_sha256 = sha256_value(approval_sha256)
+        folder = self.root/approval_sha256
+        plan = h.storage.read_private_record(folder/'approval.json', expected_sha256=approval_sha256)
+        must(sha(encoded(plan)) == approval_sha256 and
+             set(plan) == {'schema','authority','review_sha256','missing_operation_id','operation_id','before'} and
+             plan['schema'] == self.SCHEMA and plan['authority'] == self.authority,
+             'community_receipt_repair_approval')
+        self._review(plan['review_sha256'])
+        evidence = plan['before']
+        before = h.storage.read_private_record(folder/'before-supervision.json',
+                                               expected_sha256=evidence['state_sha256'])
+        missing, operation = plan['missing_operation_id'], plan['operation_id']
+        must(all(type(op) is str and re.fullmatch('[a-f0-9]{32}', op) for op in (missing,operation)) and
+             operation not in before['attempts'], 'community_receipt_repair_identity')
+        after = dict(before, attempts=[*before['attempts'],operation], stable=None, unhealthy=None)
+        state_path = self.supervisor.state
+        journal = folder/'journal.json'
+
+        def record(phase):
+            h.write(journal, {'schema': self.SCHEMA, 'approval_sha256': approval_sha256, 'phase': phase})
+
+        if journal.exists() or journal.is_symlink():
+            current = h.read(journal)
+            phase = current['phase']
+            must(current == {'schema': self.SCHEMA, 'approval_sha256': approval_sha256, 'phase': phase},
+                 'community_receipt_repair_journal')
+            if phase == 'COMMITTED':
+                self._verify_ready(operation)
+                return 'COMMITTED_VERIFIED_NOOP'
+            must(recover, 'community_receipt_repair_explicit_recovery')
+        else:
+            must(not recover, 'community_receipt_repair_not_started')
+            phase = 'DECISION_INTENT'
+            must(self.supervisor.registered() == before, 'community_receipt_repair_state_drift')
+            record(phase)
+
+        if phase == 'DECISION_INTENT':
+            actual = identity(state_path)['sha256']
+            after_raw = encoded(after)
+            must(self.supervisor.registered() == (before if actual == evidence['state_sha256'] else after) and
+                 actual in (evidence['state_sha256'],sha(after_raw)), 'community_receipt_repair_state_drift')
+            terminal = self._terminal_context(before,missing)
+            must(dict(terminal,state_sha256=evidence['state_sha256']) == evidence,
+                 'community_receipt_repair_terminal_drift')
+            self._require_no_receipt(h.role(),operation)
+            if actual == evidence['state_sha256']:
+                h.storage.atomic_write_bytes(state_path, after_raw, replace=True, expected_existing_sha256=actual)
+            record('START_INTENT')
+            h.control('start',operation)
+            phase = 'START_INTENT'
+        must(phase == 'START_INTENT', 'community_receipt_repair_phase')
+        self._verify_ready(operation)
+        self.code.data(h.package_plan, self.code.predecessor(retained=True))
+        record('COMMITTED')
+        return 'COMMITTED'
+
+    def _verify_ready(self, operation):
+        h = self.host
+        _, owned = h.role().current()
+        must(owned is not None and owned['operation_id'] == operation and
+             owned['phase'] in ('STARTING','READY') and owned.get('process'),
+             'community_receipt_repair_unknown_start_no_replay')
+        deadline = time.monotonic()+20
+        while True:
+            status = h.control('observe')
+            if status=='READY':
+                break
+            must(status=='STARTING' and time.monotonic()<deadline,'community_receipt_repair_not_ready')
+            time.sleep(.1)
+        must(h.preserve_running(self.supervisor)['state']=='READY_PRESERVED','community_receipt_repair_not_preserved')
