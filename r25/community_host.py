@@ -32,6 +32,7 @@ PARENT_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_BINDING_V1'
 SUCCESSOR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_SUCCESSOR_BINDING_V1'
 REPAIR_SCHEMA = 'R25_MANAGED_VMM_CORE_PUBLICATION_REPAIR_BINDING_V1'
 ASSISTANT_ROLLOUT_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
+ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
 
 
 def sha(raw):
@@ -1517,27 +1518,34 @@ def assistant_community_approval(rollout_sha, code_sha, manifest_sha, *, preserv
     receipt=storage.read_private_record(folder/'journal.json')
     allowed={'VERIFY_INTENT','INSTALLED'} if preserve_only else {'INSTALLED'}
     must(rollout['schema']==receipt['schema'] and
-         rollout['schema'] in (ASSISTANT_ROLLOUT_SCHEMA, 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1') and
+         rollout['schema'] in (ASSISTANT_ROLLOUT_SCHEMA, ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA) and
          receipt['approval_sha256']==rollout_sha and receipt['phase'] in allowed,
          'community_assistant_controller_not_installed')
     community=rollout['assistant_rollout']['community']
     must(community['code_controller_sha256']==code_sha and
          community['deploy']['manifest_sha256']==manifest_sha,'community_assistant_controller_binding')
     sha256_value(community['code_plan_sha256'])
-    if rollout['schema'] != ASSISTANT_ROLLOUT_SCHEMA:
-        previous = rollout['installed_control']
-        prior_id = sha256_value(previous['approval_sha256'])
-        prior = base/'controller-upgrades'/prior_id
-        parent = storage.read_private_record(prior/'approval.json',expected_sha256=prior_id)
-        installed = storage.read_private_record(prior/'journal.json',expected_sha256=previous['journal_sha256'])
-        must(parent['schema']==installed['schema']==ASSISTANT_ROLLOUT_SCHEMA and
-             installed['approval_sha256']==prior_id and installed['phase']=='INSTALLED' and
-             all(parent['operational'][key]['after_sha256']==rollout['operational'][key]['before_sha256']
-                 for key in ('guard','policy')) and
-             all(parent['assistant_rollout']['community'][key]==community[key]
-                 for key in ('code_controller_sha256','code_plan_sha256')),
-             'community_assistant_successor_parent')
-        rollout = dict(rollout, illustration_predecessor=parent)
+    if rollout['schema'] == ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA:
+        schemas = (ASSISTANT_ROLLOUT_SCHEMA,)
+        if 'ai_snapshot_core' in rollout.get('successor', {}):
+            schemas = (ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA, *schemas)
+        child = rollout
+        for schema in schemas:
+            previous = child['installed_control']
+            prior_id = sha256_value(previous['approval_sha256'])
+            prior = base/'controller-upgrades'/prior_id
+            parent = storage.read_private_record(prior/'approval.json',expected_sha256=prior_id)
+            installed = storage.read_private_record(prior/'journal.json',expected_sha256=previous['journal_sha256'])
+            must(parent['schema']==installed['schema']==schema and
+                 installed['approval_sha256']==prior_id and installed['phase']=='INSTALLED' and
+                 'ai_snapshot_core' not in parent.get('successor', {}) and
+                 all(parent['operational'][key]['after_sha256']==child['operational'][key]['before_sha256']
+                     for key in ('guard','policy')) and
+                 all(parent['assistant_rollout']['community'][key]==community[key]
+                     for key in ('code_controller_sha256','code_plan_sha256')),
+                 'community_assistant_successor_parent')
+            child = parent
+        rollout = dict(rollout, illustration_predecessor=child, illustration_predecessor_sha256=prior_id)
     return rollout
 
 
