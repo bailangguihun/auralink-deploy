@@ -125,6 +125,71 @@ class ReferenceProofs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'community_assistant_controller_pointer'):
                 approved()
 
+    def test_reviewed_followup_uses_original_community_reference_preimage(self):
+        f = self.f
+        f.current(f.candidate)
+        store = f.base / 'controller-upgrades'
+        code = {'code_controller_sha256': 'a' * 64, 'code_plan_sha256': 'b' * 64,
+                'deploy': {'manifest_sha256': 'c' * 64}}
+        policy = f.base / 'POLICY.json'
+        current = f.base / 'CURRENT.json'
+        runtime = {'current_sha256': community.identity(current)['sha256'],
+                   'transaction_sha256': community.identity(f.base/'transactions'/f.tx/'journal.json')['sha256'],
+                   'jar_sha256': f.candidate['artifact_sha256']}
+        successor_schema = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
+
+        def write_approval(schema, before_guard, after_guard, before_policy, after_policy,
+                           phase, **proofs):
+            plan = {'schema': schema, 'assistant_rollout': {'community': code,
+                    'core_current_sha256': runtime['current_sha256']},
+                    'operational': {'guard': {'before_sha256': before_guard, 'after_sha256': after_guard},
+                                    'policy': {'before_sha256': before_policy, 'after_sha256': after_policy}},
+                    **proofs}
+            ident = community.sha(community.encoded(plan))
+            receipt = {'schema': schema, 'approval_sha256': ident, 'phase': phase}
+            f.put(store/ident/'approval.json', plan)
+            f.put(store/ident/'journal.json', receipt)
+            link = {'approval_sha256': ident, 'journal_sha256': community.sha(community.encoded(receipt))}
+            return ident, plan, link
+
+        original, plan, original_link = write_approval(
+            community.ASSISTANT_ROLLOUT_SCHEMA, '1' * 64, '2' * 64,
+            community.identity(policy)['sha256'], '3' * 64, 'INSTALLED')
+        f.put(store/original/'before/policy', community.reference_core_record(f.host, policy))
+        f.put(store/original/'before/ILLUSTRATION_CORE_CURRENT.json', community.reference_core_record(f.host, current))
+        previous, _, previous_link = write_approval(
+            successor_schema, '2' * 64, '4' * 64, '3' * 64, '5' * 64, 'INSTALLED',
+            installed_control=original_link, successor={})
+        followup, _, _ = write_approval(
+            successor_schema, '4' * 64, '6' * 64, '5' * 64, '7' * 64, 'VERIFY_INTENT',
+            installed_control=previous_link, successor={'ai_snapshot_core': {}})
+        f.put(f.base/'CONTROL_UPGRADE_ACTIVE.json',
+              {'schema': 'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1', 'approval_sha256': followup})
+
+        def approved():
+            return community.assistant_community_approval(
+                followup, code['code_controller_sha256'], code['deploy']['manifest_sha256'], preserve_only=True)
+
+        storage = community.R25Storage
+        with patch.object(community, 'R25Storage', side_effect=lambda roots, *_: storage(roots, *f.host.owner)):
+            bound = approved()
+            self.assertEqual(bound['illustration_predecessor_sha256'], original)
+            self.assertEqual(bound['illustration_predecessor'], plan)
+            context = community.assistant_reference_package_context(
+                f.host, f.reference_id, bound['illustration_predecessor_sha256'],
+                bound['illustration_predecessor'], {'core_runtime': runtime})
+            self.assertEqual(context, f.expected)
+            for ident in (previous, original):
+                journal = store/ident/'journal.json'
+                raw = journal.read_bytes()
+                with self.subTest(parent=ident):
+                    try:
+                        f.put(journal, dict(community.reference_core_record(f.host, journal), phase='RESTORED'))
+                        with self.assertRaisesRegex(ValueError, 'record_sha256_mismatch'):
+                            approved()
+                    finally:
+                        journal.write_bytes(raw)
+
     def test_code_upgrade_still_requires_both_live_core_digests(self):
         f = self.f
         f.current(f.candidate)
