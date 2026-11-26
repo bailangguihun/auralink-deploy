@@ -3443,17 +3443,16 @@ def applied_assistant_rollout(rt,value,handoff,controller):
          'schema':CODE_CONTROLLER_SCHEMA,'approval_sha256':code_id,'phase':'INSTALLED'},
          'assistant_rollout_code_not_installed')
     if guard.is_assistant_rollout_successor(value):
-        prior = approval['installed_control']
-        prior_id = digest(prior['approval_sha256'])
-        prior_folder = rt.root/'runtime/core-publications/controller-upgrades'/prior_id
-        parent = json_read(prior_folder/'approval.json', rt.private, prior_id)
-        receipt = json_read(prior_folder/'journal.json', rt.private, prior['journal_sha256'])
-        must(parent['schema'] == receipt['schema'] == guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA and
-             receipt['phase'] == 'INSTALLED' and receipt['approval_sha256'] == prior_id and
-             parent['operational']['policy']['after_sha256'] == approval['operational']['policy']['before_sha256'] and
-             parent['assistant_rollout']['community']['code_controller_sha256'] == code_id,
-             'illustration_successor_vmm_parent')
-        history = assistant_rollout_successor_history(rt, approval, folder, parent, prior_folder)
+        def read_parent(path, expected):
+            return json_read(path, rt.private, expected)
+
+        parent, parent_folder = guard.load_assistant_rollout_successor_parent(approval, read=read_parent)
+        if 'ai_snapshot_core' in approval['successor']:
+            # The historical Community proof still predates the first rollout.
+            original, original_folder = guard.load_assistant_rollout_successor_parent(parent, read=read_parent)
+            history = assistant_rollout_successor_history(rt, parent, parent_folder, original, original_folder)
+        else:
+            history = assistant_rollout_successor_history(rt, approval, folder, parent, parent_folder)
     else:
         history = assistant_rollout_history(rt, approval, folder)
     verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,

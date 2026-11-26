@@ -237,6 +237,9 @@ class AssistantRolloutControllerTest(unittest.TestCase):
             })
             if component == 'ai':
                 evidence['ai_snapshot_sha256'] = self.record(folder/'snapshot.json', {'candidate': ref})
+        self.store_successor_fixture(plan)
+
+    def store_successor_fixture(self, plan):
         self.targets = self.controller.targets(plan)
         self.approval_sha = hashlib.sha256(guard.encoded(plan)).hexdigest()
         self.folder = self.controller.transaction_path(self.approval_sha)
@@ -244,6 +247,36 @@ class AssistantRolloutControllerTest(unittest.TestCase):
         self.record(self.folder/'review.json', {'reviewed': True})
         for name in self.targets:
             self.write(self.folder/'after'/name, self.after(name))
+
+    def test_second_successor_installs_without_rewriting_parent_or_current_pointers(self):
+        self.set_successor_plan()
+        plan = self.new_plan
+        parent = deepcopy(plan)
+        parent['current_release'] = {**plan['current_release'], 'commit_sha': '5'*40}
+        parent['operational']['policy']['after_sha256'] = plan['operational']['policy']['before_sha256']
+        parent_web = parent['successor']['web']
+        parent_web.update({**plan['frontend'], 'commit_sha': '6'*40})
+        plan['assistant_rollout']['web_commit'] = parent_web['commit_sha']
+        plan['successor']['ai_snapshot_core'] = parent['current_release']
+        parent_id = hashlib.sha256(guard.encoded(parent)).hexdigest()
+        folder = self.controller.transaction_path(parent_id)
+        self.record(folder/'approval.json', parent)
+        journal = {'schema': self.controller.SUCCESSOR, 'approval_sha256': parent_id, 'phase': 'INSTALLED'}
+        plan['installed_control'] = {'approval_sha256': parent_id,
+                                     'journal_sha256': self.record(folder/'journal.json', journal)}
+        plan['assistant_rollout']['control_active_sha256'] = self.record(
+            self.store/'CONTROL_UPGRADE_ACTIVE.json', self.controller._active_record(parent_id))
+        self.store_successor_fixture(plan)
+        paths = (folder/'approval.json', folder/'journal.json', self.store/'CURRENT.json', self.ai/'CURRENT.json')
+        before = {path: path.read_bytes() for path in paths}
+
+        with patch.object(self.controller, 'verify_successor_web_preimage'):
+            self.assertEqual(self.install(), 'INSTALLED')
+
+        for path, data in before.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(self.read(self.store/'CONTROL_UPGRADE_ACTIVE.json'),
+                         self.controller._active_record(self.approval_sha))
 
     def test_successor_recovers_known_partial_install_without_rewriting_parent_receipts(self):
         self.set_successor_plan()
