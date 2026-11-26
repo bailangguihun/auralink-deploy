@@ -129,8 +129,14 @@ def validate(plan):
 
 
 def validate_successor(value):
-    _fields(value, {'candidate', 'web', 'core_journal_sha256', 'ai_journal_sha256', 'ai_snapshot_sha256'},
-            'illustration_successor_fields')
+    fields = {'candidate', 'web', 'core_journal_sha256', 'ai_journal_sha256', 'ai_snapshot_sha256'}
+    if 'ai_snapshot_core' in value:
+        fields.add('ai_snapshot_core')
+        reference = value['ai_snapshot_core']
+        _fields(reference, {'commit_sha', 'artifact_sha256', 'accepted_record_sha256'},
+                'illustration_successor_ai_core_reference')
+        _hashes(reference, short=('commit_sha',))
+    _fields(value, fields, 'illustration_successor_fields')
     for key in ('core_journal_sha256', 'ai_journal_sha256', 'ai_snapshot_sha256'):
         guard.digest_value(value[key])
     candidate = value['candidate']
@@ -220,7 +226,7 @@ def _check_context(rt, plan, approval_sha256, side):
     must(journal.get('approval_sha256') == prior['approval_sha256'] and journal.get('phase') == 'INSTALLED',
          'assistant_rollout_predecessor_controller')
     if plan['schema'] == SUCCESSOR:
-        verify_successor_preimages(rt, plan, paths=pointers, predecessor=prior_folder, journal=journal)
+        verify_successor_preimages(rt, plan, paths=pointers)
     active = pointers['control_active_sha256']
     observed = rt.identity(active, expected_owner=private)['sha256']
     before = rollout['control_active_sha256']
@@ -232,16 +238,10 @@ def _check_context(rt, plan, approval_sha256, side):
     return observed
 
 
-def verify_successor_preimages(rt, plan, *, paths, predecessor, journal):
-    prior = rt.read(predecessor / 'approval.json', plan['installed_control']['approval_sha256'])
+def verify_successor_preimages(rt, plan, *, paths):
+    guard.load_assistant_rollout_successor_parent(plan, read=rt.read)
     evidence = plan['successor']
     rollout = plan['assistant_rollout']
-    must(prior.get('schema') == journal.get('schema') == SCHEMA and
-         prior['operational']['policy']['after_sha256'] == plan['operational']['policy']['before_sha256'] and
-         prior['assistant_rollout']['web_commit'] == rollout['web_commit'] and
-         all(prior['assistant_rollout']['community'][name] == rollout['community'][name]
-             for name in ('code_controller_sha256', 'code_plan_sha256')),
-         'illustration_successor_controller_parent')
     verify_successor_web_preimage(plan['frontend'], evidence['web'])
     for name in ('core', 'ai'):
         active = rt.read(paths[name + '_active_sha256'], rollout[name + '_active_sha256'])

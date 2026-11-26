@@ -344,29 +344,33 @@ def prepare_successor(rt, request_sha256):
         assistant_backup.require_terminal(rt)
         old_sha = rt.identity(guard.STORE/'POLICY.json')['sha256']
         old = rt.read(guard.STORE/'POLICY.json', old_sha)
-        guard.must(old['upgrade']['core_followup']['schema'] == guard.ASSISTANT_ILLUSTRATION_CORE_SCHEMA,
-                   'illustration_successor_predecessor')
+        guard.must(guard.is_assistant_rollout(old), 'illustration_successor_predecessor')
+        repeated = guard.is_assistant_rollout_successor(old)
         guard.policy()
         parent, prior_folder, phase = guard.load_assistant_rollout_approval(old)
-        guard.must(phase == 'INSTALLED', 'illustration_successor_predecessor')
+        guard.must(phase == 'INSTALLED' and 'ai_snapshot_core' not in parent.get('successor', {}),
+                   'illustration_successor_predecessor')
         critic = guard.verify_assistant_rollout_ai(old)
         current = rt.current()
         rt.verify_current(current)
         rt.require_no_active_work()
         bundle, files, vmm, community = successor_archives(rt, request, parent)
         candidate = core_candidate(rt, request['core'], old)
-        guard.must(request['web']['commit_sha'] != parent['assistant_rollout']['web_commit'],
-                   'illustration_successor_requires_new_web')
+        parent_web = parent['successor']['web'] if repeated else parent['assistant_rollout']
+        web_commit = parent_web['commit_sha' if repeated else 'web_commit']
+        guard.must(request['web']['commit_sha'] != web_commit, 'illustration_successor_requires_new_web')
         pointers = controller._pointer_paths()
         evidence = successor_commit_evidence(rt, pointers)
         evidence.update(candidate=candidate, web=request['web'])
+        if repeated:
+            evidence['ai_snapshot_core'] = parent['current_release']
         controller.validate_successor(evidence)
         frontend = guard.frontend_digests()
         controller.verify_successor_web_preimage(frontend, evidence['web'])
         rollout = {
             **{name: rt.identity(path)['sha256'] for name, path in pointers.items()},
             'core_candidate_manifest_sha256': request['core']['manifest_sha256'],
-            'web_commit': parent['assistant_rollout']['web_commit'],
+            'web_commit': web_commit,
             'ai_candidate': parent['assistant_rollout']['ai_candidate'],
             'community': {**parent['assistant_rollout']['community'], 'deploy': request['community'],
                           'cli_sha256': sha(community['community_host_cli.py'])},
@@ -382,14 +386,22 @@ def prepare_successor(rt, request_sha256):
                 'private_owner': old['installation']['private_owner'],
                 'files': {}, 'operational': {}, 'review_evidence_sha256': sha(review),
                 'assistant_rollout': rollout, 'successor': evidence}
+        if repeated:
+            # Check the already-installed parent and the live Web pair before rendering any new control.
+            plan['operational']['policy'] = {'before_sha256': old_sha}
+            guard.load_assistant_rollout_successor_parent(plan, read=rt.read)
         targets = controller.targets(plan)
         renderer = guard.source_module(bundle/'control_overlay.py', 'illustration_successor_renderer',
                                        files['control_overlay.py'])
         material = {name: (vmm if name == 'vmm_controller.py' else files)[name] for name in controller.files(plan)}
         material.update(guard=files['core_release_guard.py'], **{'ai-guard': files['ai_release_guard.py']})
         path, owner, mode = targets['lifecycle']
-        material['lifecycle'] = renderer.render_assistant_rollout_successor_lifecycle(
-            guard.read_file(path, owner=owner, mode=mode))
+        live_lifecycle = guard.read_file(path, owner=owner, mode=mode)
+        if repeated:
+            guard.must(sha(live_lifecycle) == parent['operational']['lifecycle']['after_sha256'],
+                       'illustration_successor_lifecycle_parent')
+        material['lifecycle'] = (live_lifecycle if repeated else
+                                 renderer.render_assistant_rollout_successor_lifecycle(live_lifecycle))
         for name, (path, owner, mode) in targets.items():
             before = rt.identity(path, expected_owner=owner, expected_mode=mode)['sha256']
             source = 'files' if name in controller.files(plan) else 'operational'
