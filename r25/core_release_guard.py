@@ -206,7 +206,8 @@ def is_assistant_rollout_successor(value):
 
 
 def render_assistant_rollout_successor_policy(old, plan):
-    must(is_assistant_rollout(old) and not is_assistant_rollout_successor(old),
+    must(is_assistant_rollout(old) and
+         is_assistant_rollout_successor(old) == ('ai_snapshot_core' in plan['successor']),
          'illustration_successor_predecessor')
     value = deepcopy(old)
     upgrade = value['upgrade']
@@ -516,6 +517,42 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
     return approval, folder, phase
 
 
+def load_assistant_rollout_successor_parent(approval, *, read=None):
+    """Bind the first successor or one reviewed follow-up to its installed predecessor."""
+    if read is None:
+        read = private_record
+    installed = approval['installed_control']
+    ident = digest_value(installed['approval_sha256'])
+    folder = STORE / 'controller-upgrades' / ident
+    parent = read(folder / 'approval.json', ident)
+    receipt = read(folder / 'journal.json', digest_value(installed['journal_sha256']))
+    proof = approval['successor']
+    repeated = 'ai_snapshot_core' in proof
+    expected = ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL if repeated else ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA
+    rollout = approval['assistant_rollout']
+    original = parent['assistant_rollout']
+    must(parent.get('schema') == receipt.get('schema') == expected and
+         receipt.get('approval_sha256') == ident and receipt.get('phase') == 'INSTALLED' and
+         parent['operational']['policy']['after_sha256'] == approval['operational']['policy']['before_sha256'] and
+         all(rollout['community'][key] == original['community'][key]
+             for key in ('code_controller_sha256', 'code_plan_sha256')),
+         'illustration_successor_controller_parent')
+    if repeated:
+        prior_proof = parent['successor']
+        must('ai_snapshot_core' not in prior_proof, 'illustration_successor_controller_parent')
+        must(proof['ai_snapshot_core'] == parent['current_release'] and
+             approval['current_ai_release'] == parent['current_ai_release'] and
+             all(proof[key] == prior_proof[key] for key in ('ai_journal_sha256', 'ai_snapshot_sha256')) and
+             all(rollout[key] == original[key] for key in ('ai_candidate', 'ai_active_sha256', 'ai_current_sha256')),
+             'illustration_successor_ai_parent')
+        web = prior_proof['web']
+        must(approval['frontend'] == {key: web[key] for key in ('selection_sha256', 'reference_sha256')} and
+             rollout['web_commit'] == web['commit_sha'], 'illustration_successor_web_parent')
+    else:
+        must(rollout['web_commit'] == original['web_commit'], 'illustration_successor_web_parent')
+    return parent, folder
+
+
 def verify_assistant_rollout_core(value, approval, folder, *, preserve_only=False):
     module = assistant_rollout_binding_module(approval)
     value = private_record(STORE / 'POLICY.json', approval['operational']['policy']['after_sha256'])
@@ -798,11 +835,15 @@ def verify_assistant_rollout_successor_ai(value, approval, folder, *, for_start)
     path = store / 'transactions' / tx
     journal = private_record(path / 'journal.json', proof['ai_journal_sha256'])
     snapshot = private_record(path / 'snapshot.json', proof['ai_snapshot_sha256'])
+    snapshot_core = approval['current_release']
+    if 'ai_snapshot_core' in proof:
+        parent, _ = load_assistant_rollout_successor_parent(approval)
+        snapshot_core = parent['current_release']
     must(journal.get('schema') == 'R25_AI_TRANSACTION_V1' and journal.get('phase') == 'COMMITTED' and
          snapshot.get('schema') == 'R25_AI_SNAPSHOT_V1' and journal.get('candidate') == snapshot.get('candidate') == ref and
          journal.get('transaction_id') == snapshot.get('transaction_id') == tx and
          journal.get('snapshot_sha256') == proof['ai_snapshot_sha256'] and
-         snapshot.get('core') == approval['current_release'],
+         snapshot.get('core') == snapshot_core,
          'illustration_successor_ai_provenance')
     followup = value['upgrade']['core_followup']
     policy_sha = followup['ai_policy_sha256']

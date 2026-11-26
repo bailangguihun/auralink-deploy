@@ -46,6 +46,30 @@ class SuccessorPolicyTests(unittest.TestCase):
         self.assertEqual(value['controllers']['lifecycle_adapter.py'], before['controllers']['lifecycle_adapter.py'])
         self.assertEqual(value['controllers']['core_release_guard.py'], 'f' * 64)
 
+    def test_derives_a_second_reviewed_successor_from_the_active_published_core(self):
+        installed = guard.render_assistant_rollout_successor_policy(self.old, self.plan)
+        prior = deepcopy(installed)
+        plan = deepcopy(self.plan)
+        plan['current_release'] = {
+            'commit_sha': self.candidate['commit_sha'],
+            'artifact_sha256': self.candidate['artifact_sha256'],
+            'accepted_record_sha256': '7' * 64,
+        }
+        proof = plan['successor']
+        proof['ai_snapshot_core'] = deepcopy(self.plan['current_release'])
+        proof['candidate'].update(commit_sha='6'*40, artifact_sha256='6'*64, payload_fingerprint='5'*64)
+        proof['web']['commit_sha'] = '4'*40
+        plan['operational']['policy']['before_sha256'] = '8' * 64
+
+        value = guard.render_assistant_rollout_successor_policy(installed, plan)
+
+        self.assertEqual(installed, prior)
+        self.assertEqual(value['upgrade']['baseline_release'], plan['current_release'])
+        self.assertEqual(value['upgrade']['candidate'], proof['candidate'])
+        self.assertEqual(value['upgrade']['assistant']['compatible_recovery_jar_sha256'], self.candidate['artifact_sha256'])
+        self.assertEqual(value['upgrade']['core_followup']['predecessor_policy_sha256'], '8'*64)
+        self.assertEqual(value['upgrade']['assistant']['artifacts']['ai'], prior['upgrade']['assistant']['artifacts']['ai'])
+
     def test_rejects_wrong_predecessor_or_repackaging(self):
         value = guard.render_assistant_rollout_successor_policy(self.old, self.plan)
         with self.assertRaisesRegex(guard.Refused, 'successor_predecessor'):
@@ -53,6 +77,106 @@ class SuccessorPolicyTests(unittest.TestCase):
         self.candidate['payload_fingerprint'] = 'b' * 64
         with self.assertRaisesRegex(guard.Refused, 'successor_candidate'):
             guard.render_assistant_rollout_successor_policy(self.old, self.plan)
+
+
+class SuccessorParentTests(unittest.TestCase):
+    def setUp(self):
+        self.original_core = {'commit_sha': '1'*40, 'artifact_sha256': '2'*64, 'accepted_record_sha256': '3'*64}
+        self.ai = {'commit_sha': '4'*40, 'source_tree_sha256': '5'*64, 'record_sha256': '6'*64}
+        self.prior_id = 'a'*64
+        self.journal_id = 'b'*64
+        self.old_web = {'commit_sha': 'c'*40, 'selection_sha256': 'd'*64, 'reference_sha256': 'e'*64}
+        self.rollout = {
+            'ai_candidate': {'commit_sha': '4'*40},
+            'ai_current_sha256': 'f'*64,
+            'ai_active_sha256': '7'*64,
+            'community': {'code_controller_sha256': '8'*64, 'code_plan_sha256': '9'*64},
+        }
+        self.parent = {
+            'schema': guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL,
+            'current_release': self.original_core,
+            'current_ai_release': self.ai,
+            'operational': {'policy': {'after_sha256': '3'*64}},
+            'successor': {'web': self.old_web, 'ai_journal_sha256': '4'*64, 'ai_snapshot_sha256': '5'*64},
+            'assistant_rollout': {**self.rollout, 'web_commit': '6'*40},
+        }
+        self.plan = {
+            'current_release': {'commit_sha': '9'*40, 'artifact_sha256': 'a'*64, 'accepted_record_sha256': 'b'*64},
+            'installed_control': {'approval_sha256': self.prior_id, 'journal_sha256': self.journal_id},
+            'operational': {'policy': {'before_sha256': '3'*64}},
+            'current_ai_release': self.ai,
+            'frontend': {key: self.old_web[key] for key in ('selection_sha256', 'reference_sha256')},
+            'assistant_rollout': {**self.rollout, 'web_commit': self.old_web['commit_sha']},
+            'successor': {'ai_snapshot_core': deepcopy(self.original_core),
+                          'ai_journal_sha256': '4'*64, 'ai_snapshot_sha256': '5'*64},
+        }
+        self.receipt = {'schema': self.parent['schema'], 'approval_sha256': self.prior_id, 'phase': 'INSTALLED'}
+
+    def read(self, file, expected):
+        if file.name == 'approval.json':
+            self.assertEqual(expected, self.prior_id)
+            return self.parent
+        self.assertEqual(expected, self.journal_id)
+        self.assertEqual(file.name, 'journal.json')
+        return self.receipt
+
+    def test_second_successor_preserves_published_web_rollback_and_original_ai_binding(self):
+        parent, folder = guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)
+        self.assertEqual(parent, self.parent)
+        self.assertEqual(folder.name, self.prior_id)
+        self.assertEqual(self.plan['successor']['ai_snapshot_core'], parent['current_release'])
+
+    def test_live_ai_verifier_keeps_the_snapshot_bound_to_the_original_core(self):
+        tx = '1' * 32
+        documents = {
+            'CURRENT.json': {'schema': 'R25_AI_CURRENT_V1', 'release': self.ai},
+            'ACTIVE.json': {'schema': 'R25_AI_ACTIVE_V1', 'transaction_id': tx},
+            'journal.json': {'schema': 'R25_AI_TRANSACTION_V1', 'phase': 'COMMITTED',
+                             'candidate': self.ai, 'transaction_id': tx, 'snapshot_sha256': '5'*64},
+            'snapshot.json': {'schema': 'R25_AI_SNAPSHOT_V1', 'candidate': self.ai,
+                              'transaction_id': tx, 'core': self.original_core},
+            'POLICY.json': {'source_owner': [0, 0]},
+            'record.json': {},
+        }
+        policy = {'upgrade': {'core_followup': {'ai_policy_sha256': 'a'*64, 'ai_configuration_sha256': 'b'*64}},
+                  'installation': {'private_owner': [0, 0]}}
+        parent_folder = guard.STORE/'controller-upgrades'/self.prior_id
+        with patch.object(guard, 'private_record', side_effect=lambda path, expected: documents[path.name]), \
+             patch.object(guard, 'load_assistant_rollout_successor_parent', return_value=(self.parent, parent_folder)), \
+             patch.object(guard, 'handoff_values', return_value={'R25_AI_RELEASE_POLICY_SHA256': 'a'*64}), \
+             patch.object(guard, 'read_file'), patch.object(guard, '_rollout_ai_inventory', return_value={}), \
+             patch.object(guard, '_verify_rollout_live_ai'), \
+             patch.object(guard, 'verify_assistant_rollout_core', return_value=self.plan['current_release']), \
+             patch.object(guard, 'verify_assistant_rollout_successor_web') as web:
+            self.assertEqual(guard.verify_assistant_rollout_successor_ai(policy, self.plan, parent_folder, for_start=True),
+                             self.ai)
+            web.assert_called_once_with(policy, self.plan, None)
+            documents['snapshot.json']['core'] = self.plan['current_release']
+            with self.assertRaisesRegex(guard.Refused, 'illustration_successor_ai_provenance'):
+                guard.verify_assistant_rollout_successor_ai(policy, self.plan, parent_folder, for_start=True)
+
+    def test_refuses_rebound_ai_snapshot_or_web_rollback(self):
+        for field, bad in (
+            ('ai_snapshot_core', {**self.original_core, 'commit_sha': '9'*40}),
+            ('ai_snapshot_sha256', '9'*64),
+        ):
+            changed = deepcopy(self.plan)
+            changed['successor'][field] = bad
+            with self.assertRaisesRegex(guard.Refused, 'illustration_successor_ai_parent'):
+                guard.load_assistant_rollout_successor_parent(changed, read=self.read)
+        changed = deepcopy(self.plan)
+        changed['assistant_rollout']['web_commit'] = self.parent['assistant_rollout']['web_commit']
+        with self.assertRaisesRegex(guard.Refused, 'illustration_successor_web_parent'):
+            guard.load_assistant_rollout_successor_parent(changed, read=self.read)
+
+    def test_refuses_missing_terminal_receipt_and_unreviewed_third_generation(self):
+        self.receipt['phase'] = 'VERIFY_INTENT'
+        with self.assertRaisesRegex(guard.Refused, 'illustration_successor_controller_parent'):
+            guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)
+        self.receipt['phase'] = 'INSTALLED'
+        self.parent['successor']['ai_snapshot_core'] = self.original_core
+        with self.assertRaisesRegex(guard.Refused, 'illustration_successor_controller_parent'):
+            guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)
 
 
 class SuccessorWebTests(unittest.TestCase):
