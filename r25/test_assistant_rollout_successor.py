@@ -85,6 +85,7 @@ class SuccessorParentTests(unittest.TestCase):
         self.ai = {'commit_sha': '4'*40, 'source_tree_sha256': '5'*64, 'record_sha256': '6'*64}
         self.prior_id = 'a'*64
         self.journal_id = 'b'*64
+        self.original_id, self.original_receipt = '1'*64, '2'*64
         self.old_web = {'commit_sha': 'c'*40, 'selection_sha256': 'd'*64, 'reference_sha256': 'e'*64}
         self.rollout = {
             'ai_candidate': {'commit_sha': '4'*40},
@@ -96,7 +97,8 @@ class SuccessorParentTests(unittest.TestCase):
             'schema': guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL,
             'current_release': self.original_core,
             'current_ai_release': self.ai,
-            'operational': {'policy': {'after_sha256': '3'*64}},
+            'operational': {'policy': {'before_sha256': '2'*64, 'after_sha256': '3'*64}},
+            'installed_control': {'approval_sha256': self.original_id, 'journal_sha256': self.original_receipt},
             'successor': {'web': self.old_web, 'ai_journal_sha256': '4'*64, 'ai_snapshot_sha256': '5'*64},
             'assistant_rollout': {**self.rollout, 'web_commit': '6'*40},
         }
@@ -113,6 +115,15 @@ class SuccessorParentTests(unittest.TestCase):
         self.receipt = {'schema': self.parent['schema'], 'approval_sha256': self.prior_id, 'phase': 'INSTALLED'}
 
     def read(self, file, expected):
+        if expected == self.original_id:
+            return {
+                'schema': guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA,
+                'operational': {'policy': {'after_sha256': '2'*64}},
+                'assistant_rollout': {**self.rollout, 'web_commit': self.parent['assistant_rollout']['web_commit']},
+            }
+        if expected == self.original_receipt:
+            return {'schema': guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA, 'phase': 'INSTALLED',
+                    'approval_sha256': self.original_id}
         if file.name == 'approval.json':
             self.assertEqual(expected, self.prior_id)
             return self.parent
@@ -169,7 +180,59 @@ class SuccessorParentTests(unittest.TestCase):
         with self.assertRaisesRegex(guard.Refused, 'illustration_successor_web_parent'):
             guard.load_assistant_rollout_successor_parent(changed, read=self.read)
 
-    def test_refuses_missing_terminal_receipt_and_unreviewed_third_generation(self):
+    def test_third_successor_keeps_the_original_ai_anchor_and_checks_historical_receipts(self):
+        first, second, third = (deepcopy(item) for item in (self.parent, self.plan, self.plan))
+        original_id, original_receipt = '1'*64, '2'*64
+        second_id, second_receipt = '6'*64, '7'*64
+        first['installed_control'] = {'approval_sha256': original_id, 'journal_sha256': original_receipt}
+        first['operational']['policy']['before_sha256'] = '2'*64
+        original = {
+            'schema': guard.ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA,
+            'operational': {'policy': {'after_sha256': '2'*64}},
+            'assistant_rollout': {**self.rollout, 'web_commit': first['assistant_rollout']['web_commit']},
+        }
+        second['schema'] = first['schema']
+        second['operational']['policy']['after_sha256'] = '8'*64
+        web = {'commit_sha': '8'*40, 'selection_sha256': '7'*64, 'reference_sha256': '6'*64}
+        second['successor']['web'] = web
+        third['installed_control'] = {'approval_sha256': second_id, 'journal_sha256': second_receipt}
+        third['operational']['policy']['before_sha256'] = '8'*64
+        third['frontend'] = {key: web[key] for key in ('selection_sha256', 'reference_sha256')}
+        third['assistant_rollout']['web_commit'] = web['commit_sha']
+        records = {
+            original_id: original,
+            original_receipt: {'schema': original['schema'], 'phase': 'INSTALLED', 'approval_sha256': original_id},
+            self.prior_id: first,
+            self.journal_id: self.receipt,
+            second_id: second,
+            second_receipt: {'schema': second['schema'], 'phase': 'INSTALLED', 'approval_sha256': second_id},
+        }
+
+        def read(_path, expected):
+            return records[expected]
+
+        parent, folder = guard.load_assistant_rollout_successor_parent(third, read=read)
+        self.assertEqual(parent, second)
+        self.assertEqual(folder.name, second_id)
+        self.assertEqual(
+            [(doc, path.name) for doc, path in guard.load_assistant_rollout_ancestry(third, read=read)],
+            [(second, second_id), (first, self.prior_id), (original, original_id)],
+        )
+        for record in (original_receipt, self.journal_id, second_receipt):
+            with self.subTest(record=record):
+                saved = records[record]
+                records[record] = dict(saved, phase='RESTORED')
+                try:
+                    with self.assertRaisesRegex(guard.Refused, 'illustration_successor_controller_parent'):
+                        guard.load_assistant_rollout_successor_parent(third, read=read)
+                finally:
+                    records[record] = saved
+        second['successor']['ai_snapshot_core'] = second['current_release']
+        third['successor']['ai_snapshot_core'] = second['current_release']
+        with self.assertRaisesRegex(guard.Refused, 'illustration_successor_ai_parent'):
+            guard.load_assistant_rollout_successor_parent(third, read=read)
+
+    def test_refuses_missing_terminal_receipt_and_invalid_predecessor(self):
         self.receipt['phase'] = 'VERIFY_INTENT'
         with self.assertRaisesRegex(guard.Refused, 'illustration_successor_controller_parent'):
             guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)

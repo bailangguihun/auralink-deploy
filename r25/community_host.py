@@ -1526,19 +1526,20 @@ def assistant_community_approval(rollout_sha, code_sha, manifest_sha, *, preserv
          community['deploy']['manifest_sha256']==manifest_sha,'community_assistant_controller_binding')
     sha256_value(community['code_plan_sha256'])
     if rollout['schema'] == ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA:
-        schemas = (ASSISTANT_ROLLOUT_SCHEMA,)
-        if 'ai_snapshot_core' in rollout.get('successor', {}):
-            schemas = (ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA, *schemas)
+        seen = {rollout_sha}
         child = rollout
-        for schema in schemas:
+        while child['schema'] == ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA:
+            schema = (ASSISTANT_ROLLOUT_SUCCESSOR_SCHEMA if 'ai_snapshot_core' in child['successor']
+                      else ASSISTANT_ROLLOUT_SCHEMA)
             previous = child['installed_control']
             prior_id = sha256_value(previous['approval_sha256'])
+            must(prior_id not in seen, 'community_assistant_successor_parent')
+            seen.add(prior_id)
             prior = base/'controller-upgrades'/prior_id
             parent = storage.read_private_record(prior/'approval.json',expected_sha256=prior_id)
             installed = storage.read_private_record(prior/'journal.json',expected_sha256=previous['journal_sha256'])
             must(parent['schema']==installed['schema']==schema and
                  installed['approval_sha256']==prior_id and installed['phase']=='INSTALLED' and
-                 'ai_snapshot_core' not in parent.get('successor', {}) and
                  all(parent['operational'][key]['after_sha256']==child['operational'][key]['before_sha256']
                      for key in ('guard','policy')) and
                  all(parent['assistant_rollout']['community'][key]==community[key]

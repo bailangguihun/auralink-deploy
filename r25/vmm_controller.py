@@ -3446,13 +3446,11 @@ def applied_assistant_rollout(rt,value,handoff,controller):
         def read_parent(path, expected):
             return json_read(path, rt.private, expected)
 
-        parent, parent_folder = guard.load_assistant_rollout_successor_parent(approval, read=read_parent)
-        if 'ai_snapshot_core' in approval['successor']:
-            # The historical Community proof still predates the first rollout.
-            original, original_folder = guard.load_assistant_rollout_successor_parent(parent, read=read_parent)
-            history = assistant_rollout_successor_history(rt, parent, parent_folder, original, original_folder)
-        else:
-            history = assistant_rollout_successor_history(rt, approval, folder, parent, parent_folder)
+        ancestry = [(approval, folder), *guard.load_assistant_rollout_ancestry(approval, read=read_parent)]
+        # The Community proof predates the initial rollout. The Core publisher
+        # preimage was archived by its first successor.
+        (first_successor, first_folder), (original, original_folder) = ancestry[-2:]
+        history = assistant_rollout_successor_history(rt, first_successor, first_folder, original, original_folder)
     else:
         history = assistant_rollout_history(rt, approval, folder)
     verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,
