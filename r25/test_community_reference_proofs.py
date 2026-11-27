@@ -160,9 +160,12 @@ class ReferenceProofs(unittest.TestCase):
         previous, _, previous_link = write_approval(
             successor_schema, '2' * 64, '4' * 64, '3' * 64, '5' * 64, 'INSTALLED',
             installed_control=original_link, successor={})
-        followup, _, _ = write_approval(
-            successor_schema, '4' * 64, '6' * 64, '5' * 64, '7' * 64, 'VERIFY_INTENT',
+        second, _, second_link = write_approval(
+            successor_schema, '4' * 64, '6' * 64, '5' * 64, '7' * 64, 'INSTALLED',
             installed_control=previous_link, successor={'ai_snapshot_core': {}})
+        followup, _, _ = write_approval(
+            successor_schema, '6' * 64, '8' * 64, '7' * 64, '9' * 64, 'VERIFY_INTENT',
+            installed_control=second_link, successor={'ai_snapshot_core': {}})
         f.put(f.base/'CONTROL_UPGRADE_ACTIVE.json',
               {'schema': 'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1', 'approval_sha256': followup})
 
@@ -179,7 +182,7 @@ class ReferenceProofs(unittest.TestCase):
                 f.host, f.reference_id, bound['illustration_predecessor_sha256'],
                 bound['illustration_predecessor'], {'core_runtime': runtime})
             self.assertEqual(context, f.expected)
-            for ident in (previous, original):
+            for ident in (second, previous, original):
                 journal = store/ident/'journal.json'
                 raw = journal.read_bytes()
                 with self.subTest(parent=ident):

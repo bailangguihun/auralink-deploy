@@ -517,40 +517,54 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
     return approval, folder, phase
 
 
-def load_assistant_rollout_successor_parent(approval, *, read=None):
-    """Bind the first successor or one reviewed follow-up to its installed predecessor."""
+def load_assistant_rollout_ancestry(approval, *, read=None):
+    """Return the validated predecessors, from immediate rollback to initial rollout."""
     if read is None:
         read = private_record
-    installed = approval['installed_control']
-    ident = digest_value(installed['approval_sha256'])
-    folder = STORE / 'controller-upgrades' / ident
-    parent = read(folder / 'approval.json', ident)
-    receipt = read(folder / 'journal.json', digest_value(installed['journal_sha256']))
-    proof = approval['successor']
-    repeated = 'ai_snapshot_core' in proof
-    expected = ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL if repeated else ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA
-    rollout = approval['assistant_rollout']
-    original = parent['assistant_rollout']
-    must(parent.get('schema') == receipt.get('schema') == expected and
-         receipt.get('approval_sha256') == ident and receipt.get('phase') == 'INSTALLED' and
-         parent['operational']['policy']['after_sha256'] == approval['operational']['policy']['before_sha256'] and
-         all(rollout['community'][key] == original['community'][key]
-             for key in ('code_controller_sha256', 'code_plan_sha256')),
-         'illustration_successor_controller_parent')
-    if repeated:
+    ancestry = []
+    seen = set()
+    child = approval
+    while True:
+        installed = child.get('installed_control')
+        must(isinstance(installed, dict), 'illustration_successor_controller_parent')
+        ident = digest_value(installed['approval_sha256'])
+        must(ident not in seen, 'illustration_successor_controller_parent')
+        seen.add(ident)
+        folder = STORE / 'controller-upgrades' / ident
+        parent = read(folder / 'approval.json', ident)
+        receipt = read(folder / 'journal.json', digest_value(installed['journal_sha256']))
+        proof = child['successor']
+        repeated = 'ai_snapshot_core' in proof
+        expected = ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL if repeated else ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA
+        rollout = child['assistant_rollout']
+        original = parent['assistant_rollout']
+        must(parent.get('schema') == receipt.get('schema') == expected and
+             receipt.get('approval_sha256') == ident and receipt.get('phase') == 'INSTALLED' and
+             parent['operational']['policy']['after_sha256'] == child['operational']['policy']['before_sha256'] and
+             all(rollout['community'][key] == original['community'][key]
+                 for key in ('code_controller_sha256', 'code_plan_sha256')),
+             'illustration_successor_controller_parent')
+        ancestry.append((parent, folder))
+        if not repeated:
+            must(rollout['web_commit'] == original['web_commit'], 'illustration_successor_web_parent')
+            return ancestry
+
         prior_proof = parent['successor']
-        must('ai_snapshot_core' not in prior_proof, 'illustration_successor_controller_parent')
-        must(proof['ai_snapshot_core'] == parent['current_release'] and
-             approval['current_ai_release'] == parent['current_ai_release'] and
+        anchor = prior_proof.get('ai_snapshot_core', parent['current_release'])
+        must(proof['ai_snapshot_core'] == anchor and
+             child['current_ai_release'] == parent['current_ai_release'] and
              all(proof[key] == prior_proof[key] for key in ('ai_journal_sha256', 'ai_snapshot_sha256')) and
              all(rollout[key] == original[key] for key in ('ai_candidate', 'ai_active_sha256', 'ai_current_sha256')),
              'illustration_successor_ai_parent')
         web = prior_proof['web']
-        must(approval['frontend'] == {key: web[key] for key in ('selection_sha256', 'reference_sha256')} and
+        must(child['frontend'] == {key: web[key] for key in ('selection_sha256', 'reference_sha256')} and
              rollout['web_commit'] == web['commit_sha'], 'illustration_successor_web_parent')
-    else:
-        must(rollout['web_commit'] == original['web_commit'], 'illustration_successor_web_parent')
-    return parent, folder
+        child = parent
+
+
+
+def load_assistant_rollout_successor_parent(approval, *, read=None):
+    return load_assistant_rollout_ancestry(approval, read=read)[0]
 
 
 def verify_assistant_rollout_core(value, approval, folder, *, preserve_only=False):
@@ -837,8 +851,8 @@ def verify_assistant_rollout_successor_ai(value, approval, folder, *, for_start)
     snapshot = private_record(path / 'snapshot.json', proof['ai_snapshot_sha256'])
     snapshot_core = approval['current_release']
     if 'ai_snapshot_core' in proof:
-        parent, _ = load_assistant_rollout_successor_parent(approval)
-        snapshot_core = parent['current_release']
+        load_assistant_rollout_successor_parent(approval)
+        snapshot_core = proof['ai_snapshot_core']
     must(journal.get('schema') == 'R25_AI_TRANSACTION_V1' and journal.get('phase') == 'COMMITTED' and
          snapshot.get('schema') == 'R25_AI_SNAPSHOT_V1' and journal.get('candidate') == snapshot.get('candidate') == ref and
          journal.get('transaction_id') == snapshot.get('transaction_id') == tx and

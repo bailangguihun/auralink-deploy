@@ -348,8 +348,7 @@ def prepare_successor(rt, request_sha256):
         repeated = guard.is_assistant_rollout_successor(old)
         guard.policy()
         parent, prior_folder, phase = guard.load_assistant_rollout_approval(old)
-        guard.must(phase == 'INSTALLED' and 'ai_snapshot_core' not in parent.get('successor', {}),
-                   'illustration_successor_predecessor')
+        guard.must(phase == 'INSTALLED', 'illustration_successor_predecessor')
         critic = guard.verify_assistant_rollout_ai(old)
         current = rt.current()
         rt.verify_current(current)
@@ -363,7 +362,7 @@ def prepare_successor(rt, request_sha256):
         evidence = successor_commit_evidence(rt, pointers)
         evidence.update(candidate=candidate, web=request['web'])
         if repeated:
-            evidence['ai_snapshot_core'] = parent['current_release']
+            evidence['ai_snapshot_core'] = parent['successor'].get('ai_snapshot_core', parent['current_release'])
         controller.validate_successor(evidence)
         frontend = guard.frontend_digests()
         controller.verify_successor_web_preimage(frontend, evidence['web'])
