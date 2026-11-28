@@ -118,6 +118,48 @@ def render_serializer(serializer, artifact, staged_inner):
                 "str(e) if isinstance(e,RuntimeError) or type(e).__name__ == 'ArtifactRefused' else type(e).__name__")
 
 
+def render_independent_serializer(serializer):
+    serializer = edit(serializer, 'import tarfile\n', 'import tarfile\nimport re as _re\n')
+    serializer = edit(serializer, "        artifact_mode = action == 'deploy-artifact'", """        independent = action in {'prepare-independent-artifact', 'deploy-independent-artifact'}
+        if independent:
+            action = action.replace('-independent', '')
+        artifact_mode = action == 'deploy-artifact'""")
+    serializer = edit(serializer, "            if action == 'prepare-artifact':", '''            if independent and not artifact_mode:
+                independent_guard()
+            if action == 'prepare-artifact':''')
+    serializer = edit(serializer, "                print('DEPLOY_WEB=INCOMING_READY')", '''                print('DEPLOY_WEB=INDEPENDENT_INCOMING_READY' if independent else 'DEPLOY_WEB=INCOMING_READY')''')
+    serializer = edit(serializer, "                package.materialize(ROOT,", '''                if independent:
+                    core = independent_guard()
+                    try:
+                        core.require_independent_web_publication(fd)
+                    except core.Refused as error:
+                        raise RuntimeError(str(error)) from None
+                package.materialize(ROOT,''')
+    serializer = edit(serializer, 'def main(', '''def independent_guard():
+    check(HANDOFF, 0o600)
+    values = settings(HANDOFF)
+    path = R25 / 'operations/core_release_guard.py'
+    digest = values.get('R25_CORE_RELEASE_GUARD_SHA256', '')
+    require(values.get('R25_CORE_RELEASE_GUARD') == str(path) and _re.fullmatch('[0-9a-f]{64}', digest),
+            'independent_web_guard_binding')
+    require(not any(item.is_symlink() for item in (path, *path.parents)), 'independent_web_guard_path')
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700 and
+            (info.st_uid, info.st_gid, info.st_nlink) == (1000, 1000, 1), 'independent_web_guard_identity')
+    raw = path.read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == digest, 'independent_web_guard_digest')
+    core = types.ModuleType('verified_independent_web_guard')
+    core.__file__ = str(path)
+    exec(compile(raw, str(path), 'exec', dont_inherit=True), core.__dict__)
+    require(callable(getattr(core, 'require_independent_web_publication', None)),
+            'independent_web_controller_upgrade_required')
+    return core
+
+
+def main(''')
+    return serializer
+
+
 def render(source, artifact):
     if any(digest(source[name]) != sha for name, sha in BASELINES.items()):
         raise ValueError("unreviewed_web_publisher_baseline")
@@ -132,13 +174,28 @@ def render(source, artifact):
     }
 
 
+def render_independent_upgrade(source, artifact):
+    files = render(source, artifact)
+    previous = {name: digest(contents) for name, (contents, _) in files.items()}
+    serializer = render_independent_serializer(files[SERIALIZER][0])
+    entry = edit(files[ENTRY][0], previous[SERIALIZER], digest(serializer))
+    ast.parse(serializer)
+    files.update({ENTRY: (entry, 0o700), SERIALIZER: (serializer, 0o700)})
+    return files, previous
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--independent-upgrade", action="store_true")
     args = parser.parse_args()
     source = {name: read_input(args.source_directory / name) for name in BASELINES}
-    output = render(source, Path(__file__).with_name(ARTIFACT).read_bytes())
+    artifact = Path(__file__).with_name(ARTIFACT).read_bytes()
+    if args.independent_upgrade:
+        output, previous = render_independent_upgrade(source, artifact)
+    else:
+        output, previous = render(source, artifact), BASELINES
     args.output_directory.mkdir(mode=0o700)
     files = []
     for name, (contents, mode) in output.items():
@@ -146,7 +203,7 @@ def main():
         with path.open("xb") as stream:
             os.fchmod(stream.fileno(), mode)
             stream.write(contents)
-        files.append({"file": name, "previous_sha256": BASELINES.get(name),
+        files.append({"file": name, "previous_sha256": previous.get(name),
                       "sha256": digest(contents), "mode": f"{mode:04o}"})
     manifest = {"status": "RENDERED_NOT_INSTALLED", "files": files, "preserved_inner_sha256": BASELINES[INNER]}
     with (args.output_directory / "candidate.json").open("x", encoding="utf-8") as stream:

@@ -1,4 +1,7 @@
 from copy import deepcopy
+from hashlib import sha256
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -242,39 +245,172 @@ class SuccessorParentTests(unittest.TestCase):
             guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)
 
 
+class RolloutControllerRefreshTests(unittest.TestCase):
+    def setUp(self):
+        self.original = {'schema': guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL, 'successor': {'candidate': 'bound'},
+                         'files': {'core_release_guard.py': {'before_sha256': '1'*64, 'after_sha256': '2'*64},
+                                   'vmm_controller.py': {'before_sha256': '3'*64, 'after_sha256': '4'*64}},
+                         'operational': {'guard': {'before_sha256': '1'*64, 'after_sha256': '2'*64},
+                                         'handoff': {'before_sha256': '5'*64, 'after_sha256': '6'*64},
+                                         'policy': {'before_sha256': '7'*64, 'after_sha256': '8'*64}}}
+        self.revision = {'schema': 'R25_ILLUSTRATION_CONTROLLER_REFRESH_V1', 'approval_sha256': '9'*64,
+                         'journal_sha256': 'a'*64, 'review_sha256': 'b'*64, 'context_sha256': 'c'*64}
+        self.after = {'guard': 'f'*64, 'vmm_controller.py': 'e'*64, 'handoff': 'd'*64}
+
+    def test_control_refresh_keeps_the_existing_application_binding(self):
+        refreshed = guard.render_rollout_controller_refresh(self.original, self.revision, self.after)
+        self.assertEqual(refreshed['successor'], self.original['successor'])
+        self.assertEqual(refreshed['operational']['policy'], self.original['operational']['policy'])
+        self.assertEqual(refreshed['operational']['guard']['after_sha256'], self.after['guard'])
+        self.assertEqual(refreshed['files']['core_release_guard.py']['after_sha256'], self.after['guard'])
+        self.assertEqual(self.original['operational']['guard']['after_sha256'], '2'*64)
+
+    def test_revision_cannot_rewrite_the_application_policy_or_reuse_a_refresh(self):
+        refreshed = guard.render_rollout_controller_refresh(self.original, self.revision, self.after)
+        with self.assertRaises(guard.Refused):
+            guard.render_rollout_controller_refresh(self.original, self.revision, self.after | {'policy': '0'*64})
+        with self.assertRaises(guard.Refused):
+            guard.render_rollout_controller_refresh(refreshed, self.revision, self.after)
+
+
 class SuccessorWebTests(unittest.TestCase):
-    def check_web(self, selected, candidate_committed=False):
+    def test_old_web_remains_startable_with_either_core(self):
         before = {'selection_sha256': 'a' * 64, 'reference_sha256': 'b' * 64}
         after = {'selection_sha256': 'c' * 64, 'reference_sha256': 'd' * 64, 'commit_sha': 'e' * 40}
         approval = {'frontend': before, 'assistant_rollout': {'web_commit': 'f' * 40},
                     'successor': {'web': after}}
-        with patch.object(guard, 'frontend_digests', return_value=selected), \
-             patch.object(guard, '_rollout_web_commit_receipt') as receipt, \
-             patch.object(guard, '_verify_rollout_live_web', return_value=True) as live:
-            result = guard.verify_assistant_rollout_successor_web({}, approval, 100 if candidate_committed else None)
-            return result, receipt, live
+        for core_at in (None, 100):
+            with self.subTest(core_at=core_at), patch.object(guard, 'frontend_digests', return_value=before), \
+                 patch.object(guard, '_verify_independent_web_history') as receipts, \
+                 patch.object(guard, '_verify_rollout_live_web', return_value=True) as live:
+                self.assertTrue(guard.verify_assistant_rollout_successor_web({}, approval, core_at))
+                receipts.assert_not_called()
+                live.assert_called_once_with({}, 'f' * 40, before['selection_sha256'])
 
-    def test_old_web_remains_startable_with_either_core(self):
-        old = {'selection_sha256': 'a' * 64, 'reference_sha256': 'b' * 64}
-        for candidate_committed in (False, True):
-            with self.subTest(candidate_committed=candidate_committed):
-                result, receipt, live = self.check_web(old, candidate_committed)
-                self.assertTrue(result)
-                receipt.assert_not_called()
-                self.assertEqual(live.call_args.args[1], 'f' * 40)
 
-    def test_new_web_needs_a_publication_after_the_new_core_commit(self):
-        new = {'selection_sha256': 'c' * 64, 'reference_sha256': 'd' * 64}
-        with self.assertRaisesRegex(guard.Refused, 'successor_web_core_not_committed'):
-            self.check_web(new)
-        result, receipt, live = self.check_web(new, True)
-        self.assertTrue(result)
-        self.assertEqual(receipt.call_args.kwargs['core_at'], 100)
-        self.assertEqual(live.call_args.args[1], 'e' * 40)
+class IndependentWebReceiptTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.runtime = Path(temp.name)
+        self.paths = self.runtime / 'selection.json', self.runtime / 'selection.reference'
+        self.before = self.pair('a')
+        self.anchor = self.pair('b')
+        self.intermediate = self.pair('c')
+        self.current = self.pair('d')
+        self.core_at = 1790000000
+        self.archive = 'f' * 64
+        self.approval = {'frontend': self.hashes(self.before), 'assistant_rollout': {'web_commit': 'a' * 40},
+                         'successor': {'web': self.hashes(self.anchor) | {
+                             'commit_sha': 'b' * 40, 'github_run_id': '1', 'github_run_attempt': '1',
+                             'archive_sha256': self.archive, 'build_id': 'build-b'}}}
+        for name, value in [('LOCK', self.runtime / 'lock'), ('frontend_paths', lambda: self.paths),
+                            ('read_file', self.read)]:
+            mocked = patch.object(guard, name, value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        live = patch.object(guard, '_verify_rollout_live_web', return_value=True)
+        self.verify_live = live.start()
+        self.addCleanup(live.stop)
+        self.receipt(1, self.before, self.anchor, 'b')
+        self.receipt(2, self.anchor, self.intermediate, 'c')
+        self.receipt(3, self.intermediate, self.current, 'd')
+        self.select(self.current)
 
-    def test_refuses_mixed_or_foreign_web_selection(self):
+    def select(self, pair):
+        for path, data in zip(self.paths, pair, strict=True):
+            path.write_bytes(data)
+
+    @staticmethod
+    def hashes(pair):
+        return dict(zip(('selection_sha256', 'reference_sha256'),
+                        (sha256(item).hexdigest() for item in pair), strict=True))
+
+    @staticmethod
+    def pair(identity):
+        commit, build = identity * 40, 'build-' + identity
+        selection = guard.encoded({'commit_sha': commit, 'build_id': build, 'provenance': {'kind': 'git_commit'}})
+        reference = (f'schema=ARTLIVE_FRONTEND_SELECTION_REFERENCE_V1\nselection_sha256={sha256(selection).hexdigest()}'
+                     f'\ncommit_sha={commit}\nbuild_id={build}\n').encode()
+        return selection, reference
+
+    @staticmethod
+    def read(path, *, expected=None, **kwargs):
+        raw = path.read_bytes()
+        guard.must(expected in (None, sha256(raw).hexdigest()), 'fixture_file_digest')
+        return raw
+
+    def receipt(self, index, before, after, commit, **overrides):
+        stage = self.runtime / f'frontend-selection-transition-{(self.core_at + index) * 10**9}'
+        stage.mkdir(exist_ok=True)
+        state = {'state': 'COMMITTED', 'stage': str(stage), 'selection': str(self.paths[0]),
+                 'reference': str(self.paths[1]), 'expected_commit': commit * 40,
+                 'requested_ref': f'{commit * 40}-{index}-1', 'artifact_sha256': self.archive,
+                 'expected_build_id': 'build-' + commit}
+        for side, pair in (('old', before), ('new', after)):
+            for name, data in zip(('selection', 'reference'), pair, strict=True):
+                (stage / f'{side}.{name}').write_bytes(data)
+                state[f'{side}_{name}_sha'] = sha256(data).hexdigest()
+        (stage / 'state.json').write_bytes(guard.encoded(state | overrides))
+        return stage
+
+    def check_live(self, core_at):
+        return guard.verify_assistant_rollout_successor_web({}, self.approval, core_at)
+
+    def test_later_artifacts_are_allowed_after_the_reviewed_web_commit(self):
+        self.assertTrue(self.check_live(self.core_at))
+        self.verify_live.assert_called_once_with({}, 'd' * 40, self.hashes(self.current)['selection_sha256'])
+
+    def test_later_web_release_cannot_run_before_the_core_commit(self):
+        with self.assertRaises(guard.Refused):
+            self.check_live(None)
+
+    def test_receipts_cannot_skip_the_reviewed_anchor_or_intermediate_commit(self):
+        self.receipt(2, self.before, self.intermediate, 'c')
+        with self.assertRaises(guard.Refused):
+            self.check_live(self.core_at)
+
+    def test_newest_uncommitted_receipt_is_refused(self):
+        self.receipt(3, self.intermediate, self.current, 'd', state='CONFIG_INSTALLED')
+        with self.assertRaises(guard.Refused):
+            self.check_live(self.core_at)
+
+    def test_foreign_artifact_identity_or_tampered_snapshot_is_refused(self):
+        self.receipt(2, self.anchor, self.intermediate, 'c', expected_build_id='other')
+        with self.assertRaises(guard.Refused):
+            self.check_live(self.core_at)
+        stage = self.receipt(2, self.anchor, self.intermediate, 'c')
+        (stage / 'new.reference').write_bytes(b'tampered')
+        with self.assertRaises(guard.Refused):
+            self.check_live(self.core_at)
+
+    def test_reviewed_anchor_still_requires_the_exact_approved_artifact(self):
+        self.receipt(1, self.before, self.anchor, 'b', artifact_sha256='e' * 64)
+        with self.assertRaises(guard.Refused):
+            self.check_live(self.core_at)
+
+    def test_reviewed_anchor_without_later_releases_is_startable(self):
+        stages = sorted(self.runtime.glob('frontend-selection-transition-*'))
+        for stage in stages[1:]:
+            for file in stage.iterdir():
+                file.unlink()
+            stage.rmdir()
+        self.select(self.anchor)
+        self.assertTrue(self.check_live(self.core_at))
+
+    def test_baseline_retained_receipt_keeps_the_last_committed_release(self):
+        self.receipt(4, self.current, self.pair('e'), 'e', state='BASELINE_RETAINED')
+        self.assertTrue(self.check_live(self.core_at))
+
+    def test_managed_rollback_to_reviewed_anchor_reuses_the_exact_chain(self):
+        self.receipt(4, self.current, self.anchor, 'b')
+        self.select(self.anchor)
+        self.assertTrue(self.check_live(self.core_at))
+
+    def test_mixed_selection_and_reference_are_refused(self):
+        self.select((self.current[0], self.anchor[1]))
         with self.assertRaisesRegex(guard.Refused, 'successor_web_pair'):
-            self.check_web({'selection_sha256': 'a' * 64, 'reference_sha256': 'd' * 64}, True)
+            self.check_live(self.core_at)
 
 
 if __name__ == '__main__':
