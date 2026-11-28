@@ -33,3 +33,11 @@
 仍使用 `prepare-successor`。准备阶段沿各次批准记录和已安装日志核验原始链路，将 AI 快照最初绑定的 Core 身份沿用到新计划。AI 日志和快照摘要在每一环都须一致。Community 继续核验原始发布证明和首次后继发布保留的 Core 发布器前像。已安装的兼容生命周期文件按原摘要保留。
 
 每次续发都要把新的 Core 和 Web 制品绑定到本轮审批，并核验上一轮的实际运行身份及回退目标。
+
+## 单独发布 Web
+
+先通过上面的受保护流程安装支持独立 Web 发布的 Core 控制器，并完成已审批的 Core 和 Web 切换。使用 `web_artifact_overlay.py --independent-upgrade` 和原始受信输入生成 Web 发布器升级候选。候选清单中的前像必须与已安装的制品发布器一致。受审维护窗口内按清单更新入口和序列化器，使用原共享发布锁，并保留旧文件供恢复。随后提升包含新版部署工作流的 Web `release`。
+
+日常 Web 更新走 Web `release` 和 GitHub `production` 审批。制品传输中断后，Actions 核对已有内容并续传。重跑失败的发布任务会复用同一运行已经打包的制品。Actions 摘要会记录上传、发布和监督状态。
+
+独立入口 `prepare-independent-artifact` 在上传前核验已安装的控制器支持。`deploy-independent-artifact` 持有原共享发布锁，要求 Core 已提交，并且当前 Web 与本轮已审批的 Web 之间有完整的受管制品发布记录。进行下一次 Core 联合发布前，按 `prepare-successor` 的要求确认已审批的 Web 锚点和预计回退版本。
