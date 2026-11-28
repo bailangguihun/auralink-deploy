@@ -3413,13 +3413,24 @@ def assistant_rollout_successor_history(rt, approval, folder, parent, parent_fol
 
 def applied_assistant_rollout(rt,value,handoff,controller):
     path,owner,mode=rt.targets()['publisher-guard']
-    raw=read(path,owner,mode,digest(value['runtime_modules']['core_release_guard.py']))
+    guard_sha=digest(value['runtime_modules']['core_release_guard.py'])
+    marker=json_read(rt.preserved()['original-controller-active'],rt.private)
+    ident=digest(marker.get('approval_sha256'))
+    must(marker=={'schema':'R25_CORE_CONTROLLER_UPGRADE_ACTIVE_V1','approval_sha256':ident},
+         'assistant_rollout_active_approval_binding')
+    candidate=json_read(rt.root/'runtime/core-publications/controller-upgrades'/ident/'approval.json',rt.private,ident)
+    if 'controller_refresh' in candidate:
+        guard_sha=digest(candidate['files']['core_release_guard.py']['after_sha256'])
+    must(handoff.get('R25_CORE_RELEASE_GUARD_SHA256')==guard_sha, 'assistant_rollout_guard_binding')
+    raw=read(path,owner,mode,guard_sha)
     spec=importlib.util.spec_from_file_location('_r25_assistant_rollout_vmm_guard',path)
     guard=importlib.util.module_from_spec(spec)
     sys.modules[spec.name]=guard
     exec(compile(raw,str(path),'exec',dont_inherit=True),guard.__dict__)
     must(guard.ROOT==rt.root,'assistant_rollout_fixed_root')
-    approval,folder,_=guard.load_assistant_rollout_approval(value)
+    approval,folder,_=guard.load_assistant_rollout_approval(value,ident)
+    must(approval['files']['core_release_guard.py']['after_sha256']==guard_sha and
+         approval['operational']['guard']['after_sha256']==guard_sha, 'assistant_rollout_guard_digest')
     must(sha(controller)==approval['files']['vmm_controller.py']['after_sha256'],
          'assistant_rollout_controller_digest')
     live=read(rt.targets()['handoff'][0],rt.private)
@@ -3455,6 +3466,11 @@ def applied_assistant_rollout(rt,value,handoff,controller):
         history = assistant_rollout_history(rt, approval, folder)
     verify_code_controller(rt,code,code_folder,'after',runtime=True,historical=history,
                            read_archived_jar=guard.read_file)
+    if 'controller_refresh' in approval:
+        effective = copy.deepcopy(value)
+        effective['controllers']['core_release_guard.py'] = guard_sha
+        effective['runtime_modules']['core_release_guard.py'] = guard_sha
+        return effective
     return value
 
 

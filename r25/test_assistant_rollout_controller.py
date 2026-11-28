@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import core_release_guard as guard
+import assistant_rollout_prepare as prepare
 import upgrade_core_controller
 from publisher_transaction import Refused
 from r25_storage import R25Storage
@@ -303,6 +304,84 @@ class AssistantRolloutControllerTest(unittest.TestCase):
         self.assertEqual((parent/'journal.json').read_bytes(), parent_receipt)
         self.assertEqual((self.store/'CONTROL_UPGRADE_ACTIVE.json').read_bytes(), old_pointer)
         self.assertEqual({name: path.read_bytes() for name, (path, _, _) in self.targets.items()}, original)
+
+    def prepare_refresh_fixture(self):
+        self.set_successor_plan()
+        before_sha = self.new_plan['operational']['handoff']['before_sha256']
+        fallback = self.after
+        handoff = (f'R25_CORE_RELEASE_GUARD_SHA256={"e"*64}\nR25_VMM_CONTROLLER_SHA256={"f"*64}\n').encode()
+        self.new_plan['operational']['handoff'] = {'before_sha256': before_sha,
+                                                  'after_sha256': prepare.sha(handoff)}
+        with patch.object(self, 'after', side_effect=lambda name: handoff if name == 'handoff' else fallback(name)):
+            self.store_successor_fixture(self.new_plan)
+        with patch.object(self.controller, 'verify_successor_web_preimage'):
+            self.assertEqual(self.install(), 'INSTALLED')
+
+        # Private file ownership follows the disposable fixture's UID/GID.
+        actual_read = guard.read_file
+
+        def read(path, **kwargs):
+            kwargs.setdefault('owner', self.owner)
+            return actual_read(path, **kwargs)
+
+        material = {'guard': b'reviewed refreshed guard', 'core_release_guard.py': b'reviewed refreshed guard',
+                    'vmm_controller.py': b'reviewed refreshed vmm'}
+        review = {'operator_review': 'verified formal controller refresh fixture'}
+        request = {'review_evidence_sha256': prepare.sha(guard.encoded(review))}
+        request_sha = prepare.sha(guard.encoded(request))
+        inputs = self.store/'assistant-rollout-refresh-requests'/request_sha
+        self.record(inputs/'request.json', request)
+        self.record(inputs/'review.json', review)
+        for module, name, result in (
+                (guard, 'require_independent_web_publication', None),
+                (guard, 'handoff_values', {}),
+                (guard, 'assistant_rollout_policy', {}),
+                (guard, 'load_assistant_rollout_approval', (self.new_plan, self.folder, 'INSTALLED')),
+                (guard, 'verify_assistant_rollout_ai', None),
+                (prepare, 'refresh_material', material),
+                (prepare, 'refresh_recovery_engine', self.service)):
+            mock = patch.object(module, name, return_value=result)
+            mock.start()
+            self.addCleanup(mock.stop)
+        for module, name, value in ((guard, 'read_file', read), (prepare, 'LIVE_FILES', self.live)):
+            mock = patch.object(module, name, value)
+            mock.start()
+            self.addCleanup(mock.stop)
+        result = prepare.prepare_refresh(self, request_sha)
+        ident = result['approval_sha256']
+        folder = self.controller.transaction_path(ident)
+        self.write(folder/'approval.json', (folder/'UNSIGNED_PLAN.json').read_bytes())
+        return folder
+
+    def test_refresh_switches_only_controls_and_preserves_current_releases(self):
+        refresh = self.prepare_refresh_fixture()
+        preserve = [self.live['release-jar'], self.live['preview-jar'], self.store/'CURRENT.json',
+                    self.ai/'CURRENT.json', self.store/'POLICY.json', self.folder/'approval.json', self.folder/'journal.json']
+        before = {path: path.read_bytes() for path in preserve}
+        self.assertEqual(prepare.apply_refresh(self, refresh.name, recover=False), 'INSTALLED')
+        self.assertEqual(prepare.apply_refresh(self, refresh.name, recover=False), 'INSTALLED_VERIFIED_NOOP')
+        self.assertEqual({path: path.read_bytes() for path in preserve}, before)
+        self.assertEqual(self.read(self.store/'CONTROL_UPGRADE_ACTIVE.json')['approval_sha256'], refresh.name)
+        self.assertEqual((self.service.stops, self.service.starts), (2, 2))
+
+    def test_refresh_recovers_interrupted_control_copies(self):
+        refresh = self.prepare_refresh_fixture()
+        original = {name: self.targets[name][0].read_bytes() for name in prepare.REFRESH_TARGETS}
+        copy = self.storage.atomic_copy_file
+
+        def fail_second(source, target, *args, **kwargs):
+            if source == refresh/'after/vmm_controller.py':
+                raise OSError('simulated outage')
+            return copy(source, target, *args, **kwargs)
+
+        with patch.object(self.storage, 'atomic_copy_file', side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, 'simulated outage'):
+                prepare.apply_refresh(self, refresh.name, recover=False)
+        self.assertEqual(self.read(refresh/'journal.json')['phase'], 'RECOVERY_REQUIRED')
+        self.assertEqual(prepare.apply_refresh(self, refresh.name, recover=True), 'RESTORED')
+        self.assertEqual({name: self.targets[name][0].read_bytes() for name in prepare.REFRESH_TARGETS}, original)
+        self.assertEqual(self.read(self.store/'CONTROL_UPGRADE_ACTIVE.json')['approval_sha256'], self.folder.name)
+        self.assertTrue(self.service.running)
 
     def test_successor_installs_once_and_refuses_missing_community_preservation(self):
         self.set_successor_plan()

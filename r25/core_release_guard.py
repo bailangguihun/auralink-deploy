@@ -35,6 +35,7 @@ ASSISTANT_ILLUSTRATION_CORE_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATIO
 ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
 ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'
 ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
+ILLUSTRATION_CONTROLLER_REFRESH = 'R25_ILLUSTRATION_CONTROLLER_REFRESH_V1'
 ASSISTANT_AI_PATHS = tuple(sorted((
     'guide_service/__init__.py', 'guide_service/__main__.py', 'guide_service/app.py',
     'guide_service/config.py', 'guide_service/diagnostics.py', 'guide_service/env_loader.py',
@@ -487,6 +488,43 @@ def assistant_rollout_binding_module(approval):
     return source_module(path, 'r25_bound_assistant_rollout', read_file(path, expected=digest))
 
 
+def render_rollout_controller_refresh(original, revision, after):
+    must(original.get('schema') == ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL and
+         'controller_refresh' not in original, 'illustration_refresh_predecessor')
+    must(revision.keys() == {'schema', 'approval_sha256', 'journal_sha256', 'review_sha256', 'context_sha256'} and
+         revision['schema'] == ILLUSTRATION_CONTROLLER_REFRESH and
+         after.keys() == {'guard', 'vmm_controller.py', 'handoff'}, 'illustration_refresh_fields')
+    for key in ('approval_sha256', 'journal_sha256', 'review_sha256', 'context_sha256'):
+        digest_value(revision[key])
+    refreshed = deepcopy(original)
+    refreshed['controller_refresh'] = dict(revision)
+    for name, entry, digest in (
+            ('guard', refreshed['operational']['guard'], after['guard']),
+            ('publisher-guard', refreshed['files']['core_release_guard.py'], after['guard']),
+            ('vmm', refreshed['files']['vmm_controller.py'], after['vmm_controller.py']),
+            ('handoff', refreshed['operational']['handoff'], after['handoff'])):
+        must(digest_value(digest) != entry['after_sha256'], 'illustration_refresh_unchanged:' + name)
+        entry['after_sha256'] = digest
+    return refreshed
+
+
+def verify_rollout_controller_refresh(approval, folder):
+    revision = approval['controller_refresh']
+    ident = digest_value(revision['approval_sha256'])
+    original_folder = STORE / 'controller-upgrades' / ident
+    original = private_record(original_folder / 'approval.json', ident)
+    journal = private_record(original_folder / 'journal.json', digest_value(revision['journal_sha256']))
+    must(journal.get('phase') == 'INSTALLED' and journal.get('schema') == original['schema'] and
+         journal.get('approval_sha256') == ident, 'illustration_refresh_original_journal')
+    after = {name: approval['operational'][name]['after_sha256'] for name in ('guard', 'handoff')}
+    after['vmm_controller.py'] = approval['files']['vmm_controller.py']['after_sha256']
+    must(approval == render_rollout_controller_refresh(original, revision, after),
+         'illustration_refresh_control_only_binding')
+    private_record(folder / 'refresh-review.json', digest_value(revision['review_sha256']))
+    private_record(folder / 'refresh-context.json', digest_value(revision['context_sha256']))
+    return original
+
+
 def load_assistant_rollout_approval(value, expected_sha256=None):
     marker = private_record(STORE / 'CONTROL_UPGRADE_ACTIVE.json')
     digest = digest_value(marker.get('approval_sha256'))
@@ -512,7 +550,9 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
          'illustration_approved_policy_binding')
     if successor:
         old = private_record(folder / 'before/policy', approval['operational']['policy']['before_sha256'])
-        must(raw == render_assistant_rollout_successor_policy(old, approval),
+        policy_approval = (verify_rollout_controller_refresh(approval, folder)
+                           if 'controller_refresh' in approval else approval)
+        must(raw == render_assistant_rollout_successor_policy(old, policy_approval),
              'illustration_successor_rendered_policy')
     return approval, folder, phase
 

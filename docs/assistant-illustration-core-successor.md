@@ -36,8 +36,16 @@
 
 ## 单独发布 Web
 
-先通过上面的受保护流程安装支持独立 Web 发布的 Core 控制器，并完成已审批的 Core 和 Web 切换。使用 `web_artifact_overlay.py --independent-upgrade` 和原始受信输入生成 Web 发布器升级候选。候选清单中的前像必须与已安装的制品发布器一致。受审维护窗口内按清单更新入口和序列化器，使用原共享发布锁，并保留旧文件供恢复。随后提升包含新版部署工作流的 Web `release`。
+首次启用时，可用下面的控制器升级入口保留当前 Core。若使用上文的 Core 联合发布流程，先完成已审批的 Core 和 Web 切换。使用 `web_artifact_overlay.py --independent-upgrade` 和原始受信输入生成 Web 发布器升级候选。候选清单中的前像必须与已安装的制品发布器一致。受审维护窗口内按清单更新入口和序列化器，使用原共享发布锁，并保留旧文件供恢复。随后提升包含新版部署工作流的 Web `release`。
 
 日常 Web 更新走 Web `release` 和 GitHub `production` 审批。制品传输中断后，Actions 核对已有内容并续传。重跑失败的发布任务会复用同一运行已经打包的制品。Actions 摘要会记录上传、发布和监督状态。
 
 独立入口 `prepare-independent-artifact` 在上传前核验已安装的控制器支持。`deploy-independent-artifact` 持有原共享发布锁，要求 Core 已提交，并且当前 Web 与本轮已审批的 Web 之间有完整的受管制品发布记录。进行下一次 Core 联合发布前，按 `prepare-successor` 的要求确认已审批的 Web 锚点和预计回退版本。
+
+### 保留当前 Core 的控制器升级
+
+将同一受保护的 Deploy `release` 运行产生的 Core 控制器和 VMM 官方包放进前文约定的候选目录。当前 Core 和已审批的 Web 必须已提交，现有监督器及 Community 必须健康。
+
+在 `runtime/core-publications/assistant-rollout-refresh-requests/<请求摘要>/` 保存权限为 0600 的 `request.json` 和 `review.json`。请求的 `schema` 为 `R25_ILLUSTRATION_CONTROLLER_REFRESH_REQUEST_V1`，`deploy` 和 `vmm` 采用前文正式制品身份，`review_evidence_sha256` 绑定审核记录。用正式包中的 `assistant_rollout_prepare.py prepare-refresh --request-sha256 <请求摘要>` 生成 `UNSIGNED_PLAN.json`。
+
+核对批准记录、原应用身份、两个 guard 副本、VMM 控制器和 handoff 的前后摘要。把批准的原始计划字节保存为同目录的 `approval.json`，然后运行 `assistant_rollout_prepare.py install-refresh --approval-sha256 <批准摘要>`。安装在原锁下更新控制文件和控制器指针，核验应用进程和 Community，再启动应用监督器。发生中断时，先核对日志，再用 `recover-refresh --approval-sha256 <同一摘要>` 恢复批准的原像。

@@ -8,6 +8,7 @@ from dataclasses import asdict
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -21,11 +22,13 @@ import core_publish
 from core_runtime import LIVE_FILES, env_values, replace_env
 from publisher_transaction import Refused
 from upgrade_assistant_controller import service_identities
-from upgrade_core_controller import ControlUpgradeRuntime, upgrade_lease
+from upgrade_core_controller import ControlUpgradeRuntime, immutable_copy, upgrade_lease
 
 
 REQUEST = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_REQUEST_V1'
 SUCCESSOR_REQUEST = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_REQUEST_V1'
+REFRESH_REQUEST = 'R25_ILLUSTRATION_CONTROLLER_REFRESH_REQUEST_V1'
+REFRESH_TARGETS = ('core_release_guard.py', 'vmm_controller.py', 'guard', 'handoff')
 REF_FIELDS = ('repository', 'ref', 'commit', 'run_id', 'run_attempt')
 CONTROLLER_FILES = {
     'ai-baseline.json', 'ai_publish.py', 'ai_release_candidate.py', 'ai_release_guard.py', 'ai_runtime.py',
@@ -434,17 +437,217 @@ def prepare_successor(rt, request_sha256):
             'unsigned_plan': str(folder/'UNSIGNED_PLAN.json')}
 
 
+def refresh_material(rt, request):
+    formal, vmm = request['deploy'], request['vmm']
+    guard.must(request.keys() == {'schema', 'deploy', 'vmm', 'review_evidence_sha256'} and
+               request['schema'] == REFRESH_REQUEST and
+               formal['repository'] == 'bailangguihun/auralink-deploy' and formal['ref'] == 'refs/heads/release' and
+               all(formal[key] == vmm[key] for key in REF_FIELDS), 'illustration_refresh_request')
+    commit = guard.digest_value(formal['commit'], 40)
+    operations = guard.ROOT/'operations'
+    bundle = operations/'r25-controller-candidates'/commit
+    files = approval_input(rt, bundle, formal, 'r25-controller.zip', sorted(CONTROLLER_FILES), controller_manifest=True)
+    tool = Path(__file__).absolute()
+    guard.must(tool == bundle/tool.name and sha(files[tool.name]) == formal['tool_sha256'] == sha(tool.read_bytes()),
+               'illustration_refresh_tool')
+    extension = approval_input(rt, operations/'r25-vmm-candidates'/commit, vmm, 'vmm-extension.zip', VMM_FILES)
+    core = files['core_release_guard.py']
+    guard.must(core == extension['core_release_guard.py'] and sha(core) == sha(Path(guard.__file__).read_bytes()),
+               'illustration_refresh_guard_bundle')
+    return {'guard': core, 'core_release_guard.py': core, 'vmm_controller.py': extension['vmm_controller.py']}
+
+
+def prepare_refresh(rt, request_sha256):
+    inputs = guard.STORE/'assistant-rollout-refresh-requests'/guard.digest_value(request_sha256)
+    request = rt.read(inputs/'request.json', request_sha256)
+    review = guard.read_file(inputs/'review.json', expected=guard.digest_value(request['review_evidence_sha256']))
+    guard.strict_json(review)
+    material = refresh_material(rt, request)
+    with upgrade_lease(rt):
+        rt.require_terminal_application_transactions()
+        guard.require_independent_web_publication(rt.fd)
+        value = guard.assistant_rollout_policy(guard.handoff_values())
+        original, original_folder, _ = guard.load_assistant_rollout_approval(value)
+        controller.validate(original)
+        guard.verify_assistant_rollout_ai(value)
+        rt.verify_current(rt.current())
+        engine = rt.engine()
+        guard.must(engine.watchdog_identity() is not None, 'illustration_refresh_watchdog_required')
+        context = {'request': request, 'frontend': guard.frontend_digests(), 'before': {},
+                   'services': controller._services(engine), 'pointers': {}}
+        context['community'] = controller._community(rt, context, engine)
+        for key, path in controller._pointer_paths().items():
+            context['pointers'][key] = rt.identity(path)['sha256']
+        for name in REFRESH_TARGETS:
+            path, owner, mode = controller.targets(original)[name]
+            context['before'][name] = rt.identity(path, expected_owner=owner, expected_mode=mode)['sha256']
+        raw = guard.read_file(LIVE_FILES['handoff'], expected=context['before']['handoff'])
+        material['handoff'] = replace_env(raw, {'R25_CORE_RELEASE_GUARD_SHA256': sha(material['guard']),
+                                               'R25_VMM_CONTROLLER_SHA256': sha(material['vmm_controller.py'])})
+        revision = {'schema': guard.ILLUSTRATION_CONTROLLER_REFRESH, 'approval_sha256': original_folder.name,
+                    'journal_sha256': rt.identity(original_folder/'journal.json')['sha256'],
+                    'review_sha256': sha(review), 'context_sha256': sha(guard.encoded(context))}
+        plan = guard.render_rollout_controller_refresh(original, revision,
+                    {name: sha(material[name]) for name in ('guard', 'vmm_controller.py', 'handoff')})
+        raw_plan = guard.encoded(plan)
+        ident = sha(raw_plan)
+        folder = controller.transaction_path(ident)
+        rt.storage.mkdir_private(folder)
+        for name in ('before', 'after', 'refresh-before'):
+            rt.storage.mkdir_private(folder/name)
+        # Preserve the historical Core transaction inputs and policy approval in their original format.
+        for name, entry in controller.entries(original).items():
+            if entry['before_sha256'] is not None:
+                immutable_copy(rt, original_folder/'before'/name, folder/'before'/name, entry['before_sha256'])
+            if name not in material:
+                immutable_copy(rt, original_folder/'after'/name, folder/'after'/name, entry['after_sha256'])
+        for key, name in controller.PREIMAGE_NAMES.items():
+            immutable_copy(rt, original_folder/'before'/name, folder/'before'/name, original['assistant_rollout'][key])
+        immutable_copy(rt, original_folder/'review.json', folder/'review.json', original['review_evidence_sha256'])
+        for name, content in material.items():
+            put(rt, folder/'after'/name, content)
+            path, owner, mode = controller.targets(original)[name]
+            immutable_copy(rt, path, folder/'refresh-before'/name, context['before'][name],
+                           source_owner=owner, source_mode=mode)
+        for name, content in {'refresh-context.json': guard.encoded(context), 'refresh-review.json': review,
+                             'UNSIGNED_PLAN.json': raw_plan}.items():
+            put(rt, folder/name, content)
+    return {'outcome': 'ILLUSTRATION_REFRESH_PREPARED', 'approval_sha256': ident,
+            'unsigned_plan': str(folder/'UNSIGNED_PLAN.json')}
+
+
+def refresh_live(rt, plan, folder, context, side):
+    rt.require_terminal_application_transactions()
+    guard.must(guard.frontend_digests() == context['frontend'], 'illustration_refresh_web_drift')
+    for name, path in controller._pointer_paths().items():
+        before = context['pointers'][name]
+        after = (sha(guard.encoded(controller._active_record(folder.name)))
+                 if name == 'control_active_sha256' else before)
+        guard.must(rt.identity(path)['sha256'] in {'before': {before}, 'after': {after}, 'mixed': {before, after}}[side],
+                   'illustration_refresh_pointer:' + name)
+    observed = {}
+    for name in REFRESH_TARGETS:
+        path, owner, mode = controller.targets(plan)[name]
+        before, after = context['before'][name], controller.entries(plan)[name]['after_sha256']
+        actual = rt.identity(path, expected_owner=owner, expected_mode=mode)['sha256']
+        guard.must(actual in {'before': {before}, 'after': {after}, 'mixed': {before, after}}[side],
+                   'illustration_refresh_target:' + name)
+        observed[name] = actual
+    return observed
+
+
+def refresh_copy(rt, plan, folder, context, observed, *, restore):
+    for name in reversed(REFRESH_TARGETS) if restore else REFRESH_TARGETS:
+        path, owner, mode = controller.targets(plan)[name]
+        source = folder/('refresh-before' if restore else 'after')/name
+        desired = context['before'][name] if restore else controller.entries(plan)[name]['after_sha256']
+        if observed[name] != desired:
+            rt.storage.atomic_copy_file(source, path, desired, replace=True, expected_existing_sha256=observed[name],
+                                        target_owner=owner, mode=mode, existing_owner=owner, existing_mode=mode)
+    pointer = controller._pointer_paths()['control_active_sha256']
+    desired = guard.encoded(controller._active_record(plan['controller_refresh']['approval_sha256'] if restore else folder.name))
+    previous = rt.identity(pointer)['sha256']
+    if previous != sha(desired):
+        rt.storage.atomic_write_bytes(pointer, desired, replace=True, expected_existing_sha256=previous)
+
+
+def refresh_verify_services(rt, context):
+    rt.verify_current(rt.current())
+    engine = rt.engine()
+    guard.must(controller._community(rt, context, engine) == context['community'], 'illustration_refresh_community_drift')
+    return engine
+
+
+def refresh_recovery_engine(rt, plan, handoff):
+    lifecycle, owner, mode = controller.targets(plan)['lifecycle']
+    raw = guard.read_file(lifecycle, owner=owner, mode=mode, expected=plan['operational']['lifecycle']['after_sha256'])
+    module = guard.source_module(lifecycle, 'r25_refresh_recovery_lifecycle', raw)
+    os.environ['R25_ROOT'] = str(guard.ROOT)
+    os.environ['ARTLIVE_R25_HANDOFF_CONFIG'] = str(LIVE_FILES['handoff'])
+    engine = module.production(rt.fd)
+    engine.v = env_values(handoff)
+    engine.kind = engine.v['R25_LIFECYCLE_RELEASE_KIND']
+    engine.load_execution_policy()
+    return engine
+
+
+def apply_refresh(rt, ident, *, recover):
+    folder = controller.transaction_path(ident)
+    with upgrade_lease(rt):
+        plan = rt.read(folder/'approval.json', ident)
+        expected = rt.read(folder/'UNSIGNED_PLAN.json', ident)
+        guard.must(plan == expected, 'illustration_refresh_exact_approval')
+        original = guard.verify_rollout_controller_refresh(plan, folder)
+        context = rt.read(folder/'refresh-context.json', plan['controller_refresh']['context_sha256'])
+        material = refresh_material(rt, context['request'])
+        for name in REFRESH_TARGETS:
+            rt.identity(folder/'refresh-before'/name, expected_sha256=context['before'][name])
+            after = rt.identity(folder/'after'/name, expected_sha256=controller.entries(plan)[name]['after_sha256'])
+            if name in material:
+                guard.must(after['sha256'] == sha(material[name]), 'illustration_refresh_material:' + name)
+        handoff = guard.read_file(folder/'refresh-before/handoff', expected=context['before']['handoff'])
+        expected_handoff = replace_env(handoff, {'R25_CORE_RELEASE_GUARD_SHA256': sha(material['guard']),
+                                                 'R25_VMM_CONTROLLER_SHA256': sha(material['vmm_controller.py'])})
+        guard.must(sha(expected_handoff) == plan['operational']['handoff']['after_sha256'] and
+                   context['pointers']['control_active_sha256'] ==
+                   sha(guard.encoded(controller._active_record(plan['controller_refresh']['approval_sha256']))),
+                   'illustration_refresh_handoff')
+        path, schema = folder/'journal.json', original['schema']
+        phase, journal = controller._read_journal(rt, path, ident, schema)
+        if phase in {'INSTALLED', 'RESTORED'}:
+            guard.must(phase == 'INSTALLED' or recover, 'illustration_refresh_already_restored')
+            refresh_live(rt, plan, folder, context, 'after' if phase == 'INSTALLED' else 'before')
+            controller._resume_watchdog(refresh_verify_services(rt, context))
+            return phase + '_VERIFIED_NOOP'
+        if recover:
+            guard.must(phase is not None, 'illustration_refresh_not_started')
+            observed = refresh_live(rt, plan, folder, context, 'mixed')
+            # The approved lifecycle stays in place. Recover watchdog metadata from the saved handoff.
+            engine = refresh_recovery_engine(rt, plan, handoff)
+            guard.must(controller._services(engine) == context['services'], 'illustration_refresh_service_drift')
+        else:
+            guard.must(phase is None, 'illustration_refresh_recovery_required')
+            observed = refresh_live(rt, plan, folder, context, 'before')
+            rt.require_no_active_work()
+            engine = refresh_verify_services(rt, context)
+            guard.must(engine.watchdog_identity() is not None, 'illustration_refresh_watchdog_required')
+            journal = controller._record(rt, path, ident, 'PREPARED', schema=schema)
+        try:
+            stop_phase = 'RESTORE_INTENT' if recover else 'WATCHDOG_STOP_INTENT'
+            journal = controller._record(rt, path, ident, stop_phase, prior=journal, schema=schema)
+            if engine.watchdog_identity() is not None:
+                engine.watchdog_stop_locked()
+            guard.must(engine.watchdog_identity() is None, 'illustration_refresh_watchdog_not_stopped')
+            if not recover:
+                journal = controller._record(rt, path, ident, 'INSTALL_INTENT', prior=journal, schema=schema)
+            refresh_copy(rt, plan, folder, context, observed, restore=recover)
+            refresh_live(rt, plan, folder, context, 'before' if recover else 'after')
+            if not recover:
+                journal = controller._record(rt, path, ident, 'VERIFY_INTENT', prior=journal, schema=schema)
+            engine = refresh_verify_services(rt, context)
+            phase = 'RESTORED' if recover else 'INSTALLED'
+            controller._record(rt, path, ident, phase, prior=journal, schema=schema)
+            controller._resume_watchdog(engine)
+            return phase
+        except BaseException as error:
+            controller._failure(rt, path, ident, error, schema)
+            raise
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('prepare', 'prepare-successor', 'install', 'recover'))
+    parser.add_argument('action', choices=('prepare', 'prepare-successor', 'install', 'recover',
+                                           'prepare-refresh', 'install-refresh', 'recover-refresh'))
     parser.add_argument('--request-sha256')
     parser.add_argument('--approval-sha256')
     args = parser.parse_args(argv)
     rt = ControlUpgradeRuntime()
     try:
-        if args.action in {'prepare', 'prepare-successor'} and args.request_sha256 and not args.approval_sha256:
-            operation = prepare_successor if args.action == 'prepare-successor' else prepare
+        if args.action in {'prepare', 'prepare-successor', 'prepare-refresh'} and args.request_sha256 and not args.approval_sha256:
+            operation = {'prepare': prepare, 'prepare-successor': prepare_successor, 'prepare-refresh': prepare_refresh}[args.action]
             result = operation(rt, args.request_sha256)
+        elif args.action in {'install-refresh', 'recover-refresh'} and not args.request_sha256 and args.approval_sha256:
+            result = apply_refresh(rt, args.approval_sha256, recover=args.action == 'recover-refresh')
         elif args.action in {'install', 'recover'} and not args.request_sha256 and args.approval_sha256:
             result = getattr(controller, args.action)(rt, approval_sha256=args.approval_sha256)
         else:

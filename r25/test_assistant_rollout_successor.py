@@ -245,6 +245,34 @@ class SuccessorParentTests(unittest.TestCase):
             guard.load_assistant_rollout_successor_parent(self.plan, read=self.read)
 
 
+class RolloutControllerRefreshTests(unittest.TestCase):
+    def setUp(self):
+        self.original = {'schema': guard.ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL, 'successor': {'candidate': 'bound'},
+                         'files': {'core_release_guard.py': {'before_sha256': '1'*64, 'after_sha256': '2'*64},
+                                   'vmm_controller.py': {'before_sha256': '3'*64, 'after_sha256': '4'*64}},
+                         'operational': {'guard': {'before_sha256': '1'*64, 'after_sha256': '2'*64},
+                                         'handoff': {'before_sha256': '5'*64, 'after_sha256': '6'*64},
+                                         'policy': {'before_sha256': '7'*64, 'after_sha256': '8'*64}}}
+        self.revision = {'schema': 'R25_ILLUSTRATION_CONTROLLER_REFRESH_V1', 'approval_sha256': '9'*64,
+                         'journal_sha256': 'a'*64, 'review_sha256': 'b'*64, 'context_sha256': 'c'*64}
+        self.after = {'guard': 'f'*64, 'vmm_controller.py': 'e'*64, 'handoff': 'd'*64}
+
+    def test_control_refresh_keeps_the_existing_application_binding(self):
+        refreshed = guard.render_rollout_controller_refresh(self.original, self.revision, self.after)
+        self.assertEqual(refreshed['successor'], self.original['successor'])
+        self.assertEqual(refreshed['operational']['policy'], self.original['operational']['policy'])
+        self.assertEqual(refreshed['operational']['guard']['after_sha256'], self.after['guard'])
+        self.assertEqual(refreshed['files']['core_release_guard.py']['after_sha256'], self.after['guard'])
+        self.assertEqual(self.original['operational']['guard']['after_sha256'], '2'*64)
+
+    def test_revision_cannot_rewrite_the_application_policy_or_reuse_a_refresh(self):
+        refreshed = guard.render_rollout_controller_refresh(self.original, self.revision, self.after)
+        with self.assertRaises(guard.Refused):
+            guard.render_rollout_controller_refresh(self.original, self.revision, self.after | {'policy': '0'*64})
+        with self.assertRaises(guard.Refused):
+            guard.render_rollout_controller_refresh(refreshed, self.revision, self.after)
+
+
 class SuccessorWebTests(unittest.TestCase):
     def test_old_web_remains_startable_with_either_core(self):
         before = {'selection_sha256': 'a' * 64, 'reference_sha256': 'b' * 64}
