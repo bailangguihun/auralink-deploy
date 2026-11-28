@@ -35,6 +35,7 @@ ASSISTANT_ILLUSTRATION_CORE_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATIO
 ASSISTANT_ILLUSTRATION_APPROVAL_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_PUBLICATION_BINDING_V1'
 ASSISTANT_ILLUSTRATION_SUCCESSOR_SCHEMA = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_V1'
 ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL = 'R25_ASSISTANT_ILLUSTRATION_CORE_SUCCESSOR_BINDING_V1'
+ILLUSTRATION_CONTROLLER_REFRESH = 'R25_ILLUSTRATION_CONTROLLER_REFRESH_V1'
 ASSISTANT_AI_PATHS = tuple(sorted((
     'guide_service/__init__.py', 'guide_service/__main__.py', 'guide_service/app.py',
     'guide_service/config.py', 'guide_service/diagnostics.py', 'guide_service/env_loader.py',
@@ -487,6 +488,43 @@ def assistant_rollout_binding_module(approval):
     return source_module(path, 'r25_bound_assistant_rollout', read_file(path, expected=digest))
 
 
+def render_rollout_controller_refresh(original, revision, after):
+    must(original.get('schema') == ASSISTANT_ILLUSTRATION_SUCCESSOR_APPROVAL and
+         'controller_refresh' not in original, 'illustration_refresh_predecessor')
+    must(revision.keys() == {'schema', 'approval_sha256', 'journal_sha256', 'review_sha256', 'context_sha256'} and
+         revision['schema'] == ILLUSTRATION_CONTROLLER_REFRESH and
+         after.keys() == {'guard', 'vmm_controller.py', 'handoff'}, 'illustration_refresh_fields')
+    for key in ('approval_sha256', 'journal_sha256', 'review_sha256', 'context_sha256'):
+        digest_value(revision[key])
+    refreshed = deepcopy(original)
+    refreshed['controller_refresh'] = dict(revision)
+    for name, entry, digest in (
+            ('guard', refreshed['operational']['guard'], after['guard']),
+            ('publisher-guard', refreshed['files']['core_release_guard.py'], after['guard']),
+            ('vmm', refreshed['files']['vmm_controller.py'], after['vmm_controller.py']),
+            ('handoff', refreshed['operational']['handoff'], after['handoff'])):
+        must(digest_value(digest) != entry['after_sha256'], 'illustration_refresh_unchanged:' + name)
+        entry['after_sha256'] = digest
+    return refreshed
+
+
+def verify_rollout_controller_refresh(approval, folder):
+    revision = approval['controller_refresh']
+    ident = digest_value(revision['approval_sha256'])
+    original_folder = STORE / 'controller-upgrades' / ident
+    original = private_record(original_folder / 'approval.json', ident)
+    journal = private_record(original_folder / 'journal.json', digest_value(revision['journal_sha256']))
+    must(journal.get('phase') == 'INSTALLED' and journal.get('schema') == original['schema'] and
+         journal.get('approval_sha256') == ident, 'illustration_refresh_original_journal')
+    after = {name: approval['operational'][name]['after_sha256'] for name in ('guard', 'handoff')}
+    after['vmm_controller.py'] = approval['files']['vmm_controller.py']['after_sha256']
+    must(approval == render_rollout_controller_refresh(original, revision, after),
+         'illustration_refresh_control_only_binding')
+    private_record(folder / 'refresh-review.json', digest_value(revision['review_sha256']))
+    private_record(folder / 'refresh-context.json', digest_value(revision['context_sha256']))
+    return original
+
+
 def load_assistant_rollout_approval(value, expected_sha256=None):
     marker = private_record(STORE / 'CONTROL_UPGRADE_ACTIVE.json')
     digest = digest_value(marker.get('approval_sha256'))
@@ -512,7 +550,9 @@ def load_assistant_rollout_approval(value, expected_sha256=None):
          'illustration_approved_policy_binding')
     if successor:
         old = private_record(folder / 'before/policy', approval['operational']['policy']['before_sha256'])
-        must(raw == render_assistant_rollout_successor_policy(old, approval),
+        policy_approval = (verify_rollout_controller_refresh(approval, folder)
+                           if 'controller_refresh' in approval else approval)
+        must(raw == render_assistant_rollout_successor_policy(old, policy_approval),
              'illustration_successor_rendered_policy')
     return approval, folder, phase
 
@@ -588,13 +628,18 @@ def require_community_rollout(approval_sha256, lease_fd, *, preserve_only=False)
     return verify_assistant_rollout_core(policy, approval, folder, preserve_only=preserve_only)
 
 
+def _web_transition_stages(core_at):
+    stages = []
+    for stage in LOCK.parent.glob('frontend-selection-transition-*'):
+        match = re.fullmatch(r'frontend-selection-transition-([1-9][0-9]{17,19})', stage.name)
+        if match is not None and int(match[1]) // 1_000_000_000 > core_at:
+            stages.append((int(match[1]), stage))
+    return (stage for _, stage in sorted(stages, reverse=True))
+
+
 def _rollout_web_commit_receipt(selection, reference, *, commit, before, core_at, artifact=None):
     selection_sha, reference_sha = (hashlib.sha256(read_file(path)).hexdigest() for path in (selection, reference))
-    runtime = LOCK.parent
-    for stage in sorted(runtime.glob('frontend-selection-transition-*'), reverse=True):
-        match = re.fullmatch(r'frontend-selection-transition-([1-9][0-9]{17,19})', stage.name)
-        if match is None or int(match[1]) // 1_000_000_000 <= core_at:
-            continue
+    for stage in _web_transition_stages(core_at):
         try:
             state = private_record(stage / 'state.json')
         except FileNotFoundError:
@@ -657,16 +702,46 @@ def verify_assistant_rollout_successor_web(value, approval, core_at):
     if observed == before:
         commit = approval['assistant_rollout']['web_commit']
     else:
-        must(all(after[key] == digest for key, digest in observed.items()), 'illustration_successor_web_pair')
         must(core_at is not None, 'illustration_successor_web_core_not_committed')
-        commit = after['commit_sha']
-        _rollout_web_commit_receipt(*frontend_paths(), commit=commit, before=before, core_at=core_at,
-                                    artifact=after)
+        commit = _verify_independent_web_history(observed, before, after, core_at)
     return _verify_rollout_live_web(value, digest_value(commit, 40), observed['selection_sha256'])
 
 
-def _verify_rollout_live_web(value, commit, selection_sha):
-    selection, reference = frontend_paths()
+def _verify_independent_web_history(observed, before, anchor, core_at):
+    """Prove the current pair descends from the exact reviewed Web transition."""
+    paths = frontend_paths()
+    current_commit = None
+    for stage in _web_transition_stages(core_at):
+        state = private_record(stage / 'state.json')
+        if state.get('state') == 'BASELINE_RETAINED':
+            continue
+        must(state.get('state') == 'COMMITTED' and
+             all(state.get('new_' + name + '_sha') == observed[name + '_sha256']
+                 for name in ('selection', 'reference')), 'illustration_successor_web_pair')
+        previous = {name + '_sha256': digest_value(state.get('old_' + name + '_sha'))
+                    for name in ('selection', 'reference')}
+        commit = digest_value(state.get('expected_commit'), 40)
+        if previous == before and all(anchor[key] == digest for key, digest in observed.items()):
+            must(commit == anchor['commit_sha'], 'illustration_successor_web_anchor')
+            verify_rollout_web_receipt(stage, state, before, anchor, paths=paths, artifact=anchor)
+            return current_commit or commit
+
+        requested_ref = state.get('requested_ref')
+        build = state.get('expected_build_id')
+        must(type(requested_ref) is str and re.fullmatch(commit + r'(-[1-9][0-9]{0,19}){2}', requested_ref)
+             and type(build) is str and re.fullmatch(r'[A-Za-z0-9._-]{1,80}', build)
+             and previous != observed, 'illustration_successor_web_artifact')
+        digest_value(state.get('artifact_sha256'))
+        verify_rollout_web_receipt(stage, state, previous, observed, paths=paths)
+        selected = _verify_web_selection_pair(stage / 'new.selection', stage / 'new.reference',
+                                              commit, observed['selection_sha256'])
+        must(selected['build_id'] == build, 'illustration_successor_web_artifact')
+        current_commit = current_commit or commit
+        observed = previous
+    raise Refused('illustration_successor_web_pair')
+
+
+def _verify_web_selection_pair(selection, reference, commit, selection_sha):
     selected = private_record(selection, selection_sha)
     build_id = selected.get('build_id')
     provenance = selected.get('provenance')
@@ -675,6 +750,12 @@ def _verify_rollout_live_web(value, commit, selection_sha):
     wanted_reference = ('schema=ARTLIVE_FRONTEND_SELECTION_REFERENCE_V1\nselection_sha256=' + selection_sha +
                         '\ncommit_sha=' + commit + '\nbuild_id=' + build_id + '\n').encode()
     must(read_file(reference) == wanted_reference, 'illustration_web_selection_reference')
+    return selected
+
+
+def _verify_rollout_live_web(value, commit, selection_sha):
+    selection, reference = frontend_paths()
+    selected = _verify_web_selection_pair(selection, reference, commit, selection_sha)
     handoff = handoff_values()
     path = ROOT / 'operations/frontend_lifecycle_selector.py'
     must(handoff.get('R25_FRONTEND_SELECTOR') == str(path) and
@@ -689,6 +770,20 @@ def _verify_rollout_live_web(value, commit, selection_sha):
         raise Refused(str(error)) from None
     must(observed == selected, 'illustration_web_verified_selection')
     return True
+
+
+def require_independent_web_publication(lease_fd):
+    """Check the active Core and Web before allowing an independent switch."""
+    BusinessGuard().verify_lease(lease_fd)
+    value = assistant_rollout_policy(handoff_values())
+    must(is_assistant_rollout_successor(value or {}), 'independent_web_successor_policy_required')
+    approval, folder, phase = load_assistant_rollout_approval(value)
+    must(phase == 'INSTALLED', 'independent_web_controller_not_installed')
+    selected = verify_assistant_rollout_core(value, approval, folder, preserve_only=True)
+    core_at = _successor_core_committed_at(selected, approval)
+    must(core_at is not None, 'illustration_successor_web_core_not_committed')
+    must(frontend_digests() != approval['frontend'], 'independent_web_reviewed_anchor_not_live')
+    verify_assistant_rollout_successor_web(value, approval, core_at)
 
 
 def _rollout_record_path(ref):
@@ -871,19 +966,24 @@ def verify_assistant_rollout_successor_ai(value, approval, folder, *, for_start)
     if for_start:
         selected = verify_assistant_rollout_core(value, approval, folder, preserve_only=True)
         must(selected is not None, 'illustration_successor_core_in_flight')
-        committed_at = None
-        if selected != approval['current_release']:
-            core = private_record(STORE / 'CURRENT.json')
-            if core.get('release') == selected:
-                tx = digest_value(core.get('transaction_id'), 32)
-                journal = private_record(STORE / 'transactions' / tx / 'journal.json')
-                if journal.get('phase') == 'COMMITTED' and journal.get('candidate') == selected:
-                    event = journal['history'][-1]
-                    must(event.get('phase') == 'COMMITTED' and type(event.get('at_unix')) is int,
-                         'illustration_successor_core_commit_order')
-                    committed_at = event['at_unix']
-        verify_assistant_rollout_successor_web(value, approval, committed_at)
+        verify_assistant_rollout_successor_web(value, approval, _successor_core_committed_at(selected, approval))
     return ref
+
+
+def _successor_core_committed_at(selected, approval):
+    if selected is None or selected == approval['current_release']:
+        return None
+    core = private_record(STORE / 'CURRENT.json')
+    if core.get('release') != selected:
+        return None
+    tx = digest_value(core.get('transaction_id'), 32)
+    journal = private_record(STORE / 'transactions' / tx / 'journal.json')
+    if journal.get('phase') != 'COMMITTED' or journal.get('candidate') != selected:
+        return None
+    event = journal['history'][-1]
+    must(event.get('phase') == 'COMMITTED' and type(event.get('at_unix')) is int,
+         'illustration_successor_core_commit_order')
+    return event['at_unix']
 
 
 def successor_configuration_phase(value):
