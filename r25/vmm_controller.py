@@ -3421,7 +3421,8 @@ def applied_assistant_rollout(rt,value,handoff,controller):
     candidate=json_read(rt.root/'runtime/core-publications/controller-upgrades'/ident/'approval.json',rt.private,ident)
     if 'controller_refresh' in candidate:
         guard_sha=digest(candidate['files']['core_release_guard.py']['after_sha256'])
-    must(handoff.get('R25_CORE_RELEASE_GUARD_SHA256')==guard_sha, 'assistant_rollout_guard_binding')
+        must(handoff.get('R25_CORE_RELEASE_GUARD_SHA256')==guard_sha and
+             candidate['operational']['guard']['after_sha256']==guard_sha, 'assistant_rollout_guard_binding')
     raw=read(path,owner,mode,guard_sha)
     spec=importlib.util.spec_from_file_location('_r25_assistant_rollout_vmm_guard',path)
     guard=importlib.util.module_from_spec(spec)
@@ -3429,8 +3430,6 @@ def applied_assistant_rollout(rt,value,handoff,controller):
     exec(compile(raw,str(path),'exec',dont_inherit=True),guard.__dict__)
     must(guard.ROOT==rt.root,'assistant_rollout_fixed_root')
     approval,folder,_=guard.load_assistant_rollout_approval(value,ident)
-    must(approval['files']['core_release_guard.py']['after_sha256']==guard_sha and
-         approval['operational']['guard']['after_sha256']==guard_sha, 'assistant_rollout_guard_digest')
     must(sha(controller)==approval['files']['vmm_controller.py']['after_sha256'],
          'assistant_rollout_controller_digest')
     live=read(rt.targets()['handoff'][0],rt.private)
